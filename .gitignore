@@ -1,0 +1,9 @@
+# the harness copies plugin.js + its files in here to run (`tests/run.sh`)
+tests/work/
+
+node_modules/
+package-lock.json
+
+# editor / OS noise
+.DS_Store
+*.log
