@@ -22,13 +22,43 @@
  * It is NOT the trailing edge (the timer pins to that) and NOT line 2.
  *
  * ── STATUS LIGHTS ───────────────────────────────────────────────────────────
- * `SessionStatusDot` reads CORE's live state, and core only knows the sessions
- * of the profile the app is ON. So the pane feeds the other profiles itself:
- * when a poll sees a profile's `last_active` advance past its watermark it
- * writes `markSessionUnreadFinished(id, profile)` — the SDK's unread store,
- * which exists for exactly this ("a roster poll's activity watermark, say").
- * That lights the emerald dot for remote profiles too. Literal *working now*
- * (accent) stays the active profile's alone, the only one core can see.
+ * Two dot layers, one vocabulary (core's `$sessionDotStateById`):
+ *
+ * 1. A SESSION row renders core's own `SessionStatusDot`, which resolves the
+ *    state itself from the stored id (the app's live-state registry is keyed by
+ *    that id, so it answers for any profile).
+ * 2. The PROFILE row's dot is an AGGREGATE of that profile's sessions, never
+ *    the state of its latest one. `SessionStatusDot` handed a single id can
+ *    only report that one session, so answering the newest blocked session
+ *    silenced the row while a second session still waited. Pedro, 2026-10-10:
+ *    "two sessions show orange because they need interaction … when the latest
+ *    session has been resolved, the profile dot goes silent, but there's still
+ *    another session awaiting interaction. is it possible for the statusdot to
+ *    show that instead?" The aggregate is the LOUDEST state among the profile's
+ *    sessions (needs-input > working > unread), it stays lit while ANY session
+ *    holds it, and the badge counts the non-idle sessions behind it.
+ *
+ * The aggregate cannot ride core's own rollup (`profileDotSummaryFor` is a
+ * private core export, not in the SDK), so the pane derives it from the two
+ * sources a plugin CAN read:
+ *   live    `session.active_list` → `{stored id: status}`. `waiting` is the
+ *           gateway's pending server→client request — core's amber, exactly.
+ *           This covers the sessions live in THIS gateway process.
+ *   unread  each profile's OWN rows (`host.listPersistedSessions` — a direct
+ *           `state.db` read, no backend dial), whose `unread` flag is
+ *           `SessionDB.session_unread`: the one state that survives a restart,
+ *           and the only one readable for a profile with no live runtime. NOT
+ *           `session.list`: that RPC's row projection drops `unread`. The read
+ *           is cached per profile (`dotListCache`): re-read on a moved roster
+ *           stamp, otherwise at most once per `DOT_LIST_TTL_MS`, and capped at
+ *           the endpoint's own 500-row page.
+ * A profile with nothing readable falls back to core's `SessionStatusDot` for
+ * its latest session — what this row drew before — so a store that cannot be
+ * read degrades to the old dot instead of blanking the row. The pane also feeds
+ * REMOTE profiles itself: when a poll sees a profile's `last_active` advance
+ * past its watermark it writes `markSessionUnreadFinished(id, profile)` — the
+ * SDK's unread store, which exists for exactly this ("a roster poll's activity
+ * watermark, say").
  *
  * Every class below must already exist in the app's compiled stylesheet — a
  * plugin loads at RUNTIME, so a utility the app never used is simply absent
@@ -1748,12 +1778,213 @@ function trackActivity(rows, currentProfile) {
   watermarksSeeded = true
 }
 
+// ── P8b: the profile row's dot is an AGGREGATE of its sessions ───────────────
+
+/** The class core paints each session state with, copied from
+ *  `app/chat/session-status-dot.tsx` (`DOT_VARIANTS`). Core's own
+ *  `sessionDotClassName` is NOT exported to plugins, so the pane carries its own
+ *  copy — and every class here is one core itself uses, so it is already in the
+ *  compiled stylesheet (tests/classes.mjs proves it, the way it proves the
+ *  pane's other classes: a plugin loads at runtime and cannot invent a
+ *  utility). */
+const ROLLUP_DOT = {
+  'needs-input': 'size-1.5 rounded-full bg-amber-500',
+  idle: 'size-1 rounded-full bg-(--ui-text-quaternary)',
+  unread: 'size-1.5 rounded-full bg-(--ui-success)'
+  // No `working` here, on purpose: the PROFILE aggregate never paints blue. A
+  // session that is merely running is not news about the profile, and a row lit
+  // blue for its own agent could never read as quiet. The per-SESSION dot still
+  // carries it — `dotStateFor` below is untouched (Pedro, 2026-10-11: "drop blue
+  // (from profile, keep in session statusdot)").
+}
+/** Ink for the COUNT badge, by state. An inline `var()` rather than a class: the
+ *  badge is micro-type on the pane's own chip, and a variable that did not
+ *  resolve degrades to the inherited colour — never to an invisible numeral. */
+const ROLLUP_INK = {
+  'needs-input': 'var(--color-amber-500)',
+  unread: 'var(--ui-success)'
+  // No `working` (see ROLLUP_DOT): the badge never counts a running session.
+}
+/** i18n keys for the dot's label, by state. */
+const DOT_TITLE_KEY = {
+  'needs-input': 'dotNeedsInput',
+  idle: 'dotIdle',
+  unread: 'dotUnread'
+}
+/** Live statuses that mean a TURN IS RUNNING (`_session_live_status`).
+ *  `waiting` is deliberately absent: it is the pending server→client request —
+ *  a clarify/approval blocking the turn — which is core's amber, not accent. */
+const LIVE_WORKING = new Set(['resuming', 'starting', 'streaming', 'working'])
+/** How many of a profile's sessions the dot read looks at. 500 is the endpoint's
+ *  own ceiling (`Query(le=500)` and the SDK's `Math.min(500, …)`), which is also
+ *  the honest bound on this bucket: a row past the page cannot be counted, so a
+ *  profile with more than 500 sessions can hide an old unread one. The roster is
+ *  ordered by `created`, so what is inside the page is the newest 500. */
+const ROLLUP_LIST_LIMIT = 500
+/** Per-profile row cache for the dot read: `{profile: {at, rows, stamp}}`.
+ *  The roster poll runs every 5s and a profile's rows change only when it moves
+ *  — re-reading twenty-odd `state.db` files on every tick would be a fan-out
+ *  with nothing to show for it. A profile whose roster STAMP moved re-reads at
+ *  once; everything else re-reads at most once per TTL, because `unread` can
+ *  also change with NO activity to see (opening a session clears it, and without
+ *  the TTL the emerald would sit there until that profile's next turn). Exported
+ *  for the harness, which drives several polls in a row. */
+const DOT_LIST_TTL_MS = 30000
+const dotListCache = new Map()
+
+/** `{profile: {state, count, counts}}` — the roster's aggregate dots, written by
+ *  fetchRoster's poll and read by every ProfileRow. Empty until the first poll
+ *  lands, which is what makes the fallback dot the initial state. */
+const $profileDots = atom({})
+
+/** The dot ONE session shows, from the two sources a plugin can read. The
+ *  priority is core's own (`$sessionDotStateById`): a session blocked on a
+ *  question outranks one that is merely producing, which outranks one that
+ *  finished unread. Pure. */
+function dotStateFor(liveStatus, unread) {
+  if (liveStatus === 'waiting') {
+    return 'needs-input'
+  }
+
+  if (LIVE_WORKING.has(String(liveStatus || ''))) {
+    return 'working'
+  }
+
+  return unread ? 'unread' : 'idle'
+}
+
+/** Live rows → `{storedSessionId: status}`. `session.active_list` keys a session
+ *  twice — `session_id` is the RUNTIME id, `session_key` the STORED id every row
+ *  and dot is keyed by — so only the second is usable here. A row missing either
+ *  half is dropped rather than guessed at. Pure. */
+function liveStatusMap(rows) {
+  const map = {}
+
+  for (const row of rows || []) {
+    const key = String(row?.session_key || '')
+    const status = String(row?.status || '')
+
+    if (key && status) {
+      map[key] = status
+    }
+  }
+
+  return map
+}
+
+/** The whole roster's dots: `{profile: {state, count, counts}}`.
+ *  `lists` = profile → its own session rows; `live` = stored id → live status.
+ *
+ *  Two rules, both the user's (2026-10-11):
+ *
+ *  1. The profile's dot is the LOUDEST state among its sessions, not the state
+ *     of its latest one, so it stays lit while ANY session still holds it and
+ *     answering the newest one can no longer silence the row. Loud, here, means
+ *     `needs-input` (amber) then `unread` (emerald): a session that is merely
+ *     RUNNING paints nothing on the profile. Blue belongs to the per-session
+ *     dot, and a row that lights blue for its own running agent could never
+ *     read as quiet.
+ *  2. `count` — the badge — is how many sessions are AWAITING him: `needs-input`
+ *     + `unread`. `working` is excluded on purpose, and that is the reported
+ *     bug: answering a blocked session RESUMES its turn, so it goes `waiting` →
+ *     `working`, and a count that included `working` could not drop at the very
+ *     moment he had just answered it (his "after one got solved, the number '2'
+ *     didn't disappear"). `counts` keeps the full per-state split, so the
+ *     tooltip can still say a session is running behind the row.
+ *
+ *  A stored id that appears in MORE THAN ONE profile's list is dropped
+ *  everywhere: ids are timestamp+random, so two profiles sharing one means a
+ *  copied store, and a shared id cannot say which row it lit. Skipping it paints
+ *  no dot rather than a wrong one. Pure; pinned by the harness. */
+function rosterRollups(lists, live) {
+  const owners = new Map()
+
+  for (const sessions of Object.values(lists || {})) {
+    for (const session of sessions || []) {
+      const id = String(session?.id || '')
+
+      if (id) {
+        owners.set(id, (owners.get(id) || 0) + 1)
+      }
+    }
+  }
+
+  const rollups = {}
+
+  for (const [profile, sessions] of Object.entries(lists || {})) {
+    const counts = { 'needs-input': 0, unread: 0, working: 0 }
+
+    for (const session of sessions || []) {
+      const id = String(session?.id || '')
+
+      if (!id || owners.get(id) !== 1) {
+        continue
+      }
+
+      const state = dotStateFor(live?.[id], session?.unread === true)
+
+      if (state !== 'idle') {
+        counts[state] += 1
+      }
+    }
+
+    const state = counts['needs-input'] ? 'needs-input' : counts.unread ? 'unread' : 'idle'
+
+    rollups[profile] = { count: counts['needs-input'] + counts.unread, counts, state }
+  }
+
+  return rollups
+}
+
 async function fetchRoster() {
   const res = await host.request('profiles.list', { include_sessions: true })
   const rows = Array.isArray(res?.profiles) ? res.profiles : []
   const mapped = rows.map(toRow).filter(row => !row.hidden).sort(compareRows)
 
   trackActivity(mapped, host.state.profile.get())
+
+  // P8b: the aggregate dots' two readable sources. What is LIVE in this gateway
+  // process, and every profile's own rows. The rows come from
+  // `host.listPersistedSessions`, NOT `session.list`: the RPC's row projection
+  // (`_session_row_summary`) drops the `unread` flag, and that flag is the whole
+  // point (it is the persisted half of the dot, `SessionDB.session_unread`). The
+  // host door opens each profile's `state.db` directly — no backend dial, no
+  // profile switch — which is how it can answer for a profile with no runtime.
+  // The per-profile read is CACHED (see dotListCache): a 5s tick must not
+  // re-read twenty stores that have not moved.
+  try {
+    const [live, lists] = await Promise.all([
+      liveSessionRows(),
+      Promise.all(
+        mapped.map(async row => {
+          const stamp = `${row.sessionId || ''}|${row.lastActiveS || ''}`
+          const cached = dotListCache.get(row.name)
+
+          if (cached && cached.stamp === stamp && Date.now() - cached.at < DOT_LIST_TTL_MS) {
+            return [row.name, cached.rows]
+          }
+
+          try {
+            const page = await host.listPersistedSessions(null, { limit: ROLLUP_LIST_LIMIT, profile: row.name })
+            const rows = Array.isArray(page?.sessions) ? page.sessions : []
+
+            dotListCache.set(row.name, { at: Date.now(), rows, stamp })
+
+            return [row.name, rows]
+          } catch {
+            // An unreadable or absent store contributes the rows it last
+            // contributed (usually none) — the same rule the search sweep
+            // follows, and never a dot that blinks off because one read failed.
+            return [row.name, cached?.rows || []]
+          }
+        })
+      )
+    ])
+
+    $profileDots.set(rosterRollups(Object.fromEntries(lists), liveStatusMap(live)))
+  } catch {
+    // Belt-and-braces: nothing here may take the roster down with it.
+  }
 
   return mapped
 }
@@ -4757,6 +4988,27 @@ function ProfileRow({
   // The colour this profile's rows are filled with — his pick in the editor, and
   // NOTHING unless he picked one (see fillOf: "fill is opt-in").
   const fill = fillOf(row)
+  // P8b: this row's dot is the AGGREGATE of the profile's sessions, written by
+  // the roster poll (see rosterRollups). Until one lands — the first render, or a
+  // store the poll could not read — there is no rollup at all and core's own
+  // `SessionStatusDot` draws, which is exactly what this slot did before.
+  const dots = useValue($profileDots)
+  const rollup = dots?.[row.name] || null
+  // The pane paints its OWN dot whenever it has a rollup for this profile — an
+  // IDLE rollup included, as the neutral dot. Handing the cell back to core's
+  // per-session dot on idle would put blue on the row for a merely running
+  // session, which is the one thing the profile dot must not do. Core's dot is
+  // only the placeholder for a profile the poll has not reached yet (the first
+  // render, or a store it could not read).
+  const dot = rollup && rollup.state !== 'idle' ? rollup : null
+  const dotLabel = rollup ? t(DOT_TITLE_KEY[rollup.state]) : ''
+  // The breakdown only earns its place when it says more than the colour does:
+  // one bucket and the label already said it.
+  const dotTitle = dot
+    ? dot.count > 1
+      ? `${dotLabel} — ${t('dotSummary', dot.counts['needs-input'], dot.counts.working, dot.counts.unread)}`
+      : dotLabel
+    : dotLabel
 
   return jsxs('div', {
     'data-drop-profile': row.name,
@@ -4842,8 +5094,21 @@ function ProfileRow({
                             // The lead cell, exactly where the Bots rail puts
                             // it: first thing on the name line, which is what
                             // holds every name on one left edge.
+                            //
+                            // The aggregate dot when the profile has one (P8b),
+                            // core's own per-session dot otherwise. Both are the
+                            // same size and sit in the same cell, so a profile
+                            // going amber cannot shift the list.
                             jsx(SidebarRowLead, {
-                              children: jsx(SessionStatusDot, { storedSessionId: row.sessionId })
+                              children: rollup
+                                ? jsx('span', {
+                                    'aria-label': dotLabel,
+                                    'data-profile-dot': rollup.state,
+                                    className: ROLLUP_DOT[rollup.state],
+                                    role: 'status',
+                                    title: dotTitle
+                                  })
+                                : jsx(SessionStatusDot, { storedSessionId: row.sessionId })
                             }),
                             jsx('span', {
                               className: 'min-w-0 truncate font-medium',
@@ -4864,6 +5129,30 @@ function ProfileRow({
                               : null
                           ]
                         }),
+                        // The count badge: the messenger convention this pane is
+                        // modelled on, and the second half of the user's ask
+                        // ("show a number for how many session statusdots are
+                        // active"). It counts what AWAITS him — waiting + unread
+                        // (see rosterRollups) — never a session that is only
+                        // running. Only for more than one: a lone "1" would just
+                        // repeat the dot, which is exactly why the number
+                        // disappears the moment one of two is read while the
+                        // colour stays ("the dot remains green, but the number
+                        // disappears"). It sits in the trailing cluster beside
+                        // the age, which keeps every name on the one left edge
+                        // the lead cell exists to hold.
+                        dot && dot.count > 1
+                          ? jsx(
+                              'span',
+                              {
+                                'data-profile-dot-count': dot.count,
+                                className: 'shrink-0 rounded-sm px-1 text-[0.625rem] font-medium',
+                                style: { color: ROLLUP_INK[dot.state] },
+                                children: String(dot.count)
+                              },
+                              'dot-count'
+                            )
+                          : null,
                         age
                           ? jsx('span', {
                               className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
@@ -7736,6 +8025,18 @@ export default {
         cancel: 'Cancel',
         create: 'Create',
         deliver: 'Deliver',
+        dotIdle: 'Nothing unread',
+        dotNeedsInput: 'Waiting for your answer',
+        dotSummary: (needsInput, working, unread) =>
+          [
+            needsInput ? `${needsInput} waiting` : '',
+            working ? `${working} working` : '',
+            unread ? `${unread} unread` : ''
+          ]
+            .filter(Boolean)
+            .join(' · '),
+        dotUnread: 'Finished, unread',
+        dotWorking: 'Working now',
         deleteJob: 'Delete job',
         jobName: 'Name',
         jobNameHint: 'Morning briefing',
@@ -7904,6 +8205,17 @@ export const __internals = {
   buildAproposGroupDigest,
   APROPOS_GROUP_MAX,
   ProfileRow,
+  $profileDots,
+  DOT_TITLE_KEY,
+  dotStateFor,
+  DOT_LIST_TTL_MS,
+  dotListCache,
+  liveStatusMap,
+  LIVE_WORKING,
+  ROLLUP_DOT,
+  ROLLUP_INK,
+  ROLLUP_LIST_LIMIT,
+  rosterRollups,
   dragArmed,
   guardClick,
   ITEM_DRAG_THRESHOLD,

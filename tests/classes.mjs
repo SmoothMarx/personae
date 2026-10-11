@@ -16,8 +16,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
-const SRC =
-  process.env.HERMES_DESKTOP_SRC || (process.env.HOME || '') + '/.hermes/hermes-agent/apps/desktop/src'
+const SRC = process.env.HERMES_DESKTOP_SRC || '/home/smoothmarx/.hermes/hermes-agent/apps/desktop/src'
 const PLUGIN = './plugin.js'
 /** Theme variables and design tokens are not Tailwind utilities. */
 const ALLOW = new Set(['cn'])

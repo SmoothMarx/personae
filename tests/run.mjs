@@ -298,17 +298,22 @@ check(
   markup.slice(0, 300)
 )
 
-// One dot per row, inside the lead cell, on the NAME line.
+// One dot per row, inside the lead cell, on the NAME line. Since P8b the pane
+// paints its OWN aggregate dot as soon as the poll has data (three polls have
+// run by now), so the cell here is the pane's — core's `SessionStatusDot`, bound
+// to the profile's stored session id, is only the pre-poll placeholder (§6b
+// proves that fallback on a cleared store). Idle in this fixture: §6c is what
+// exercises the lit states.
 check(
   'the dot sits in the lead cell before the name (line 1)',
   zuluRow.indexOf('data-slot="sidebar-row-lead"') > -1 &&
-    zuluRow.indexOf('data-slot="session-status-dot"') < zuluRow.indexOf('Zulu'),
+    zuluRow.indexOf('data-profile-dot=') < zuluRow.indexOf('Zulu'),
   zuluRow.slice(0, 400)
 )
 check(
-  'the dot is bound to the profile\'s stored session id',
-  zuluRow.includes('data-stored-session-id="sess-zulu-1"') && defaultRow.includes('data-stored-session-id="sess-default-1"'),
-  markup.match(/data-stored-session-id="[^"]*"/g)?.join(' ')
+  "the pane's own dot is per row, and idle while nothing awaits him",
+  zuluRow.includes('data-profile-dot="idle"') && defaultRow.includes('data-profile-dot="idle"'),
+  (markup.match(/data-profile-dot="[^"]*"/g) || []).join(' ')
 )
 const detailsSlice = zuluRow.slice(zuluRow.indexOf(DETAILS))
 
@@ -318,6 +323,304 @@ check(
   'the preview line takes no flex-1 (it only existed to park the dot)',
   !/class="[^"]*flex-1[^"]*"[^>]*>refactored the flux capacitor/.test(zuluRow)
 )
+
+// ── 6b. the profile dot is an AGGREGATE of its sessions (P8b) ───────────────
+// The row's dot used to be core's dot for the profile's LATEST session alone, so
+// answering that one silenced the row while a second session still waited. Pedro,
+// 2026-10-10: "when the latest session has been resolved, the profile dot goes
+// silent, but there's still another session awaiting interaction. is it possible
+// for the statusdot to show that instead?" These pin the aggregate: the loudest
+// state wins, it stays lit while ANY session holds it, and the badge counts what
+// awaits him behind it (§6c narrows the count to waiting + unread).
+
+const roll = __internals.rosterRollups(
+  {
+    alpha: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3', unread: true }],
+    bravo: [{ id: 'b1', unread: true }]
+  },
+  { a1: 'waiting', a2: 'working' }
+)
+
+check(
+  "the aggregate takes the LOUDEST state, not the latest session's",
+  roll.alpha.state === 'needs-input',
+  JSON.stringify(roll.alpha)
+)
+check(
+  'the count is what AWAITS him — waiting + unread — not every live session',
+  roll.alpha.count === 2,
+  JSON.stringify(roll.alpha)
+)
+check(
+  'the per-bucket split still carries working, for the tooltip',
+  JSON.stringify(roll.alpha.counts) === '{"needs-input":1,"unread":1,"working":1}',
+  JSON.stringify(roll.alpha.counts)
+)
+check(
+  'one unread session is enough to light the row (emerald)',
+  roll.bravo.state === 'unread' && roll.bravo.count === 1,
+  JSON.stringify(roll.bravo)
+)
+
+// The user's own scenario: two sessions waiting, then the newest is answered.
+const halfAnswered = __internals.rosterRollups(
+  { alpha: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3', unread: true }] },
+  { a2: 'waiting' }
+)
+
+check(
+  'answering the newest blocked session leaves the row lit for the other one',
+  halfAnswered.alpha.state === 'needs-input' && halfAnswered.alpha.count === 2,
+  JSON.stringify(halfAnswered.alpha)
+)
+check(
+  'nothing waiting, working or unread is idle — the fallback dot draws',
+  (() => {
+    const quiet = __internals.rosterRollups({ alpha: [{ id: 'a1' }, { id: 'a2' }] }, { a1: 'idle' })
+
+    return quiet.alpha.state === 'idle' && quiet.alpha.count === 0
+  })()
+)
+check(
+  'a stored id two profiles both claim is dropped, never painted twice',
+  (() => {
+    const shared = __internals.rosterRollups(
+      { alpha: [{ id: 'dup' }], bravo: [{ id: 'dup', unread: true }] },
+      { dup: 'waiting' }
+    )
+
+    return shared.alpha.state === 'idle' && shared.bravo.state === 'idle'
+  })()
+)
+check(
+  'live rows map by the STORED id (session_key), never the runtime id',
+  JSON.stringify(
+    __internals.liveStatusMap([
+      { session_id: 'rt-1', session_key: 'st-1', status: 'waiting' },
+      { session_id: 'rt-2' }
+    ])
+  ) === '{"st-1":"waiting"}',
+  JSON.stringify(
+    __internals.liveStatusMap([
+      { session_id: 'rt-1', session_key: 'st-1', status: 'waiting' },
+      { session_id: 'rt-2' }
+    ])
+  )
+)
+check(
+  "the live statuses that mean a running turn are the gateway's own",
+  __internals.LIVE_WORKING.has('working') &&
+    __internals.LIVE_WORKING.has('streaming') &&
+    !__internals.LIVE_WORKING.has('waiting')
+)
+
+// The wiring: the roster poll reads BOTH sources and writes the dots. The rows
+// come from `host.listPersistedSessions` — the direct `state.db` read that still
+// carries `unread` — so the harness answers through `h.sessions.byProfile`.
+const savedByProfile = h.sessions.byProfile
+
+// The per-profile row read is cached across polls (see dotListCache), so each
+// scenario here starts from a cold cache — otherwise the second poll would
+// answer from the first one's rows and prove nothing.
+__internals.dotListCache.clear()
+
+h.sessions.byProfile = {
+  default: { sessions: [] },
+  zulu: { sessions: [{ id: 'sess-zulu-9' }, { id: 'sess-zulu-8' }] }
+}
+h.responses['session.active_list'] = () => ({
+  sessions: [
+    { session_id: 'rt-9', session_key: 'sess-zulu-9', status: 'waiting' },
+    { session_id: 'rt-8', session_key: 'sess-zulu-8', status: 'waiting' }
+  ]
+})
+
+await rosterQuery.queryFn()
+
+check(
+  'the roster poll writes the aggregate dot per profile',
+  __internals.$profileDots.get().zulu?.state === 'needs-input' && __internals.$profileDots.get().zulu?.count === 2,
+  JSON.stringify(__internals.$profileDots.get())
+)
+
+// The load guard: a profile that has not moved must not be re-read on the next
+// tick. Two extra polls of an unchanged roster may not add a single row read.
+const zuluReads = () => h.sessions.calls.filter(call => call.options?.profile === 'zulu').length
+const readsBefore = zuluReads()
+
+await rosterQuery.queryFn()
+
+check(
+  'an unchanged profile is not re-read on the next tick (the dot read is cached)',
+  zuluReads() === readsBefore,
+  `${readsBefore} reads → ${zuluReads()}`
+)
+
+markup = render()
+
+check(
+  "the profile row paints the AGGREGATE dot, not core's single-session one",
+  rowSlice('zulu').includes('data-profile-dot="needs-input"') &&
+    rowSlice('zulu').indexOf('data-profile-dot="needs-input"') < rowSlice('zulu').indexOf('Zulu'),
+  rowSlice('zulu').slice(0, 400)
+)
+check(
+  'the badge counts how many sessions are behind the dot',
+  rowSlice('zulu').includes('data-profile-dot-count="2"'),
+  rowSlice('zulu').slice(0, 400)
+)
+
+// One of the two is answered: the row must STAY lit, with the count down to one.
+h.responses['session.active_list'] = () => ({
+  sessions: [{ session_id: 'rt-9', session_key: 'sess-zulu-9', status: 'waiting' }]
+})
+
+await rosterQuery.queryFn()
+markup = render()
+
+check(
+  '…and it stays lit once one is answered (the whole point)',
+  rowSlice('zulu').includes('data-profile-dot="needs-input"') && __internals.$profileDots.get().zulu?.count === 1,
+  JSON.stringify(__internals.$profileDots.get())
+)
+check(
+  'a lone session behind the dot shows no badge — "1" only repeats the dot',
+  !rowSlice('zulu').includes('data-profile-dot-count'),
+  rowSlice('zulu').slice(0, 400)
+)
+
+// The restart case: no live runtime left, so the only surviving signal is the
+// persisted `unread` flag on the profile's own rows.
+__internals.dotListCache.clear()
+h.responses['session.active_list'] = () => ({ sessions: [] })
+h.sessions.byProfile = { default: { sessions: [] }, zulu: { sessions: [{ id: 'sess-zulu-9', unread: true }] } }
+
+await rosterQuery.queryFn()
+markup = render()
+
+check(
+  'a profile whose unread flag survived (no live runtime) still lights emerald',
+  rowSlice('zulu').includes('data-profile-dot="unread"') && __internals.$profileDots.get().zulu?.count === 1,
+  JSON.stringify(__internals.$profileDots.get())
+)
+
+h.sessions.byProfile = savedByProfile
+delete h.responses['session.active_list']
+__internals.$profileDots.set({})
+
+markup = render()
+
+check(
+  "with no aggregate to paint, the row falls back to core's own dot",
+  rowSlice('zulu').includes('data-slot="session-status-dot"') && !rowSlice('zulu').includes('data-profile-dot'),
+  rowSlice('zulu').slice(0, 400)
+)
+check(
+  "…and the fallback is still bound to the profile's stored session id",
+  rowSlice('zulu').includes('data-stored-session-id="sess-zulu-1"')
+)
+
+// ── 6c. blue is a SESSION colour, never a profile one (P8b follow-up) ──────
+// Pedro, 2026-10-11, verbatim: "go, drop blue (from profile, keep in session
+// statusdot)" — and the rule he gave with it: "It should show unread status,
+// with priority first. so if there is a green and an orange, the orange is shown
+// first (and the number 2), until it is read, then it should go green (the
+// number disappears). and once that one is read, it should not show a color at
+// all, as all have been read. If there are two green, it should show green and
+// the number 2. when the first one is read, the dot remains green, but the
+// number disappears."
+//
+// So the badge counts what AWAITS him — waiting + unread — and a session that is
+// merely RUNNING is counted by neither and paints nothing. That is the reported
+// bug: answering a blocked session RESUMES its turn, so it goes waiting →
+// working, and the old rollup counted the resumed one too, which is why "after
+// one got solved, the number '2' didn't disappear".
+check(
+  'the per-SESSION dot keeps blue — only the profile aggregate drops it',
+  __internals.dotStateFor('working', false) === 'working',
+  __internals.dotStateFor('working', false)
+)
+
+// The render half needs the poll, so it drives the same wiring §6b does.
+const snooze = async (rows, liveRows) => {
+  __internals.dotListCache.clear()
+  h.sessions.byProfile = { default: { sessions: [] }, zulu: { sessions: rows } }
+  h.responses['session.active_list'] = () => ({ sessions: liveRows })
+
+  await rosterQuery.queryFn()
+
+  return render()
+}
+
+// A running session paints NOTHING on the profile — no blue, no count — and in
+// particular the row must not fall back to core's per-session dot, which would
+// put the blue straight back on it.
+markup = await snooze([{ id: 'sess-zulu-9' }, { id: 'sess-zulu-8' }], [
+  { session_id: 'rt-8', session_key: 'sess-zulu-8', status: 'working' }
+])
+
+check(
+  'a session that is only RUNNING paints no blue on the profile row',
+  rowSlice('zulu').includes('data-profile-dot="idle"') &&
+    !rowSlice('zulu').includes('data-slot="session-status-dot"'),
+  rowSlice('zulu').slice(0, 400)
+)
+check(
+  '…and it adds nothing to the count',
+  __internals.$profileDots.get().zulu?.count === 0 &&
+    !rowSlice('zulu').includes('data-profile-dot-count'),
+  JSON.stringify(__internals.$profileDots.get().zulu)
+)
+
+// One waiting + one running: amber, and NO badge — the running session is not a
+// second thing awaiting him.
+markup = await snooze([{ id: 'sess-zulu-9' }, { id: 'sess-zulu-8' }], [
+  { session_id: 'rt-9', session_key: 'sess-zulu-9', status: 'waiting' },
+  { session_id: 'rt-8', session_key: 'sess-zulu-8', status: 'working' }
+])
+
+check(
+  'waiting + running is ONE thing awaiting him, so there is no badge',
+  rowSlice('zulu').includes('data-profile-dot="needs-input"') &&
+    !rowSlice('zulu').includes('data-profile-dot-count'),
+  rowSlice('zulu').slice(0, 400)
+)
+
+// His exact green sequence.
+markup = await snooze([{ id: 'sess-zulu-9', unread: true }, { id: 'sess-zulu-8', unread: true }], [])
+
+check(
+  'two unread sessions: emerald and the number 2',
+  rowSlice('zulu').includes('data-profile-dot="unread"') &&
+    rowSlice('zulu').includes('data-profile-dot-count="2"'),
+  rowSlice('zulu').slice(0, 400)
+)
+
+markup = await snooze([{ id: 'sess-zulu-9', unread: true }], [])
+
+check(
+  'read one of two: the dot stays emerald, the number disappears',
+  rowSlice('zulu').includes('data-profile-dot="unread"') &&
+    !rowSlice('zulu').includes('data-profile-dot-count'),
+  rowSlice('zulu').slice(0, 400)
+)
+
+markup = await snooze([{ id: 'sess-zulu-9' }, { id: 'sess-zulu-8' }], [])
+
+check(
+  'all read: no colour at all',
+  rowSlice('zulu').includes('data-profile-dot="idle"') &&
+    !rowSlice('zulu').includes('data-profile-dot-count'),
+  rowSlice('zulu').slice(0, 400)
+)
+
+// Hand the fixtures back the way §7 expects to find them.
+h.sessions.byProfile = savedByProfile
+delete h.responses['session.active_list']
+__internals.dotListCache.clear()
+__internals.$profileDots.set({})
+
+markup = render()
 
 // ── 7. toolbar (bell · + · folder+ · search · filter) ───────────────────────
 
@@ -511,6 +814,12 @@ check(
 
 // ── 10. the session sweep behind the search ────────────────────────────────
 
+// The sweep's OWN reads are what this section is about. The dot poll (P8b) also
+// reads `listPersistedSessions` — at its own 500 limit — so without clearing the
+// log first, `every(limit === 200)` below is answering about the polling, not
+// about the sweep.
+h.sessions.calls = []
+
 const swept = await __internals.searchInSessions(['zulu', 'default', 'ghost'], 'flux')
 
 check('the sweep reads sessions of every profile', h.sessions.calls?.length >= 3, `calls: ${JSON.stringify(h.sessions.calls)}`)
@@ -550,8 +859,15 @@ const writes = h.requests.filter(r => WRITE_METHODS.test(r.method))
 
 check('the pane issues no mutating RPCs', writes.length === 0, writes.map(w => w.method).join(','))
 check(
-  'the pane reads (profiles.list + profiles.get_asset) and nothing else',
-  h.requests.every(r => ['profiles.list', 'profiles.get_asset'].includes(r.method)),
+  'the pane reads (profiles.list + profiles.get_asset + the two aggregate-dot reads) and nothing else',
+  // P8b added `session.active_list` (which sessions are live in this gateway
+  // process) on the roster poll; `session.list` is the read the expanded rows'
+  // own refresh has always used. Both are READS — the mutating check above is
+  // what guards the pane, and it still sees nothing. Each profile's session rows
+  // for the dot come from `host.listPersistedSessions`, which is not an RPC.
+  h.requests.every(r =>
+    ['profiles.list', 'profiles.get_asset', 'session.active_list', 'session.list'].includes(r.method)
+  ),
   [...new Set(h.requests.map(r => r.method))].join(',')
 )
 check('the "+" door is the sidebar\'s own, not a hand-rolled RPC', h.newChats.length === 0 || h.newChats.every(name => typeof name === 'string'))
@@ -870,7 +1186,7 @@ check(
 )
 
 h.responses['projects.list'] = () => ({
-  projects: [{ id: 'p1', name: 'mmapp', primary_path: '/tmp/mmapp' }]
+  projects: [{ id: 'p1', name: 'mmapp', primary_path: '/home/smoothmarx/Projects/mmapp' }]
 })
 
 const projects = await projectsQuery.queryFn()
@@ -885,7 +1201,7 @@ const lastRequest = () => h.requests[h.requests.length - 1]
 // The verbs only need the gateway to answer; the assertions are on the CALL.
 h.responses['session.archive'] = () => ({ archived: true })
 h.responses['session.title'] = () => ({ title: 'ok' })
-h.responses['session.workspace.move'] = () => ({ cwd: '/tmp/mmapp' })
+h.responses['session.workspace.move'] = () => ({ cwd: '/home/smoothmarx/Projects/mmapp' })
 
 await __internals.archiveSession('sess-zulu-9', 'zulu')
 
@@ -930,12 +1246,12 @@ check(
   JSON.stringify(lastRequest())
 )
 
-await __internals.moveSessionToProject('sess-zulu-9', '/tmp/mmapp', 'zulu')
+await __internals.moveSessionToProject('sess-zulu-9', '/home/smoothmarx/Projects/mmapp', 'zulu')
 
 check(
   'Assign to project calls session.workspace.move with the folder as cwd',
   lastRequest().method === 'session.workspace.move' &&
-    lastRequest().params.cwd === '/tmp/mmapp' &&
+    lastRequest().params.cwd === '/home/smoothmarx/Projects/mmapp' &&
     lastRequest().params.session_key === 'sess-zulu-9' &&
     lastRequest().params.profile === 'zulu',
   JSON.stringify(lastRequest())

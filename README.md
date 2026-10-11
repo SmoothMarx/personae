@@ -39,6 +39,18 @@ One rail. Click a face to open its conversations. No more hopping between "which
 
 **Status lights, even for the faces core can't see.** The app only knows the live state of the profile it's currently on — Personae feeds the other rows itself, so a remote profile that just finished a turn lights up too.
 
+The dot answers one question — *is anything here waiting for me?* — in priority order:
+
+| Dot | Means |
+| --- | --- |
+| **amber** | a session is blocked on you: a question, a clarification |
+| **emerald** | unread activity |
+| **neutral** | nothing awaits you |
+
+The **number** beside it counts what awaits you — `waiting + unread` — and appears only at **2 or more**: one pending thing is already said by the colour. Read one of two and the colour stays, the number disappears; read both and the colour goes with it. A session that is merely **running** is never counted here, and never colours the profile: blue belongs to the *session* dot, where "this conversation is working right now" is a true statement about that conversation.
+
+*Emerald leans on the read/unread watermark the app writes when you open a session. On a profile that has never been read through, it can stay quiet — the dot is honest about what it knows.*
+
 **Delete, without the guilt trip.** Deleting a session deletes it. Deleting a session *group* never deletes sessions — its members fall back into the flat list. A chain (a parent and its Apropos children) is deleted together: children are orphaned by default, or taken with it if you say so.
 
 ## Requirements
@@ -86,7 +98,7 @@ deploy.sh          copies plugin.js into the app's desktop-plugins folder, print
 ```
 
 ```bash
-./tests/run.sh          # 610 render checks + 135 class tokens, no app required
+./tests/run.sh          # 635 render checks + 135 class tokens, no app required
 ```
 
 The harness needs **node ≥ 20.6** and a checkout of the desktop repo for the same React the app ships:
