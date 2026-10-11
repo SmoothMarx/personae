@@ -3,6 +3,10 @@
 **Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions. Nothing else.
 Right now, it is a plugin for the **Hermes Desktop** app. It adds a native tab beside **Sessions | Bots**
 
+<p align="center">
+  <img src="assets/personae-rail.png" width="416" alt="The Personae rail in Hermes Desktop: the PERSONAE tab beside Sessions and Bots, one profile expanded into its sessions with their ages, and the rest of the roster below">
+</p>
+
 
 ---
 
