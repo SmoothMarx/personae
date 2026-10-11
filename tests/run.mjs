@@ -848,6 +848,7 @@ h.queryResults['messenger|roster'] = { data: [], error: null, isError: false, is
 markup = render()
 
 check('empty state is reachable', markup.includes('No profiles'))
+check('empty state carries the personae mark', markup.includes('data-personae-mark') && markup.includes('data:image/png;base64,'))
 
 h.queryResults['messenger|roster'] = { data: rows, error: null, isError: false, isPending: false }
 

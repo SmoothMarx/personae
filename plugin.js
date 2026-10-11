@@ -225,6 +225,14 @@ const LIST_CLASS = 'grid min-w-0 grid-cols-1 gap-0.5 px-1.5'
 const UNASSIGNED = 'section:unassigned'
 /** Sessions listed under a row when a search matches inside them. */
 const SESSIONS_PER_ROW = 5
+
+/**
+ * The personae mark, inlined. A desktop plugin ships as one bundled `plugin.js`
+ * with no asset loader, so the 64px icon (assets/personae-icon.png) travels in
+ * the bundle as a data URL rather than as a sibling file.
+ */
+const MARK_SRC =
+  'data:image/png;base64,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'
 /** D-D: how many of a profile's sessions a click docks beside it. The tab strip
  *  scrolls horizontally past this; the cap only stops one click minting a
  *  hundred tiles. */
@@ -8256,9 +8264,27 @@ function MessengerPane() {
       title: t('loadFailed')
     })
   } else if (!shown.length && !model.sections.length) {
-    body = jsx(EmptyState, {
-      description: rows.length ? t('filteredHint') : t('emptyHint'),
-      title: rows.length ? t('filtered') : t('empty')
+    body = jsxs('div', {
+      className: 'flex min-h-0 flex-1 flex-col',
+      children: [
+        jsx('img', {
+          alt: '',
+          'data-personae-mark': '',
+          src: MARK_SRC,
+          style: {
+            borderRadius: '22%',
+            display: 'block',
+            height: 56,
+            margin: '28px auto 0',
+            opacity: 0.9,
+            width: 56
+          }
+        }),
+        jsx(EmptyState, {
+          description: rows.length ? t('filteredHint') : t('emptyHint'),
+          title: rows.length ? t('filtered') : t('empty')
+        })
+      ]
     })
   } else {
     body = jsx('div', {
