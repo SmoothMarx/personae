@@ -209,9 +209,56 @@ default, or taken with it if you ask for that instead.
   database; uninstalling the plugin doesn't move or delete them.
 - **Nothing destructive happens as a side effect.** Grouping, colouring and sorting
   never delete. The only destructive verb is Delete, and you have to click it.
-- **No server, no telemetry.** It talks to the app it lives in.
+- **No third-party server, no telemetry.** It talks to the app it lives in, and (for
+  cross-device sync) only to its own backend on your Hermes — see *Sync contract*.
 - **Loads uncompiled.** The app executes `plugin.js` as it stands, so every line that
   runs is a line you can read.
+
+---
+
+## 🔄 Sync contract
+
+Since 1.1.0 the roster arrangement follows you across machines through the pane's own
+backend (`/api/plugins/messenger/state`, `dashboard/plugin_api.py`). Local storage stays
+the source the pane reads: every edit is written locally **first and immediately**, and
+the server only hears about it afterwards.
+
+- **What syncs.** Exactly seven keys, named on the server without the `messenger-`
+  prefix: `session-sort-v1`, `session-order-v1`, `sections-v1`, `session-groups-v1`,
+  `session-colors-v1`, `hidden-v1`, `apropos-v1` (local key = `messenger-` + name).
+  Everything else is **device-local, never pushed and never read back**: expanded
+  profiles (`expanded-v1`), activity toasts, search, scroll, pane width.
+- **Wire.** `GET /state` → `{"version":1,"keys":{<key>:{"value","rev","updated_at"}}}`.
+  `PUT /state` with `{"keys":{<key>:{"value","rev"}},"tombstones":[{"key","entry","rev"}]}`
+  → `200` and the merged view of all keys. `400` = unknown/device-local key or bad shape,
+  `413` = body over 256 KB (both: the batch is dropped, local is kept, no retry loop).
+- **Debounce.** A shared-key change arms one push after **1500 ms** idle; a burst of
+  edits goes out as a single `PUT` carrying only the changed keys.
+- **LWW by rev.** Each key carries a Lamport rev: `newRev = max(last rev seen from the
+  server, last rev this device wrote) + 1`, recomputed per attempt, so a device's revs
+  only ever rise. Non-object values are whole-value last-writer-wins by rev. Object values
+  are merged **entry-wise** on their top-level keys: an incoming entry replaces the stored
+  one only if its rev is higher (equal keeps the server's); entries absent from a write
+  are **kept**, so two devices adding different entries both survive.
+- **Tombstones.** Because absence means "keep", removing a top-level entry is sent as a
+  tombstone `{key, entry, rev}` — computed by diffing the last view both sides agreed on
+  (last pushed or adopted) against the new value. The server removes the entry if the
+  tombstone's rev is higher and remembers it, so a lower-or-equal-rev write cannot
+  resurrect it; a higher-rev write re-creates it.
+- **Seed-then-authoritative.** On first contact (per key, remembered device-locally):
+  if the server has **no** value, a non-empty local value is pushed as the seed; if the
+  server **has** a value, it is **adopted** — through the same `normalize*` functions
+  `loadPrefs` uses, and written to local storage — and the local one is never pushed
+  over it. Afterwards, any server value with a rev above the last one seen (on the `PUT`
+  response, or the pull when the window becomes visible again) is adopted, **except**
+  while that key has unpushed local edits.
+- **Offline is a no-op.** A failing request never throws into the pane: the dirty keys
+  stay queued (persisted), retried with exponential backoff (2 s, 4 s, … capped at 60 s),
+  and flushed at once on the window's `online` event or when it becomes visible.
+- **404 degrades.** An older backend without `/state` (a `404`, or an answer without
+  `keys`) switches sync off for the session: local-only, silently, no retries.
+- **Bookkeeping.** Revs, seeded flags, last-seen server revs and the queue live in the
+  device-local `messenger-sync-meta-v1`, which is itself never pushed.
 
 ---
 
@@ -236,7 +283,7 @@ personae/
 ## 🔧 Development
 
 ```bash
-./tests/run.sh          # 635 render checks + 135 class tokens, no app required
+./tests/run.sh          # 668 render checks + 135 class tokens, no app required
 ```
 
 The harness needs **node ≥ 20.6** and a checkout of the desktop repo, for the same React

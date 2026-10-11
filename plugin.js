@@ -364,24 +364,52 @@ function loadPrefs() {
     const store = ctxRef?.storage
 
     $activityToasts.set(Boolean(store?.get?.(TOASTS_KEY, false)))
-    $sections.set(normalizeSections(store?.get?.(SECTIONS_KEY, EMPTY_SECTIONS)))
-    sessionColors = normalizeColors(store?.get?.(COLORS_KEY, {}))
-    $sessionColors.set(sessionColors)
-    sessionOrder = normalizeSessionOrder(store?.get?.(SESSION_ORDER_KEY, {}))
-    $sessionOrder.set(sessionOrder)
-    sessionSort = normalizeSessionSort(store?.get?.(SESSION_SORT_KEY, {}))
-    $sessionSort.set(sessionSort)
-    sessionGroups = normalizeSessionGroups(store?.get?.(SESSION_GROUPS_KEY, {}))
-    $sessionGroups.set(sessionGroups)
-    hiddenSessions = normalizeHidden(store?.get?.(HIDDEN_KEY, {}))
-    $hiddenSessions.set(hiddenSessions)
-    aproposLinks = normalizeApropos(store?.get?.(APROPOS_KEY, {}))
-    $apropos.set(aproposLinks)
+    applyPref(SECTIONS_KEY, store?.get?.(SECTIONS_KEY, EMPTY_SECTIONS))
+    applyPref(COLORS_KEY, store?.get?.(COLORS_KEY, {}))
+    applyPref(SESSION_ORDER_KEY, store?.get?.(SESSION_ORDER_KEY, {}))
+    applyPref(SESSION_SORT_KEY, store?.get?.(SESSION_SORT_KEY, {}))
+    applyPref(SESSION_GROUPS_KEY, store?.get?.(SESSION_GROUPS_KEY, {}))
+    applyPref(HIDDEN_KEY, store?.get?.(HIDDEN_KEY, {}))
+    applyPref(APROPOS_KEY, store?.get?.(APROPOS_KEY, {}))
     expandedProfiles = normalizeExpanded(store?.get?.(EXPANDED_KEY, {}))
     $expanded.set(expandedProfiles)
   } catch {
     // No storage: prefs hold for this window only, which beats throwing.
   }
+}
+
+/** One SHARED pref's stored value → the in-memory copy and its atom, through
+ *  the same normalize* the pane always used. loadPrefs and the server sync's
+ *  adopt path both come through here, so a value from another machine can
+ *  never take a shape a value from this machine's storage could not. Device-
+ *  local prefs (toasts, expanded) are deliberately absent: nothing remote may
+ *  set them. Returns false for a key it does not own. */
+function applyPref(key, raw) {
+  if (key === SECTIONS_KEY) {
+    $sections.set(normalizeSections(raw ?? EMPTY_SECTIONS))
+  } else if (key === COLORS_KEY) {
+    sessionColors = normalizeColors(raw ?? {})
+    $sessionColors.set(sessionColors)
+  } else if (key === SESSION_ORDER_KEY) {
+    sessionOrder = normalizeSessionOrder(raw ?? {})
+    $sessionOrder.set(sessionOrder)
+  } else if (key === SESSION_SORT_KEY) {
+    sessionSort = normalizeSessionSort(raw ?? {})
+    $sessionSort.set(sessionSort)
+  } else if (key === SESSION_GROUPS_KEY) {
+    sessionGroups = normalizeSessionGroups(raw ?? {})
+    $sessionGroups.set(sessionGroups)
+  } else if (key === HIDDEN_KEY) {
+    hiddenSessions = normalizeHidden(raw ?? {})
+    $hiddenSessions.set(hiddenSessions)
+  } else if (key === APROPOS_KEY) {
+    aproposLinks = normalizeApropos(raw ?? {})
+    $apropos.set(aproposLinks)
+  } else {
+    return false
+  }
+
+  return true
 }
 
 /** Profile → session ids. Malformed entries fall out, so a hand-edited store
@@ -1189,11 +1217,557 @@ function reorderSessionGroups(profile, id, onto) {
   patchProfileGroups(profile, { order: reorderNames(current.order, id, onto) })
 }
 
+/** Local storage stays the source the pane reads, written FIRST and
+ *  synchronously as ever; the server sync only ever learns about the change
+ *  afterwards, so a dead or missing backend can never cost the user an edit. */
 function persist(key, value) {
   try {
     Promise.resolve(ctxRef?.storage?.set?.(key, value)).catch(() => undefined)
   } catch {
     /* storage unavailable — the value lives for this window */
+  }
+
+  try {
+    prefSync?.noteLocal(key, value)
+  } catch {
+    /* sync is best-effort; the local write above already happened */
+  }
+}
+
+// ── cross-device sync ───────────────────────────────────────────────────────
+//
+// The roster prefs a user arranges by hand (sort, order, sections, groups,
+// colours, hidden, apropos) follow them across machines through the pane's own
+// backend: `GET/PUT /api/plugins/messenger/state`. The contract is in the
+// README ("Sync contract"); the short of it is LWW by a per-key Lamport rev,
+// object values merged entry-wise server-side, removals as tombstones, and
+// seed-then-authoritative on first contact. Everything here is best-effort: a
+// failure queues and retries, a 404 (older backend) silently means local-only.
+
+/** Server key names (no `messenger-` prefix). The ONLY keys ever pushed or
+ *  read back; expanded, toasts, search, scroll and widths are device-local by
+ *  omission. Kept as literals, not the *_KEY constants: several of those are
+ *  declared further down the module and would still be in their TDZ here. */
+const SYNC_SERVER_KEYS = [
+  'session-sort-v1',
+  'session-order-v1',
+  'sections-v1',
+  'session-groups-v1',
+  'session-colors-v1',
+  'hidden-v1',
+  'apropos-v1'
+]
+const SYNC_LOCAL_PREFIX = 'messenger-'
+/** Device-local bookkeeping ({revs, seeded, serverRevs, names, queue}). Never
+ *  pushed — it is not in SYNC_SERVER_KEYS, and nothing routes it there. */
+const SYNC_META_KEY = 'messenger-sync-meta-v1'
+/** Idle time before a burst of edits goes out as ONE push. */
+const SYNC_DEBOUNCE_MS = 1500
+const SYNC_BACKOFF_MS = 2000
+const SYNC_BACKOFF_CAP_MS = 60000
+
+/** Local storage key → server key, or null for anything device-local. */
+function syncServerKey(localKey) {
+  const name = String(localKey || '').startsWith(SYNC_LOCAL_PREFIX)
+    ? String(localKey).slice(SYNC_LOCAL_PREFIX.length)
+    : ''
+
+  return SYNC_SERVER_KEYS.includes(name) ? name : null
+}
+
+function syncLocalKey(serverKey) {
+  return `${SYNC_LOCAL_PREFIX}${serverKey}`
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** "Nothing worth seeding": a fresh install's `{}` / EMPTY_SECTIONS must not
+ *  be pushed as if it were a deliberate arrangement. */
+function isEmptyPref(value) {
+  if (value === null || value === undefined || value === '') {
+    return true
+  }
+
+  if (Array.isArray(value)) {
+    return value.length === 0
+  }
+
+  if (isPlainObject(value)) {
+    return Object.values(value).every(isEmptyPref)
+  }
+
+  return false
+}
+
+/** HTTP status out of a rejected `ctx.rest`. The desktop bridge rejects with a
+ *  plain Error whose message is `"<status>: <body>"` (electron/api-expected-
+ *  404.ts); a status field is honoured too, for any other transport. 0 means
+ *  "no status" — offline, timeout, bridge missing. */
+function syncStatus(error) {
+  const direct = Number(error?.status ?? error?.statusCode ?? error?.response?.status)
+
+  if (Number.isInteger(direct) && direct >= 100) {
+    return direct
+  }
+
+  const match = /^\s*(\d{3})\b/.exec(String(error?.message ?? error ?? ''))
+
+  return match ? Number(match[1]) : 0
+}
+
+function normalizeSyncMeta(raw) {
+  const map = value => (isPlainObject(value) ? { ...value } : {})
+
+  return {
+    names: map(raw?.names),
+    queue: Array.isArray(raw?.queue) ? raw.queue.filter(name => SYNC_SERVER_KEYS.includes(name)) : [],
+    revs: map(raw?.revs),
+    seeded: map(raw?.seeded),
+    serverRevs: map(raw?.serverRevs)
+  }
+}
+
+/** The sync writer, every effect injected so the harness can drive it with a
+ *  fake backend and fake clock. `apply(localKey, value)` puts an ADOPTED value
+ *  into the pane (applyPref in production); `storage` is the same seam the
+ *  pane persists through. Nothing it does throws out: every public method is
+ *  safe to call from an event handler, and every rest failure is swallowed
+ *  into the retry queue.
+ *
+ *  Revs are Lamport: a push uses max(last rev seen from the server, last rev
+ *  this device wrote) + 1, recomputed per attempt, so they only ever rise and
+ *  always clear whatever another machine wrote last. */
+function createSync({
+  apply = () => undefined,
+  clearTimeout: cancel = globalThis.clearTimeout,
+  debounceMs = SYNC_DEBOUNCE_MS,
+  rest,
+  setTimeout: later = globalThis.setTimeout,
+  storage
+} = {}) {
+  let meta = normalizeSyncMeta(null)
+  let metaLoad = null
+  let metaLoaded = false
+  let bootstrapped = false
+  let unsupported = typeof rest !== 'function'
+  let disposed = false
+  let inflight = null
+  let again = false
+  let pullWanted = false
+  let timer = null
+  let failures = 0
+  /** Server key → newest local value (what a push would send). */
+  const values = new Map()
+  /** Server keys with local edits the server has not acknowledged. */
+  const dirty = new Set()
+
+  const read = async (key, fallback) => {
+    try {
+      const value = await storage?.get?.(key, fallback)
+
+      return value === undefined ? fallback : value
+    } catch {
+      return fallback
+    }
+  }
+
+  const write = (key, value) => {
+    try {
+      Promise.resolve(storage?.set?.(key, value)).catch(() => undefined)
+    } catch {
+      /* storage gone — the in-memory copy still holds */
+    }
+  }
+
+  /** Never before the stored meta is in: an early save would clobber the revs
+   *  a previous run persisted, and a reused rev is a lost write. */
+  const saveMeta = () => {
+    if (metaLoaded) {
+      write(SYNC_META_KEY, { ...meta, queue: [...dirty] })
+    }
+  }
+
+  const loadMeta = () => {
+    metaLoad ||= (async () => {
+      const stored = normalizeSyncMeta(await read(SYNC_META_KEY, null))
+
+      meta = stored
+
+      for (const name of stored.queue) {
+        dirty.add(name)
+      }
+
+      metaLoaded = true
+    })()
+
+    return metaLoad
+  }
+
+  const stopTimer = () => {
+    if (timer !== null) {
+      try {
+        cancel?.(timer)
+      } catch {
+        /* a fake clock without clearTimeout */
+      }
+
+      timer = null
+    }
+  }
+
+  const schedule = ms => {
+    if (disposed || unsupported) {
+      return
+    }
+
+    stopTimer()
+    timer = later(() => {
+      timer = null
+      void flush()
+    }, ms)
+    // A Node host (the harness) must not be kept alive by a pending push.
+    timer?.unref?.()
+  }
+
+  const backoff = () => Math.min(SYNC_BACKOFF_MS * 2 ** Math.max(0, failures - 1), SYNC_BACKOFF_CAP_MS)
+
+  const goUnsupported = () => {
+    unsupported = true
+    stopTimer()
+  }
+
+  const namesOf = value => (isPlainObject(value) ? Object.keys(value) : [])
+
+  const adopt = (name, value) => {
+    values.set(name, value)
+    meta.names[name] = namesOf(value)
+    write(syncLocalKey(name), value)
+
+    try {
+      apply(syncLocalKey(name), value)
+    } catch {
+      /* a bad remote value must not break the pane; local storage has it */
+    }
+  }
+
+  /** Fold a server view into local state. `sent` maps the keys this device
+   *  just pushed to the JSON it sent: for those the merged view is adopted
+   *  whenever it differs (another device's entries survived the merge), even
+   *  though its rev is our own. Any key with unpushed local edits is left
+   *  alone — only its seen rev advances, so the next push still outranks. */
+  const ingest = async (keys, sent = null) => {
+    for (const name of SYNC_SERVER_KEYS) {
+      const entry = keys[name]
+      const has = isPlainObject(entry) && entry.value !== undefined && entry.value !== null
+      const rev = Number(entry?.rev) || 0
+      const known = Number(meta.serverRevs[name]) || 0
+
+      if (has) {
+        meta.serverRevs[name] = Math.max(known, rev)
+      }
+
+      if (!meta.seeded[name]) {
+        // Seed-then-authoritative: a value the server already has wins over
+        // whatever this device carried in; an empty server takes ours.
+        if (has) {
+          dirty.delete(name)
+          adopt(name, entry.value)
+        } else {
+          const local = values.has(name) ? values.get(name) : await read(syncLocalKey(name), undefined)
+
+          if (!isEmptyPref(local)) {
+            values.set(name, local)
+            dirty.add(name)
+          }
+        }
+
+        meta.seeded[name] = true
+        continue
+      }
+
+      if (!has || dirty.has(name)) {
+        continue
+      }
+
+      if (sent?.has(name)) {
+        if (JSON.stringify(entry.value) !== sent.get(name)) {
+          adopt(name, entry.value)
+        }
+      } else if (rev > known) {
+        adopt(name, entry.value)
+      }
+    }
+  }
+
+  /** GET /state. False when the answer is not this contract's (an older
+   *  backend that routes /state to something else) — that is "unsupported". */
+  const pull = async () => {
+    const view = await rest('/state')
+
+    if (!isPlainObject(view?.keys)) {
+      goUnsupported()
+
+      return false
+    }
+
+    await ingest(view.keys)
+
+    return true
+  }
+
+  const push = async () => {
+    const batch = []
+    const body = { keys: {}, tombstones: [] }
+    const sent = new Map()
+
+    for (const name of [...dirty]) {
+      const value = values.has(name) ? values.get(name) : await read(syncLocalKey(name), undefined)
+
+      dirty.delete(name)
+
+      if (value === undefined) {
+        continue
+      }
+
+      const rev = Math.max(Number(meta.serverRevs[name]) || 0, Number(meta.revs[name]) || 0) + 1
+
+      meta.revs[name] = rev
+      body.keys[name] = { rev, value }
+      sent.set(name, JSON.stringify(value))
+      batch.push(name)
+
+      // Absent entries are KEPT by the server's entry-wise merge, so a removal
+      // has to be said out loud — against the last view both sides agreed on.
+      if (isPlainObject(value)) {
+        for (const entry of meta.names[name] || []) {
+          if (!Object.prototype.hasOwnProperty.call(value, entry)) {
+            body.tombstones.push({ entry, key: name, rev })
+          }
+        }
+      }
+    }
+
+    if (!batch.length) {
+      saveMeta()
+
+      return
+    }
+
+    // Revs hit storage BEFORE the request: a crash mid-flight never reuses one.
+    saveMeta()
+
+    let view
+
+    try {
+      view = await rest('/state', { body, method: 'PUT' })
+    } catch (error) {
+      const status = syncStatus(error)
+
+      if (status === 404) {
+        goUnsupported()
+
+        return
+      }
+
+      if (status === 400 || status === 413) {
+        // The same body would fail the same way forever; drop it, keep local.
+        saveMeta()
+
+        return
+      }
+
+      for (const name of batch) {
+        dirty.add(name)
+      }
+
+      saveMeta()
+      throw error
+    }
+
+    for (const name of batch) {
+      meta.names[name] = namesOf(body.keys[name].value)
+    }
+
+    if (isPlainObject(view?.keys)) {
+      await ingest(view.keys, sent)
+    }
+
+    saveMeta()
+  }
+
+  const run = async () => {
+    try {
+      await loadMeta()
+
+      if (!bootstrapped || pullWanted) {
+        pullWanted = false
+
+        if (!(await pull())) {
+          return
+        }
+
+        bootstrapped = true
+        saveMeta()
+      }
+
+      if (dirty.size) {
+        await push()
+      }
+
+      failures = 0
+    } catch (error) {
+      if (syncStatus(error) === 404) {
+        goUnsupported()
+
+        return
+      }
+
+      failures += 1
+      schedule(backoff())
+    }
+  }
+
+  /** One request chain at a time; an edit that lands mid-flight re-arms the
+   *  debounce once the chain settles instead of racing it. */
+  function flush() {
+    if (disposed || unsupported) {
+      return Promise.resolve()
+    }
+
+    if (inflight) {
+      again = true
+
+      return inflight
+    }
+
+    stopTimer()
+    inflight = run().finally(() => {
+      inflight = null
+
+      if (again) {
+        again = false
+
+        if (dirty.size && timer === null) {
+          schedule(debounceMs)
+        }
+      }
+    })
+
+    return inflight
+  }
+
+  return {
+    /** A local persist(). True when the key is shared and a push is armed. */
+    noteLocal(localKey, value) {
+      const name = syncServerKey(localKey)
+
+      if (!name || disposed || unsupported) {
+        return false
+      }
+
+      values.set(name, value)
+      dirty.add(name)
+      saveMeta()
+
+      if (inflight) {
+        again = true
+      } else {
+        // During a backoff an edit must not shortcut the wait.
+        schedule(Math.max(debounceMs, failures ? backoff() : 0))
+      }
+
+      return true
+    },
+    /** Network back: retry now, forgetting the backoff. */
+    online() {
+      if (disposed || unsupported) {
+        return
+      }
+
+      failures = 0
+
+      if (dirty.size || !bootstrapped) {
+        void flush()
+      }
+    },
+    /** Window shown again: pick up what other machines wrote meanwhile. */
+    visible() {
+      if (disposed || unsupported) {
+        return
+      }
+
+      pullWanted = true
+      void flush()
+    },
+    start: () => flush(),
+    flush,
+    dispose() {
+      disposed = true
+      stopTimer()
+    },
+    state: () => ({
+      bootstrapped,
+      dirty: [...dirty],
+      failures,
+      meta: JSON.parse(JSON.stringify(meta)),
+      pending: timer !== null,
+      unsupported
+    })
+  }
+}
+
+/** The live writer for this window; replaced on every register(). */
+let prefSync = null
+let syncListening = false
+
+/** Wire the writer to the host. Called after loadPrefs, and never awaited:
+ *  first contact with the server must not hold up the pane's first paint. */
+function startSync(ctx) {
+  try {
+    prefSync?.dispose()
+  } catch {
+    /* already gone */
+  }
+
+  prefSync = null
+
+  if (typeof ctx?.rest !== 'function') {
+    return
+  }
+
+  try {
+    prefSync = createSync({
+      apply: applyPref,
+      rest: (path, opts) => ctx.rest(path, opts),
+      storage: ctx.storage
+    })
+    void prefSync.start()
+  } catch {
+    prefSync = null
+  }
+
+  if (syncListening) {
+    return
+  }
+
+  syncListening = true
+
+  try {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('online', () => prefSync?.online())
+    }
+
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          prefSync?.visible()
+        }
+      })
+    }
+  } catch {
+    /* no DOM events — pushes still go out on the debounce */
   }
 }
 
@@ -7997,6 +8571,7 @@ export default {
   register(ctx) {
     ctxRef = ctx
     loadPrefs()
+    startSync(ctx)
 
     ctx.i18n.register({
       en: {
@@ -8180,6 +8755,15 @@ export default {
  *  filtering and grouping without a DOM to type into. Not part of the plugin
  *  API: the app reads `default` and nothing else. */
 export const __internals = {
+  applyPref,
+  createSync,
+  isEmptyPref,
+  syncServerKey,
+  syncStatus,
+  SYNC_DEBOUNCE_MS,
+  SYNC_META_KEY,
+  SYNC_SERVER_KEYS,
+  getPrefSync: () => prefSync,
   createGroupNow,
   dropAction,
   elementAt,

@@ -5488,6 +5488,553 @@ check(
   lzCalls.map(call => call.params.limit).join(' → ')
 )
 
+// ── cross-device sync (PUT/GET /state) ──────────────────────────────────────
+//
+// The writer is driven through `createSync` with a fake backend and a fake
+// clock, so debounce, backoff and rev arithmetic are exact, not timing-lucky.
+
+const syncSettle = async () => {
+  for (let i = 0; i < 12; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+}
+
+const syncClock = () => {
+  let now = 0
+  let seq = 0
+  const timers = new Map()
+
+  return {
+    clearTimeout: id => timers.delete(id),
+    pending: () => [...timers.values()].map(timer => timer.at - now),
+    setTimeout: (fn, ms) => {
+      seq += 1
+      timers.set(seq, { at: now + ms, fn })
+
+      return seq
+    },
+    async advance(ms) {
+      const end = now + ms
+
+      for (;;) {
+        const due = [...timers.entries()].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0]
+
+        if (!due) {
+          break
+        }
+
+        now = due[1].at
+        timers.delete(due[0])
+        due[1].fn()
+        await syncSettle()
+      }
+
+      now = end
+      await syncSettle()
+    }
+  }
+}
+
+const syncIsObj = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+
+/** A small model of plugin_api.py's merge: entry-wise for objects (per-entry
+ *  revs, remembered tombstones), whole-value LWW otherwise. */
+const syncServer = (seed = {}) => {
+  const store = {}
+  const calls = []
+  const srv = { calls, fail: null, store }
+
+  for (const [name, { rev, value }] of Object.entries(seed)) {
+    store[name] = syncIsObj(value)
+      ? { entries: Object.fromEntries(Object.keys(value).map(k => [k, rev])), rev, tombs: {}, value: { ...value } }
+      : { rev, value }
+  }
+
+  const view = () => ({
+    version: 1,
+    keys: Object.fromEntries(
+      Object.entries(store).map(([name, row]) => [name, { rev: row.rev, updated_at: '2026-10-11T00:00:00Z', value: row.value }])
+    )
+  })
+
+  srv.rest = async (path, opts = {}) => {
+    const method = opts.method || 'GET'
+
+    calls.push({ body: opts.body === undefined ? undefined : JSON.parse(JSON.stringify(opts.body)), method, path })
+
+    const failure = srv.fail?.(method, path)
+
+    if (failure) {
+      throw failure
+    }
+
+    if (method === 'PUT') {
+      for (const [name, { rev, value }] of Object.entries(opts.body.keys || {})) {
+        const row = store[name]
+
+        if (syncIsObj(value)) {
+          const next = row && syncIsObj(row.value) ? row : { entries: {}, rev: 0, tombs: {}, value: {} }
+
+          for (const [entry, entryValue] of Object.entries(value)) {
+            if (rev > (next.entries[entry] ?? -1) && rev > (next.tombs[entry] ?? -1)) {
+              next.value[entry] = entryValue
+              next.entries[entry] = rev
+            }
+          }
+
+          next.rev = Math.max(next.rev, rev)
+          store[name] = next
+        } else if (!row || rev > row.rev) {
+          store[name] = { rev, value }
+        }
+      }
+
+      for (const { entry, key, rev } of opts.body.tombstones || []) {
+        const row = store[key]
+
+        if (row?.entries && rev > (row.entries[entry] ?? -1)) {
+          delete row.value[entry]
+          delete row.entries[entry]
+          row.tombs[entry] = rev
+          row.rev = Math.max(row.rev, rev)
+        }
+      }
+    }
+
+    return view()
+  }
+
+  return srv
+}
+
+const syncStorage = (initial = {}) => {
+  const data = { ...initial }
+
+  return { data, get: (key, fallback) => (key in data ? data[key] : fallback), set: (key, value) => (data[key] = value) }
+}
+
+const makeSync = ({ server = syncServer(), storage = syncStorage(), applied = [] } = {}) => {
+  const clock = syncClock()
+  const sync = __internals.createSync({
+    apply: (key, value) => applied.push({ key, value }),
+    clearTimeout: clock.clearTimeout,
+    rest: server.rest,
+    setTimeout: clock.setTimeout,
+    storage
+  })
+
+  return { applied, clock, server, storage, sync }
+}
+
+const puts = server => server.calls.filter(call => call.method === 'PUT')
+
+// (a) debounce + coalesce + server key name + rev
+{
+  const { clock, server, sync } = makeSync()
+
+  await sync.start()
+  await syncSettle()
+  sync.noteLocal('messenger-session-sort-v1', { zulu: 'name' })
+  await clock.advance(500)
+  sync.noteLocal('messenger-session-sort-v1', { zulu: 'manual' })
+  await clock.advance(1499)
+
+  check('sync: nothing is pushed before the debounce goes idle', puts(server).length === 0)
+
+  await clock.advance(1)
+
+  const sent = puts(server)
+
+  check(
+    'sync: rapid edits coalesce into ONE push under the un-prefixed server key, rev 1',
+    sent.length === 1 &&
+      sent[0].path === '/state' &&
+      Object.keys(sent[0].body.keys).join(',') === 'session-sort-v1' &&
+      sent[0].body.keys['session-sort-v1'].value.zulu === 'manual' &&
+      sent[0].body.keys['session-sort-v1'].rev === 1,
+    JSON.stringify(sent.map(call => call.body))
+  )
+  check(
+    'sync: the PUT body is a plain object (the bridge JSON-encodes it; a string would double-encode)',
+    typeof sent[0]?.body === 'object' && Array.isArray(sent[0]?.body?.tombstones)
+  )
+  check('sync: an acknowledged push leaves nothing queued', sync.state().dirty.length === 0 && !sync.state().pending)
+}
+
+// (b) device-local keys never leave the machine
+{
+  const { clock, server, storage, sync } = makeSync()
+
+  await sync.start()
+
+  const armed = [
+    sync.noteLocal('messenger-expanded-v1', { zulu: true }),
+    sync.noteLocal('messenger-activity-toasts', true),
+    sync.noteLocal(__internals.SYNC_META_KEY, { revs: {} }),
+    sync.noteLocal('messenger-search', 'flux')
+  ]
+
+  await clock.advance(10000)
+
+  check(
+    'sync: expanded, toasts, search and the sync meta are never pushed',
+    armed.every(flag => flag === false) && puts(server).length === 0,
+    JSON.stringify({ armed, puts: puts(server) })
+  )
+
+  sync.noteLocal('messenger-hidden-v1', { zulu: ['s1'] })
+  await clock.advance(1500)
+
+  const keysSent = puts(server).flatMap(call => Object.keys(call.body.keys))
+
+  check(
+    'sync: only the seven shared keys exist on the wire',
+    keysSent.join(',') === 'hidden-v1' &&
+      keysSent.every(name => __internals.SYNC_SERVER_KEYS.includes(name)) &&
+      __internals.SYNC_SERVER_KEYS.length === 7 &&
+      !__internals.SYNC_SERVER_KEYS.some(name => /expanded|toast|meta/.test(name)),
+    keysSent.join(',')
+  )
+  check(
+    'sync: revs live in a device-local meta key, never in a shared one',
+    storage.data[__internals.SYNC_META_KEY]?.revs?.['hidden-v1'] === 1
+  )
+}
+
+// (c) rest throwing / rejecting: no throw, queued, retried with backoff
+{
+  const server = syncServer()
+  const { clock, sync } = makeSync({ server })
+
+  await sync.start()
+  server.fail = method => (method === 'PUT' ? new Error('net::ERR_INTERNET_DISCONNECTED') : null)
+
+  let threw = false
+
+  try {
+    sync.noteLocal('messenger-session-order-v1', { zulu: ['a', 'b'] })
+    await clock.advance(1500)
+  } catch {
+    threw = true
+  }
+
+  check(
+    'sync: a failing PUT does not throw and keeps the key queued',
+    !threw && sync.state().dirty.includes('session-order-v1') && sync.state().failures === 1,
+    JSON.stringify(sync.state())
+  )
+  check('sync: the first retry waits 2s', clock.pending().join(',') === '2000', clock.pending().join(','))
+
+  await clock.advance(2000)
+
+  check('sync: the second retry backs off to 4s', clock.pending().join(',') === '4000', clock.pending().join(','))
+
+  server.fail = null
+  await clock.advance(4000)
+
+  const sent = puts(server)
+  const last = sent[sent.length - 1]
+
+  check(
+    'sync: once the server is back the queued value lands and the queue drains',
+    sent.length === 3 &&
+      last.body.keys['session-order-v1'].value.zulu.join(',') === 'a,b' &&
+      server.store['session-order-v1']?.value?.zulu?.join(',') === 'a,b' &&
+      sync.state().dirty.length === 0 &&
+      sync.state().failures === 0,
+    JSON.stringify({ revs: sent.map(call => call.body.keys['session-order-v1']?.rev), state: sync.state() })
+  )
+  check(
+    'sync: every retry carries a fresh, higher rev',
+    sent.map(call => call.body.keys['session-order-v1'].rev).join(',') === '1,2,3',
+    sent.map(call => call.body.keys['session-order-v1'].rev).join(',')
+  )
+
+  // The backoff is capped at 60s however long the outage.
+  server.fail = () => new Error('offline')
+  sync.noteLocal('messenger-session-order-v1', { zulu: ['b'] })
+
+  for (let i = 0; i < 8; i++) {
+    await clock.advance(Math.max(...clock.pending(), 0))
+  }
+
+  check('sync: backoff is capped at 60s', clock.pending().join(',') === '60000', clock.pending().join(','))
+
+  server.fail = null
+  sync.online()
+  await syncSettle()
+
+  check(
+    "sync: the window's 'online' event retries at once",
+    sync.state().dirty.length === 0 && server.store['session-order-v1'].value.zulu.join(',') === 'b'
+  )
+
+  // A server that will not answer the first GET: the pane's edits still queue.
+  const down = syncServer()
+
+  down.fail = () => Object.assign(new Error('timeout'), { status: undefined })
+
+  const offline = makeSync({ server: down })
+
+  await offline.sync.start()
+  offline.sync.noteLocal('messenger-sections-v1', { sections: [{ id: 'a', name: 'A' }] })
+  await offline.clock.advance(1500)
+
+  check(
+    'sync: unreachable at startup = edits queued, no throw, retry armed',
+    offline.sync.state().dirty.includes('sections-v1') && !offline.sync.state().bootstrapped && offline.clock.pending().length === 1
+  )
+
+  // End to end through the pane: a rejecting backend never costs the local write.
+  const savedStorage = { ...h.storage }
+  const throwingCtx = {
+    ...ctx,
+    rest: async () => {
+      throw new Error('ECONNREFUSED')
+    }
+  }
+  let paneThrew = false
+
+  try {
+    plugin.register(throwingCtx)
+    await syncSettle()
+    __internals.setSessionSort('sync-x', 'name')
+  } catch {
+    paneThrew = true
+  }
+
+  check(
+    'sync: with the backend down, the pane still writes local storage immediately',
+    !paneThrew &&
+      h.storage['messenger-session-sort-v1']?.['sync-x'] === 'name' &&
+      __internals.getPrefSync()?.state().dirty.includes('session-sort-v1'),
+    JSON.stringify(__internals.getPrefSync()?.state())
+  )
+
+  __internals.getPrefSync()?.dispose()
+  Object.keys(h.storage).forEach(key => delete h.storage[key])
+  Object.assign(h.storage, savedStorage)
+}
+
+// (d) 404: an older backend without /state — silent, local-only, no spam
+{
+  const server = syncServer()
+
+  server.fail = () => new Error('404: {"detail":"Not Found"}')
+
+  const { clock, sync } = makeSync({ server })
+
+  let threw = false
+
+  try {
+    await sync.start()
+  } catch {
+    threw = true
+  }
+
+  const armed = sync.noteLocal('messenger-session-sort-v1', { zulu: 'name' })
+
+  await clock.advance(120000)
+
+  check(
+    'sync: 404 on /state = unsupported for the session, one request, no retries',
+    !threw && sync.state().unsupported && !armed && server.calls.length === 1 && clock.pending().length === 0,
+    JSON.stringify({ calls: server.calls.length, state: sync.state() })
+  )
+
+  const odd = syncServer()
+
+  odd.rest = async () => ({ results: [] })
+
+  const oddSync = makeSync({ server: odd })
+
+  await oddSync.sync.start()
+
+  check('sync: a /state answer without `keys` (not this contract) is treated as unsupported', oddSync.sync.state().unsupported)
+  check(
+    'sync: the status is read from the bridge\'s "<status>: <body>" message or a status field',
+    __internals.syncStatus(new Error('404: nope')) === 404 && __internals.syncStatus({ status: 413 }) === 413 && __internals.syncStatus(new Error('offline')) === 0
+  )
+}
+
+// (e) seeding: an empty server takes ours; a populated server wins
+{
+  const server = syncServer({ 'sections-v1': { rev: 7, value: { sections: [{ id: 'remote', name: 'Remote' }] } } })
+  const storage = syncStorage({
+    'messenger-sections-v1': { sections: [{ id: 'stale', name: 'Stale' }] },
+    'messenger-session-sort-v1': { zulu: 'name' },
+    'messenger-session-order-v1': {}
+  })
+  const { applied, clock, sync } = makeSync({ server, storage })
+
+  await sync.start()
+  await clock.advance(0)
+
+  const sent = puts(server)
+  const keysSent = sent.flatMap(call => Object.keys(call.body.keys))
+
+  check(
+    'sync: seeding pushes a non-empty local value the server lacks',
+    keysSent.includes('session-sort-v1') && server.store['session-sort-v1']?.value?.zulu === 'name',
+    JSON.stringify(keysSent)
+  )
+  check('sync: seeding never pushes an empty local value', !keysSent.includes('session-order-v1'))
+  check(
+    'sync: a server value is ADOPTED over the local one, and never pushed over',
+    !keysSent.includes('sections-v1') &&
+      server.store['sections-v1'].value.sections[0].id === 'remote' &&
+      storage.data['messenger-sections-v1'].sections[0].id === 'remote' &&
+      applied.some(row => row.key === 'messenger-sections-v1' && row.value.sections[0].id === 'remote'),
+    JSON.stringify({ applied, keysSent })
+  )
+  check(
+    'sync: every shared key is marked seeded after first contact',
+    __internals.SYNC_SERVER_KEYS.every(name => sync.state().meta.seeded[name] === true)
+  )
+
+  // A second run (same storage) must not re-seed: it reads the meta back.
+  const again = makeSync({ server, storage })
+
+  await again.sync.start()
+
+  check('sync: a seeded device does not re-seed on the next start', puts(server).length === sent.length)
+
+  // Through the pane: adoption lands in the atoms the rows read.
+  const savedStorage = { ...h.storage }
+  const remote = syncServer({
+    'session-sort-v1': { rev: 3, value: { zulu: 'name' } },
+    'session-colors-v1': { rev: 2, value: { zulu: { 'sess-zulu-9': '#ef4444' } } }
+  })
+
+  delete h.storage[__internals.SYNC_META_KEY]
+  __internals.SYNC_SERVER_KEYS.forEach(name => delete h.storage[`messenger-${name}`])
+  h.storage['messenger-session-sort-v1'] = { zulu: 'manual' }
+  plugin.register({ ...ctx, rest: remote.rest })
+  await syncSettle()
+
+  check(
+    'sync: the pane adopts server values into its atoms and local storage',
+    __internals.$sessionSort.get().zulu === 'name' &&
+      h.storage['messenger-session-sort-v1'].zulu === 'name' &&
+      __internals.sessionColor('zulu', 'sess-zulu-9') === '#ef4444' &&
+      puts(remote).length === 0,
+    JSON.stringify({ calls: remote.calls.map(c => c.method), sort: __internals.$sessionSort.get() })
+  )
+
+  __internals.toggleExpanded('zulu')
+  __internals.setSessionSort('zulu', 'activity')
+  await new Promise(resolve => setTimeout(resolve, __internals.SYNC_DEBOUNCE_MS + 150))
+  await syncSettle()
+
+  const paneKeys = puts(remote).flatMap(call => Object.keys(call.body.keys))
+
+  check(
+    'sync: through the pane, a sort change is pushed and the expand toggle is not',
+    paneKeys.join(',') === 'session-sort-v1' && remote.store['session-sort-v1'].value.zulu === 'activity' && remote.store['session-sort-v1'].rev === 4,
+    JSON.stringify({ paneKeys, store: remote.store['session-sort-v1'] })
+  )
+
+  __internals.getPrefSync()?.dispose()
+  Object.keys(h.storage).forEach(key => delete h.storage[key])
+  Object.assign(h.storage, savedStorage)
+  plugin.register(ctx)
+  await syncSettle()
+
+  check(
+    "sync: the harness's own backend has no /state contract, so the live pane is local-only again",
+    __internals.getPrefSync()?.state().unsupported === true
+  )
+}
+
+// (f) removing an object entry is sent as a tombstone; (g) revs climb past the server's
+{
+  const server = syncServer({
+    'session-colors-v1': { rev: 3, value: { ghost: { s2: '#22c55e' }, zulu: { s1: '#ef4444' } } }
+  })
+  const { clock, sync } = makeSync({ server })
+
+  await sync.start()
+  sync.noteLocal('messenger-session-colors-v1', { zulu: { s1: '#ef4444' } })
+  await clock.advance(1500)
+
+  const first = puts(server)[0]?.body
+
+  check(
+    'sync: a removed top-level entry goes out as a tombstone with the new rev',
+    first?.keys['session-colors-v1']?.rev === 4 &&
+      first.tombstones.length === 1 &&
+      first.tombstones[0].key === 'session-colors-v1' &&
+      first.tombstones[0].entry === 'ghost' &&
+      first.tombstones[0].rev === 4 &&
+      !('ghost' in server.store['session-colors-v1'].value),
+    JSON.stringify(first)
+  )
+
+  sync.noteLocal('messenger-session-colors-v1', { zulu: { s1: '#3b82f6' } })
+  await clock.advance(1500)
+
+  check(
+    'sync: an entry already tombstoned is not tombstoned again',
+    puts(server)[1]?.body?.tombstones?.length === 0 && puts(server)[1].body.keys['session-colors-v1'].rev === 5
+  )
+
+  // Another machine writes rev 10 meanwhile; this one picks it up on show.
+  server.store['session-colors-v1'] = {
+    entries: { kilo: 10, zulu: 10 },
+    rev: 10,
+    tombs: {},
+    value: { kilo: { s9: '#a855f7' }, zulu: { s1: '#3b82f6' } }
+  }
+  sync.visible()
+  await syncSettle()
+
+  check(
+    'sync: a higher server rev is adopted when the key has no local edits',
+    sync.state().meta.serverRevs['session-colors-v1'] === 10 && sync.state().meta.names['session-colors-v1'].includes('kilo')
+  )
+
+  sync.noteLocal('messenger-session-colors-v1', { zulu: { s1: '#3b82f6' } })
+  await clock.advance(1500)
+
+  const revs = puts(server).map(call => call.body.keys['session-colors-v1'].rev)
+  const last = puts(server)[2]?.body
+
+  check(
+    'sync: revs strictly increase and exceed the highest rev seen from the server',
+    revs.join(',') === '4,5,11' && last.tombstones.map(t => `${t.entry}@${t.rev}`).join(',') === 'kilo@11',
+    JSON.stringify({ revs, last })
+  )
+
+  // Local edits are never clobbered by a server view while they are unpushed.
+  server.fail = method => (method === 'PUT' ? new Error('offline') : null)
+  sync.noteLocal('messenger-session-colors-v1', { mine: { s0: '#000000' } })
+  server.store['session-colors-v1'].rev = 50
+  server.store['session-colors-v1'].value = { theirs: { s5: '#ffffff' } }
+  server.store['session-colors-v1'].entries = { theirs: 50 }
+  sync.visible()
+  await syncSettle()
+
+  check(
+    'sync: a pull never overwrites a key that has unpushed local edits',
+    server.calls.slice(-2).map(call => call.method).join(',') === 'GET,PUT' &&
+      sync.state().dirty.includes('session-colors-v1') &&
+      !sync.state().meta.names['session-colors-v1'].includes('theirs'),
+    JSON.stringify(sync.state())
+  )
+
+  server.fail = null
+  await clock.advance(2000)
+
+  check(
+    'sync: …and its pushes outrank what it saw: 51 (failed), then 52, and the merge keeps theirs',
+    puts(server).slice(-2).map(call => call.body.keys['session-colors-v1'].rev).join(',') === '51,52' &&
+      Object.keys(server.store['session-colors-v1'].value).sort().join(',') === 'mine,theirs' &&
+      sync.state().meta.names['session-colors-v1'].sort().join(',') === 'mine,theirs' &&
+      sync.state().dirty.length === 0,
+    JSON.stringify(puts(server).slice(-1)[0].body)
+  )
+}
+
 const failedNow = results.filter(r => !r.ok)
 
 console.log(`\n${results.length - failedNow.length}/${results.length} passed`)
