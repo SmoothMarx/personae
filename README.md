@@ -1,24 +1,8 @@
-# 🎭 Personae — Agent Roster & Session Rail
+# 🎭 Personae — Agent Messenger
 
-**Every face your agent wears, in one rail.**
+**Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions. Nothing else.
+Right now, it is a plugin for the **Hermes Desktop** app. It adds a native tab beside **Sessions | Bots**
 
-**Personae** is a plugin for the **Hermes Desktop** app. It adds a native tab beside
-**Sessions | Bots** — a 280px rail that puts the two things you always want side by
-side: **who your agents are**, and **what they've been doing**. One row per profile;
-its live sessions one click underneath.
-
-No build step. No dependencies. No server. One plain ESM file the app runs as it
-stands, talking to the stores it already owns.
-
-```
- ┌─ Sessions | Bots | Personae ─────────┐
- │  ◉  Ada            working now  4m   │   ← the rail: one row per face
- │     ↳ rewrote the ingest script      │
- │  ○  Scout                 yesterday  │
- │     ↳ Trip: Oslo, day 2              │
- │  ○  Dobbs                     2d     │
- └──────────────────────────────────────┘
-```
 
 ---
 
@@ -26,7 +10,7 @@ stands, talking to the stores it already owns.
 
 | Capability | What it gives you |
 | --- | --- |
-| 🗂️ **The rail** | One row per profile: face, name, a preview of the last session, its age |
+| 🗂️ **Messenger-style** | One row per profile: face, name, a preview of the last session, its age |
 | 🔽 **Expand a face** | Its sessions — status dot, title, preview, age — newest first |
 | 🟡 **Status lights** | Amber: waiting on you. Emerald: unread. Neutral: nothing. Numbered at 2+ |
 | 🎨 **Colour that fills** | A profile's colour tints every session under it. Session → group → profile |
@@ -286,10 +270,6 @@ Personae is a thin layer standing on the shoulders of:
 ### Hermes Desktop
 The app it lives in — its plugin SDK and its stores. The Sessions and Bots panes gave
 the rail its whole vocabulary.
-
-### React
-The harness renders the pane with the same `react-dom/server` the app ships, so a
-failing check means a real difference in the tree.
 
 ### The Bots tab
 Profile identity — name, avatar, colour — is Bots' store. Personae reads and writes the
