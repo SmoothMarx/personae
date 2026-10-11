@@ -1,5 +1,9 @@
 # 🎭 Personae — Agent Messenger
 
+<p align="center">
+  <img src="assets/personae-logo.png" width="256" alt="The Personae mark: a black line-art bust of Michelangelo's David in three-quarter view, curly hair, with the front plane of the face — brow, eye, cheek, chin — filled solid blue">
+</p>
+
 **Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions. Nothing else.
 Right now, it is a plugin for the **Hermes Desktop** app. 
 
