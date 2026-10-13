@@ -6,7 +6,7 @@
  * unrelated. Components render as plain host elements carrying data-* markers,
  * so the test can assert on the TREE (which glyph/tone/state) rather than on
  * pixels. Reactive host state and `useQuery` are global-backed: the test sets
- * `globalThis.__MESSENGER_HARNESS__` and reads back what the code asked for.
+ * `globalThis.__PERSONAE_HARNESS__` and reads back what the code asked for.
  */
 
 import { createContext, useContext } from 'react'
@@ -16,7 +16,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const harness = () => {
   const g = globalThis
 
-  g.__MESSENGER_HARNESS__ ||= {
+  g.__PERSONAE_HARNESS__ ||= {
     i18n: {},
     newChats: [],
     opens: [],
@@ -34,7 +34,7 @@ const harness = () => {
     unread: []
   }
 
-  return g.__MESSENGER_HARNESS__
+  return g.__PERSONAE_HARNESS__
 }
 
 // ── host ────────────────────────────────────────────────────────────────────

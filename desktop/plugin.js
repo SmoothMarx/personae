@@ -76,7 +76,7 @@
  * pinned down (a child that never ran a turn, a lineage that renames itself on
  * compaction). Pedro, 2026-10-10: "flag the apropos feature as beta".
  *
- * Save:  ~/.hermes/desktop-plugins/messenger/plugin.js   (folder name == id)
+ * Save:  ~/.hermes/desktop-plugins/personae/plugin.js   (folder name == id)
  * Load:  the app's OWN home — run ./deploy.sh here, then let it hot-reload
  *        (fallback: ⌘K → Reload desktop plugins).
  *
@@ -135,7 +135,12 @@ import {
 import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const ID = 'messenger'
+/** The plugin id. The app keys storage by it (`hermes.plugin.<id>.*`) and the
+ *  pane's own backend mounts at `/api/plugins/<id>/`, so it is also the folder
+ *  name. Renamed from `messenger` in 1.2.0; `migrateLegacyStorage()` carries
+ *  saved prefs across — see the constants below for what deliberately KEEPS
+ *  the old spelling. */
+const ID = 'personae'
 
 /** The app's own roster cadence (`profile_roster_cache.py`: "polls every 5s"). */
 const POLL_MS = 5000
@@ -146,12 +151,16 @@ const ACTIVE_WINDOW_S = 90
 const WORKER_ACTIVE_WINDOW_S = 150
 /** The "recently active" bucket, also the rail's (`RECENT_ACTIVITY_WINDOW_S`). */
 const RECENT_WINDOW_S = 7 * 24 * 60 * 60
-/** The `ui_meta` namespace this pane owns. Distinct from the Bots pane's. */
-const META_KEY = 'messenger'
+/** The `ui_meta` namespace this pane writes. Distinct from the Bots pane's. */
+const META_KEY = 'personae'
+/** …and the one it read before 1.2.0 renamed the id. Profile rows are user
+ *  data, not code: a `hidden` flag an older build wrote is still honoured, so
+ *  both namespaces are read (the new one wins) and neither is rewritten. */
+const LEGACY_META_KEY = 'messenger'
 // The Bots pane's own namespace, deliberately: same document, two panes.
 const BOTS_META_KEY = 'hermes-bots'
-const ROSTER_KEY = ['messenger', 'roster']
-const SEARCH_KEY = ['messenger', 'search']
+const ROSTER_KEY = ['personae', 'roster']
+const SEARCH_KEY = ['personae', 'search']
 /** Sections live HERE, not in `ui_meta.sectionId` — the Bots pane owns that
  *  field and two writers would race for it. Same idea, own drawer. */
 const SECTIONS_KEY = 'messenger-sections-v1'
@@ -164,7 +173,7 @@ const TOASTS_KEY = 'messenger-activity-toasts'
 const COLORS_KEY = 'messenger-session-colors-v1'
 const SESSION_ORDER_KEY = 'messenger-session-order-v1'
 /** The project list behind "Assign to project" (per-profile `projects.db`). */
-const PROJECTS_KEY = ['messenger', 'projects']
+const PROJECTS_KEY = ['personae', 'projects']
 /** How many of a profile's sessions the roster lists before "View all". Pedro
  *  halved this from 20 on 2026-10-09: a collapsed roster has to stay scannable.
  *  It is a display cap, never a filter: anything the pane has a REASON to draw
@@ -1246,13 +1255,16 @@ function persist(key, value) {
 //
 // The roster prefs a user arranges by hand (sort, order, sections, groups,
 // colours, hidden, apropos) follow them across machines through the pane's own
-// backend: `GET/PUT /api/plugins/messenger/state`. The contract is in the
+// backend: `GET/PUT /api/plugins/personae/state`. The contract is in the
 // README ("Sync contract"); the short of it is LWW by a per-key Lamport rev,
 // object values merged entry-wise server-side, removals as tombstones, and
 // seed-then-authoritative on first contact. Everything here is best-effort: a
 // failure queues and retries, a 404 (older backend) silently means local-only.
 
-/** Server key names (no `messenger-` prefix). The ONLY keys ever pushed or
+/** Server key names (no `messenger-` prefix — the LOCAL key names below keep
+ *  that prefix on purpose: they are the wire contract with the pane's backend
+ *  and with Personae Mobile, and renaming them would need a migration on both
+ *  ends for no user-visible gain). The ONLY keys ever pushed or
  *  read back; expanded, toasts, search, scroll and widths are device-local by
  *  omission. Kept as literals, not the *_KEY constants: several of those are
  *  declared further down the module and would still be in their TDZ here. */
@@ -2240,8 +2252,11 @@ function secondsToMs(value) {
 
 function metaOf(profile) {
   const raw = profile?.ui_meta?.[META_KEY]
+  const legacy = profile?.ui_meta?.[LEGACY_META_KEY]
 
-  return raw && typeof raw === 'object' ? raw : {}
+  if (raw && typeof raw === 'object') return raw
+
+  return legacy && typeof legacy === 'object' ? legacy : {}
 }
 
 /** The 'hermes-bots' slice of a profile's ui_meta — the SAME document the Bots
@@ -2611,7 +2626,7 @@ async function searchInSessions(profiles, needle) {
 
 /** Message BODIES are the one thing the RPC surface cannot read (every
  *  `session.*` method returns session metadata), so the pane's own Python
- *  backend does the FTS read: `/api/plugins/messenger/search`, read-only, one
+ *  backend does the FTS read: `/api/plugins/personae/search`, read-only, one
  *  profile per call. `ctx.rest` is namespaced to this plugin, which is why
  *  that backend exists at all. A backend that is missing or unmounted returns
  *  null — the metadata sweep above is then all the search is, never an error. */
@@ -2917,13 +2932,72 @@ function sessionIdOf(session) {
 
 /** D-D, the dock half: put a profile's recent sessions on the tab strip, capped.
  *  Each open carries its own profile — a bare id would land in the app's own
- *  profile, which is exactly the bug this pane exists to avoid. */
-function dockSessions(row, sessions) {
-  const dock = (sessions || []).filter(session => sessionIdOf(session)).slice(0, DOCK_LIMIT)
+ *  profile, which is exactly the bug this pane exists to avoid.
+ *
+ *  `exceptOpenId` is a session that must NOT be docked — the one the user just
+ *  clicked, which is already the surface in FRONT. Docking it too would either
+ *  stack it beside itself or hand the focus to whichever tab opened last,
+ *  leaving the user looking at a session they never picked. */
+function profileIsActive(profile) {
+  return String(host.state.profile.get() || '') === String(profile || '')
+}
 
-  dock.forEach(session => openSession(sessionIdOf(session), row.name, 'tab', INTENT_OPEN))
+/** What an open has to carry to MOVE the app onto `profile` — or null when it is
+ *  already there.
+ *
+ *  `keepAllProfilesScope: false` is the SDK's own "explicit profile workspace
+ *  switch" (`sdk/plugin-open-session-plan.ts`: false ->
+ *  `{switchWorkspace: profile, showAllProfiles: false,
+ *  requireActiveProfileForHydration: true}`), the same recipe the session-click
+ *  path uses. Nothing else moves the chrome: with the flag absent (undefined
+ *  counts as TRUE) a plugin open dials the profile's backend and leaves
+ *  `$activeGatewayProfile` where it is.
+ *
+ *  Why a DOCK needs it (Pedro, 2026-10-13: "some session names are showing up as
+ *  'new session' instead of their actual name"): core keeps session tabs in
+ *  per-profile buckets and files a tile into whichever bucket is visible when it
+ *  is CREATED, so tabs opened for a profile the app never moved to are filed
+ *  under the profile the user came from — and a tab's title resolves against the
+ *  LOADED session list of the visible profile, which holds no row for a session
+ *  of another one. A tab with no row to name it stays on its "New session"
+ *  placeholder (`app/chat/session-tile.tsx` `NEW_SESSION_TITLE`), which is
+ *  exactly the nameless strip this fixes. */
+function switchingFlags(profile) {
+  return profileIsActive(profile) ? null : { keepAllProfilesScope: false }
+}
 
-  return dock.length
+function dockSessions(profile, sessions, exceptOpenId = null) {
+  const name = String(profile || '')
+  const except = String(exceptOpenId || '')
+  const dock = (sessions || [])
+    .filter(session => sessionIdOf(session) && sessionIdOf(session) !== except)
+    .slice(0, DOCK_LIMIT)
+
+  if (!name || !dock.length) {
+    return Promise.resolve(0)
+  }
+
+  const open = (session, flags) =>
+    openSession(sessionIdOf(session), name, 'tab', flags ? { ...INTENT_OPEN, ...flags } : INTENT_OPEN)
+  const switching = switchingFlags(name)
+
+  if (!switching) {
+    dock.forEach(session => open(session))
+
+    return Promise.resolve(dock.length)
+  }
+
+  // Cross-profile: the FIRST tab carries the switch, and nothing may be created
+  // beside it until that move has landed — the SDK awaits the activation before
+  // it navigates (`requireActiveProfileForHydration`), so everything opened after
+  // this resolves files into the profile that is now visible.
+  const [first, ...rest] = dock
+
+  return open(first, switching).then(() => {
+    rest.forEach(session => open(session))
+
+    return dock.length
+  })
 }
 
 /** D-D, the open half: the profile's NEWEST session takes the main pane while
@@ -2938,9 +3012,59 @@ function openProfileSessions(row, sessions) {
     return Promise.resolve()
   }
 
-  rest.forEach(session => openSession(sessionIdOf(session), row.name, 'tab', INTENT_OPEN))
+  const name = String(row?.name || '')
+  // Main LAST — a tab open focuses its own tile, so the session the user asked
+  // for has to be the one opened last. The dock also has to come first for a
+  // second reason: when this profile is not the one on screen, the dock's first
+  // tab is what MOVES the app there, and the main open must not be created
+  // before that has landed (see `switchingFlags`).
+  const openMain = () => openSession(sessionIdOf(newest), name, 'main', rest.length ? null : switchingFlags(name))
 
-  return openSession(sessionIdOf(newest), row.name, 'main')
+  return rest.length ? dockSessions(name, rest).then(openMain) : Promise.resolve(openMain())
+}
+
+/** Pedro, 2026-10-13: clicking a SESSION under another profile is a PROFILE
+ *  MOVE, not merely an open.
+ *
+ *  Core keeps its session tabs in per-profile buckets and swaps the visible set
+ *  when `$activeGatewayProfile` moves (`store/session-states.ts`: "Tiles are
+ *  persisted per connection and profile … Switching either scope swaps the
+ *  visible set"). So the strip can only show the clicked profile's sessions once
+ *  the app's OWN profile has moved there — the swap itself is core's, and this
+ *  pane breaks it by opening with `profile` while leaving chrome put
+ *  (`sdk/plugin-open-session-plan.ts`: an undefined `keepAllProfilesScope`
+ *  counts as TRUE, i.e. dialWithoutSwitching, no workspace switch).
+ *
+ *  Two steps, in this order:
+ *
+ *  1. the clicked session opens with `keepAllProfilesScope: false` — the app's
+ *     own "explicit profile workspace switch" recipe, which also collapses the
+ *     sidebar onto that profile. The SDK AWAITS that activation
+ *     (`ensureGatewayProfile`) before it navigates, so a resolved open means the
+ *     new bucket is the visible one.
+ *  2. only THEN does the profile's list dock. The order IS the fix: a tile is
+ *     filed into `visibleTileScope` as it is created, so docking first would file
+ *     every tab into the profile the user just left — and it would race the SDK's
+ *     generation guard, which throws "superseded by a newer selection" at every
+ *     open but the last (`sdk/index.ts`).
+ *
+ *  Clicking INSIDE the profile the app is already on stays what it always was:
+ *  open the session, leave the strip alone. */
+function openSessionInProfile(profile, sessions, openId) {
+  const name = String(profile || '')
+  const id = String(openId || '')
+
+  if (!name || !id) {
+    return Promise.resolve()
+  }
+
+  if (String(host.state.profile.get() || '') === name) {
+    return openSession(id, name)
+  }
+
+  return openSession(id, name, null, { expectHistory: true, keepAllProfilesScope: false }).then(() =>
+    dockSessions(name, sessions, id)
+  )
 }
 
 /** The SDK's open flags for a session THIS pane just CREATED over RPC and then
@@ -3159,7 +3283,7 @@ async function renameSession(storedId, profile, title) {
 /** Whole-session branch of a stored parent; the child opens like core's does. */
 async function branchSession(storedId, profile) {
   const res = await host.request('session.branch_stored', {
-    idempotency_key: `messenger-branch-${Date.now().toString(36)}`,
+    idempotency_key: `personae-branch-${Date.now().toString(36)}`,
     parent_session_id: String(storedId),
     profile
   })
@@ -3659,7 +3783,7 @@ async function aproposGroupSession(profile, groupId, label, sessions) {
     const name = String(label || 'group')
     const digest = buildAproposGroupDigest({ label: name, members, profile: scope })
     const res = await host.request('session.create', {
-      idempotency_key: `messenger-apropos-group-${group}-${Date.now().toString(36)}`,
+      idempotency_key: `personae-apropos-group-${group}-${Date.now().toString(36)}`,
       messages: [{ content: digest, display_kind: 'hidden', role: 'user' }],
       profile: scope,
       title: aproposChildTitle(name)
@@ -4203,7 +4327,7 @@ async function aproposSession(storedId, profile, title) {
     // do not change anything about the parent session, inside or outside the
     // group. It should remain visible, with the original name."
     const res = await host.request('session.create', {
-      idempotency_key: `messenger-apropos-${parentId}-${Date.now().toString(36)}`,
+      idempotency_key: `personae-apropos-${parentId}-${Date.now().toString(36)}`,
       messages: [{ content: digest, display_kind: 'hidden', role: 'user' }],
       profile,
       title: `Apropos: ${clip(aproposSourceName(parentTitle), 60)}`
@@ -4653,6 +4777,35 @@ function sessionLabel(session) {
   return preview ? preview.slice(0, 96) : 'Untitled session'
 }
 
+/** One menu row: core's own glyph for the verb, then the label.
+ *
+ *  Pedro, 2026-10-13: "add little icons to the options in the pop-up list when
+ *  right-clicking on a session". The shape is core's own, verbatim
+ *  (`renderActionItem` in `components/ui/actions-menu.tsx`): a Codicon at
+ *  `size="0.875rem"`, then the label in a `<span>`.
+ *
+ *  The names are core's wherever core has the same verb, checked against
+ *  `app/chat/sidebar/session-actions-menu.tsx`: Rename is `edit`, Branch
+ *  `repo-forked`, Export `cloud-download`, Archive `archive`, Delete `trash`,
+ *  Hide `eye-closed`, Mark as unread `mail`, Open/in-new-tab `browser`,
+ *  in-new-window `link-external`. A verb core does not have takes a glyph from
+ *  the app's wider menu vocabulary — Appearance is `symbol-color`, exactly what
+ *  core's own sub-trigger beside it draws; Group `folder`; New session group
+ *  `new-folder`; Copy id `copy`; Select `check`; Session `history`; Apropos
+ *  `lightbulb`; Assign to project `project`. `Move to group` is `move`, the one
+ *  name picked for the verb alone, since core has no move-a-session row.
+ *
+ *  Every name is checked against the font the app pins (@vscode/codicons 0.0.45,
+ *  see tests/icons.mjs): a glyph the font does not carry renders as NOTHING, and
+ *  a blank slot reads as "that option has no icon" rather than as an error.
+ *  `git-fork` is the cautionary example — not in the font; `repo-forked` is. */
+function menuGlyph(icon, label) {
+  return [
+    jsx(Codicon, { className: 'shrink-0', name: icon, size: '0.875rem' }, 'icon'),
+    jsx('span', { children: label }, 'label')
+  ]
+}
+
 function SessionRow({
   dropSide,
   dropTarget,
@@ -4672,6 +4825,10 @@ function SessionRow({
   onMoveGroup,
   onNewGroup,
   profile,
+  // The profile's VISIBLE session list (the same array the profile menu docks).
+  // A click under a profile the app is not on docks this list onto the strip, so
+  // the row needs the list, not just its own session.
+  profileSessions,
   selected,
   selecting,
   session,
@@ -4868,7 +5025,16 @@ function SessionRow({
           // In select mode the row's whole job flips: it ticks instead of
           // opening. (The menu still opens a session — a right-click is an
           // explicit act, never a mis-tick.)
-          onClick: guardClick(selecting ? () => onToggleSelect() : () => openSession(openId, profile)),
+          //
+          // A plain click asks `openSessionInProfile`, NOT `openSession`: under
+          // another profile the click has to move the app's profile first and put
+          // that profile's list on the strip, or the strip keeps showing the
+          // sessions of the profile the user just left (2026-10-13).
+          onClick: guardClick(
+            selecting
+              ? () => onToggleSelect()
+              : () => openSessionInProfile(profile, profileSessions, openId)
+          ),
           children: [
             selecting
               ? jsx(
@@ -4982,7 +5148,7 @@ function SessionRow({
           // Select · Open · Session · Apropos · Group · Appearance · Project.
           jsx(
             ContextMenuItem,
-            { onSelect: () => onSelect(), children: 'Select' },
+            { onSelect: () => onSelect(), children: menuGlyph('check', 'Select') },
             'select-session'
           ),
           // 2. Open
@@ -4990,19 +5156,19 @@ function SessionRow({
             ContextMenuSub,
             {
               children: [
-                jsx(ContextMenuSubTrigger, { children: 'Open' }, 'open-trigger'),
+                jsx(ContextMenuSubTrigger, { children: menuGlyph('browser', 'Open') }, 'open-trigger'),
                 jsx(
                   ContextMenuSubContent,
                   {
                     children: [
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => openSession(openId, profile, 'window'), children: 'In new window' },
+                        { onSelect: () => openSession(openId, profile, 'window'), children: menuGlyph('link-external', 'In new window') },
                         'open-window'
                       ),
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => openSession(openId, profile, 'tab', INTENT_OPEN), children: 'In new tab' },
+                        { onSelect: () => openSession(openId, profile, 'tab', INTENT_OPEN), children: menuGlyph('browser', 'In new tab') },
                         'open-tab'
                       )
                     ]
@@ -5018,24 +5184,24 @@ function SessionRow({
             ContextMenuSub,
             {
               children: [
-                jsx(ContextMenuSubTrigger, { children: 'Session' }, 'session-trigger'),
+                jsx(ContextMenuSubTrigger, { children: menuGlyph('history', 'Session') }, 'session-trigger'),
                 jsx(
                   ContextMenuSubContent,
                   {
                     children: [
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => markSessionUnreadFinished(storedId, profile), children: 'Mark as unread' },
+                        { onSelect: () => markSessionUnreadFinished(storedId, profile), children: menuGlyph('mail', 'Mark as unread') },
                         'unread'
                       ),
-                      jsx(ContextMenuItem, { onSelect: () => onRename(session, profile), children: 'Rename…' }, 'rename'),
-                      jsx(ContextMenuItem, { onSelect: () => branchSession(storedId, profile), children: 'Branch' }, 'branch'),
+                      jsx(ContextMenuItem, { onSelect: () => onRename(session, profile), children: menuGlyph('edit', 'Rename…') }, 'rename'),
+                      jsx(ContextMenuItem, { onSelect: () => branchSession(storedId, profile), children: menuGlyph('repo-forked', 'Branch') }, 'branch'),
                       // The stored id is the key every other door takes: the
                       // gateway RPCs, the REST API, and `session_search(session_id=…)`.
-                      jsx(ContextMenuItem, { onSelect: () => copySessionId(storedId), children: 'Copy id' }, 'copy-id'),
+                      jsx(ContextMenuItem, { onSelect: () => copySessionId(storedId), children: menuGlyph('copy', 'Copy id') }, 'copy-id'),
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => exportSession(storedId, profile, title), children: 'Export…' },
+                        { onSelect: () => exportSession(storedId, profile, title), children: menuGlyph('cloud-download', 'Export…') },
                         'export'
                       ),
                       // Hiding is the pane's own view filter, never a core
@@ -5045,13 +5211,13 @@ function SessionRow({
                         ContextMenuItem,
                         {
                           onSelect: () => setSessionHidden(profile, storedId, !hidden),
-                          children: hidden ? 'Unhide in Personae' : 'Hide from Personae'
+                          children: menuGlyph(hidden ? 'eye' : 'eye-closed', hidden ? 'Unhide in Personae' : 'Hide from Personae')
                         },
                         'hide-session'
                       ),
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => archiveSession(storedId, profile), children: 'Archive' },
+                        { onSelect: () => archiveSession(storedId, profile), children: menuGlyph('archive', 'Archive') },
                         'archive'
                       ),
                       // Last, behind a separator, and destructive: it is the one
@@ -5066,10 +5232,7 @@ function SessionRow({
                         {
                           onSelect: () => setConfirmDelete(true),
                           variant: 'destructive',
-                          children: [
-                            jsx(Codicon, { name: 'trash' }, 'icon'),
-                            jsx('span', { children: 'Delete session…' }, 'label')
-                          ]
+                          children: menuGlyph('trash', 'Delete session…')
                         },
                         'delete-session'
                       )
@@ -5086,7 +5249,7 @@ function SessionRow({
             ContextMenuSub,
             {
               children: [
-                jsx(ContextMenuSubTrigger, { children: 'Apropos (On that topic, beta)' }, 'apropos-trigger'),
+                jsx(ContextMenuSubTrigger, { children: menuGlyph('lightbulb', 'Apropos (On that topic, beta)') }, 'apropos-trigger'),
                 jsx(
                   ContextMenuSubContent,
                   {
@@ -5095,7 +5258,7 @@ function SessionRow({
                       // can consult THIS transcript, with no group and no bloat.
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => aproposSession(storedId, profile, title), children: 'From this session' },
+                        { onSelect: () => aproposSession(storedId, profile, title), children: menuGlyph('comment-discussion', 'From this session') },
                         'apropos-session'
                       ),
                       // 4.2 the group flavour: ALWAYS a group, even for one
@@ -5106,7 +5269,7 @@ function SessionRow({
                       // which the right-click rule has already made real.
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => onCreateAproposGroup(), children: 'Create group' },
+                        { onSelect: () => onCreateAproposGroup(), children: menuGlyph('new-folder', 'Create group') },
                         'apropos-group'
                       )
                     ]
@@ -5122,14 +5285,14 @@ function SessionRow({
             ContextMenuSub,
             {
               children: [
-                jsx(ContextMenuSubTrigger, { children: 'Group' }, 'group-trigger'),
+                jsx(ContextMenuSubTrigger, { children: menuGlyph('folder', 'Group') }, 'group-trigger'),
                 jsx(
                   ContextMenuSubContent,
                   {
                     children: [
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => onNewGroup(), children: 'New session group' },
+                        { onSelect: () => onNewGroup(), children: menuGlyph('new-folder', 'New session group') },
                         'new-session-group'
                       ),
                       groups && groups.length
@@ -5137,7 +5300,7 @@ function SessionRow({
                             ContextMenuSub,
                             {
                               children: [
-                                jsx(ContextMenuSubTrigger, { children: 'Move to group' }, 'moveto'),
+                                jsx(ContextMenuSubTrigger, { children: menuGlyph('move', 'Move to group') }, 'moveto'),
                                 jsx(
                                   ContextMenuSubContent,
                                   {
@@ -5184,7 +5347,7 @@ function SessionRow({
             ContextMenuSub,
             {
               children: [
-                jsx(ContextMenuSubTrigger, { children: 'Appearance' }, 'appearance'),
+                jsx(ContextMenuSubTrigger, { children: menuGlyph('symbol-color', 'Appearance') }, 'appearance'),
                 jsx(
                   ContextMenuSubContent,
                   { children: jsx(ColorPicker, { profile, sessionId: storedId }) },
@@ -5199,7 +5362,7 @@ function SessionRow({
             ContextMenuSub,
             {
               children: [
-                jsx(ContextMenuSubTrigger, { children: 'Assign to project' }, 'project'),
+                jsx(ContextMenuSubTrigger, { children: menuGlyph('project', 'Assign to project') }, 'project'),
                 jsx(
                   ContextMenuSubContent,
                   { children: jsx(ProjectPicker, { profile, sessionId: storedId }) },
@@ -5773,14 +5936,14 @@ function ProfileRow({
             children: [
               jsx(
                 ContextMenuItem,
-                { onSelect: () => newSession(row.name), children: 'New session' },
+                { onSelect: () => newSession(row.name), children: menuGlyph('add', 'New session') },
                 'new-session'
               ),
               // Same dialog Bots offers, writing the same places — see
               // EditProfileDialog.
               jsx(
                 ContextMenuItem,
-                { onSelect: () => onEditProfile(row), children: 'Edit profile\u2026' },
+                { onSelect: () => onEditProfile(row), children: menuGlyph('edit', 'Edit profile\u2026') },
                 'edit-profile'
               ),
               // Pedro, 2026-10-09: "group options should not be listed in the
@@ -5791,13 +5954,13 @@ function ProfileRow({
                 ContextMenuItem,
                 {
                   onSelect: () => openProfileSessions(row, sessions),
-                  children: 'Open newest session'
+                  children: menuGlyph('history', 'Open newest session')
                 },
                 'open-newest'
               ),
               jsx(
                 ContextMenuItem,
-                { onSelect: () => dockSessions(row, sessions), children: 'Open all in tabs' },
+                { onSelect: () => dockSessions(row.name, sessions), children: menuGlyph('browser', 'Open all in tabs') },
                 'open-all'
               ),
               jsx(ContextMenuSeparator, {}, 'sep-sort'),
@@ -5809,7 +5972,7 @@ function ProfileRow({
                 ContextMenuSub,
                 {
                   children: [
-                    jsx(ContextMenuSubTrigger, { children: 'Sort sessions' }, 'sort-trigger'),
+                    jsx(ContextMenuSubTrigger, { children: menuGlyph('list-ordered', 'Sort sessions') }, 'sort-trigger'),
                     jsx(
                       ContextMenuSubContent,
                       {
@@ -5835,7 +5998,7 @@ function ProfileRow({
                     ContextMenuItem,
                     {
                       onSelect: () => onToggleHidden(row.name),
-                      children: `${revealed ? '✓ ' : ''}Show hidden (${hiddenCount})`
+                      children: menuGlyph('eye', `${revealed ? '✓ ' : ''}Show hidden (${hiddenCount})`)
                     },
                     'show-hidden'
                   )
@@ -5843,7 +6006,7 @@ function ProfileRow({
               hiddenCount && revealed
                 ? jsx(
                     ContextMenuItem,
-                    { onSelect: () => unhideAll(row.name), children: `Unhide all (${hiddenCount})` },
+                    { onSelect: () => unhideAll(row.name), children: menuGlyph('eye', `Unhide all (${hiddenCount})`) },
                     'unhide-all'
                   )
                 : null
@@ -5956,6 +6119,7 @@ function ProfileRow({
                       onSelect: () => onSelect(row.name, session.id),
                       onToggleSelect: () => onToggleSelect(sessionKey(row.name, session.id)),
                       profile: row.name,
+                      profileSessions: sessions,
                       selected: (selectedKeys || []).includes(sessionKey(row.name, session.id)),
                       selecting,
                       session
@@ -6858,7 +7022,7 @@ function displayMissing(error) {
 function ScreenHero({ profile }) {
   const t = usePluginI18n(ID)
   const status = useQuery({
-    queryKey: ['messenger', 'screen', profile],
+    queryKey: ['personae', 'screen', profile],
     queryFn: () => host.request('display.status', { profile }),
     refetchInterval: 15000,
     retry: false,
@@ -6867,7 +7031,7 @@ function ScreenHero({ profile }) {
   const tone = screenTone(status.data || null, displayMissing(status.error))
   const live = tone === 'live' || tone === 'other'
   const frame = useQuery({
-    queryKey: ['messenger', 'screen-frame', profile],
+    queryKey: ['personae', 'screen-frame', profile],
     queryFn: () => host.request('display.thumbnail', { profile }),
     enabled: live,
     refetchInterval: 4000,
@@ -6981,7 +7145,7 @@ function openScreenPane(profile, label) {
 function ScreenView({ profile }) {
   const t = usePluginI18n(ID)
   const status = useQuery({
-    queryKey: ['messenger', 'screen', profile],
+    queryKey: ['personae', 'screen', profile],
     queryFn: () => host.request('display.status', { profile }),
     refetchInterval: 15000,
     retry: false,
@@ -6990,7 +7154,7 @@ function ScreenView({ profile }) {
   const tone = screenTone(status.data || null, displayMissing(status.error))
   const live = tone === 'live' || tone === 'other'
   const frame = useQuery({
-    queryKey: ['messenger', 'screen-frame', profile],
+    queryKey: ['personae', 'screen-frame', profile],
     queryFn: () => host.request('display.thumbnail', { profile }),
     enabled: live,
     refetchInterval: 3000,
@@ -7420,7 +7584,7 @@ function RoutinesPane() {
   const rows = roster.data || []
   const names = rows.map(row => row.name)
   const routines = useQuery({
-    queryKey: ['messenger', 'routines', epoch, names.join('|')],
+    queryKey: ['personae', 'routines', epoch, names.join('|')],
     queryFn: () => fetchRoutines(names),
     enabled: names.length > 0,
     refetchInterval: 20000,
@@ -7557,7 +7721,7 @@ function SessionListView({
   const hiddenState = useValue($hiddenSessions)
   const hiddenIds = new Set((hiddenState[String(profile)] || []).map(String))
   const listed = useQuery({
-    queryKey: ['messenger', 'view', kind, profile],
+    queryKey: ['personae', 'view', kind, profile],
     queryFn: () =>
       archived
         ? listArchivedSessions(profile)
@@ -7606,6 +7770,7 @@ function SessionListView({
             onRenameCancel,
             onRenameSubmit: name => onRenameSubmit(profile, session.id, name),
             profile,
+            profileSessions: sessions,
             session
           },
           `view-${profile}-${session.id}`
@@ -8005,7 +8170,7 @@ function MessengerPane() {
     .filter(name => expanded[name])
     .sort()
   const sessions = useQuery({
-    queryKey: ['messenger', 'sessions', openNames.join('|')],
+    queryKey: ['personae', 'sessions', openNames.join('|')],
     queryFn: () => refreshSessions(openNames),
     enabled: openNames.length > 0,
     refetchInterval: POLL_MS,
@@ -8591,11 +8756,67 @@ function MessengerPane() {
   })
 }
 
+/** One-time prefs carry-over for the 1.2.0 id rename (`messenger` -> `personae`).
+ *
+ *  `ctx.storage` is namespaced by the plugin's CURRENT id, so it cannot see the
+ *  old namespace — this reads the renderer's own `localStorage` instead, copies
+ *  every `hermes.plugin.messenger.*` value into `hermes.plugin.personae.*`, and
+ *  leaves the old entries in place: a COPY, never a move, so someone who rolls
+ *  back to an older build finds their groups, colours and sort orders exactly
+ *  where they left them. A key the new id has already written is never
+ *  overwritten, which is what makes this idempotent.
+ *
+ *  Key names INSIDE the namespace are untouched: they are the wire contract with
+ *  the pane's backend and with Personae Mobile (see `SYNC_LOCAL_PREFIX`).
+ *
+ *  Returns how many values it copied — the harness asserts on it. Storage that
+ *  isn't there (the headless harness, an older shell) is a no-op, never a throw.
+ */
+function migrateLegacyStorage() {
+  const store = typeof localStorage === 'undefined' ? null : localStorage
+
+  if (!store || typeof store.length !== 'number') return 0
+
+  const from = 'hermes.plugin.messenger.'
+  const to = 'hermes.plugin.personae.'
+  let copied = 0
+
+  try {
+    // Snapshot the keys first: writing inside the loop would move `length`.
+    const stale = []
+
+    for (let i = 0; i < store.length; i += 1) {
+      const key = store.key(i)
+
+      if (key && key.startsWith(from)) stale.push(key)
+    }
+
+    for (const key of stale) {
+      const next = to + key.slice(from.length)
+
+      if (store.getItem(next) !== null) continue
+
+      const value = store.getItem(key)
+
+      if (value === null) continue
+
+      store.setItem(next, value)
+      copied += 1
+    }
+  } catch {
+    // A full quota or a locked-down shell: prefs simply start fresh.
+    return copied
+  }
+
+  return copied
+}
+
 export default {
   id: ID, // must match the folder name
   name: 'Personae',
   register(ctx) {
     ctxRef = ctx
+    migrateLegacyStorage()
     loadPrefs()
     startSync(ctx)
 
@@ -8698,7 +8919,7 @@ export default {
         toastsOn: 'Activity toasts on — click to silence',
         viewAll: 'View all',
         viewAllEmpty: 'No sessions for this profile.',
-        viewArchiveUnavailable: 'Archive unavailable — the messenger backend is not mounted in this build.',
+        viewArchiveUnavailable: 'Archive unavailable — the Personae backend is not mounted in this build.',
         viewArchived: 'View Archived',
         viewArchivedEmpty: 'Nothing archived for this profile.',
         viewHidden: 'View hidden',
@@ -8781,6 +9002,7 @@ export default {
  *  filtering and grouping without a DOM to type into. Not part of the plugin
  *  API: the app reads `default` and nothing else. */
 export const __internals = {
+  migrateLegacyStorage,
   applyPref,
   createSync,
   isEmptyPref,
@@ -8919,6 +9141,7 @@ export const __internals = {
   normalizeColors,
   openProfileSessions,
   openSession,
+  openSessionInProfile,
   projectCwd,
   refreshSessions,
   relTime,

@@ -7,6 +7,7 @@
 **Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions. Nothing else.
 Right now, it is a plugin for the **Hermes Desktop** app. 
 
+![The Personae tab in the Hermes Desktop app: the profile rail on the left with the default profile expanded into its sessions, and the Scheduled jobs pane on the right](assets/personae-pane.png)
 
 ---
 
@@ -20,6 +21,7 @@ Right now, it is a plugin for the **Hermes Desktop** app.
 | 🎨 **Colour that fills** | A profile's colour tints every session under it. Session → group → profile |
 | 🔍 **Search & filter** | Profiles *and* sessions, server-side; filter by activity, kind, or a profile set |
 | 🖱️ **Right-click menus** | Profile, session, group heading — the same verbs in each |
+| 🖱️ **Profile-aware clicks** | A session under another profile moves the app there, and the tab strip follows |
 | ✅ **Multi-select** | Tick a set, then archive, delete, or Apropos them in one go |
 | 🗂️ **Groups** | Named sections shared by both panes; an empty one explains how to fill it |
 | 🌱 **Apropos** *(beta)* | A fresh session that already knows the background of the ones you picked |
@@ -39,13 +41,18 @@ Right now, it is a plugin for the **Hermes Desktop** app.
 If the tab doesn't show: open the command palette (⌘K / Ctrl+K) and run **Reload desktop plugins**.
 
 ### Manual
-Copy `plugin.js` into `<hermes home>/desktop-plugins/personae/`, then reload the plugins.
+Copy `desktop/plugin.js` into `<hermes home>/desktop-plugins/personae/`, then reload the plugins.
 
 ### Requirements
 - **Hermes Desktop.** Plugins are loaded by the app — not by the CLI or the gateway.
 - Optional: the built-in **Bots** tab, whose profile store Personae shares.
+- Optional: a backend of its own (`dashboard/plugin_api.py` on the machine that serves
+  the app — `/api/plugins/personae/*`). It carries cross-device sync and server-side
+  message-body search. Without it the pane is fully usable and **local-only**: sync
+  switches itself off on the first `404` and body search falls back to the session
+  metadata the RPC surface already gives it — never an error, never a retry loop.
 
-There is nothing to build: the app executes `plugin.js` as it stands.
+There is nothing to build: the app executes `desktop/plugin.js` as it stands.
 
 ---
 
@@ -68,10 +75,22 @@ You keep the roster. You drop the tab-hopping.
 A *persona* is the mask an actor wears — one actor, many faces. Your profiles are
 exactly that: one agent, many personae.
 
-The machine id is still `messenger`, from its first life as a messenger pane, and it
-stays that way on purpose: an id is a key. Renaming it would orphan every saved group,
-colour and link. The folder name doesn't matter — the app keys plugins by their
-manifest id.
+The machine id is `personae` — the same as the name, the folder and the plugin key,
+because an id is a key and half-matching ones are how you get a plugin that works in
+one install and not the next. Getting here meant a rename (`messenger` → `personae` in
+**1.2.0**), and a rename is a key change:
+
+- **What moved:** the app's storage namespace (`hermes.plugin.personae.*`) and the
+  pane's own backend mount (`/api/plugins/personae/…`). On first load after the
+  upgrade, `migrateLegacyStorage()` **copies** every value out of the old namespace
+  into the new one — a copy, never a move, so a downgrade still finds your groups,
+  colours and sort orders where you left them. A key the new id has already written is
+  never overwritten, so running it twice does nothing.
+- **What stayed:** every key name *inside* those namespaces (`messenger-sections-v1`,
+  the `messenger-` sync prefix, the `ui_meta.messenger` flags on your profile rows).
+  Those are the contract with the backend and with Personae Mobile — renaming them
+  would need a migration on both ends for no visible gain. Profile flags written by an
+  older build are still read.
 
 ---
 
@@ -156,6 +175,33 @@ offers the ones that make sense on the thing you clicked.
 | **Apropos (On that topic, beta)** | A new child session that knows this background |
 | **Delete** | Delete the session or the group — see below |
 
+Every option carries a small glyph. Where core has the same verb it is core's own —
+**Rename…** a pencil, **Branch** a fork, **Export…** a download, **Delete** a bin — so a
+verb looks the same wherever you meet it, and the rest come from the app's wider menu
+vocabulary (**Appearance** is the same colour wheel core draws next to it).
+
+---
+
+## 🖱️ What a click does
+
+Clicking a session opens it. If it belongs to a profile the app is **not** on, the app
+moves to that profile first and the tab strip follows — that profile's visible sessions
+(up to ten) dock beside the one you clicked, which stays in front.
+
+| Where you click | What happens |
+| --- | --- |
+| A session under the profile the app is **already on** | The session opens; the strip is left alone |
+| A session under **another** profile | The app moves to that profile, the strip swaps to it, and its list (≤10, minus the row you clicked) docks as tabs |
+
+The order is the point: the move lands *before* anything docks, because core files
+session tabs into per-profile buckets and a tab is filed into the bucket that is visible
+when it is created. **Open all in tabs** (right-click a profile) docks the same list
+without moving anything.
+
+One consequence worth knowing: the move is the app's own *workspace* switch, so the
+**Sessions** sidebar collapses onto the profile you moved to — widen it again with
+**All profiles** there.
+
 ---
 
 ## ✅ Multi-select
@@ -223,7 +269,7 @@ default, or taken with it if you ask for that instead.
 ## 🔄 Sync contract
 
 Since 1.1.0 the roster arrangement follows you across machines through the pane's own
-backend (`/api/plugins/messenger/state`, `dashboard/plugin_api.py`). Local storage stays
+backend (`/api/plugins/personae/state`, `dashboard/plugin_api.py`). Local storage stays
 the source the pane reads: every edit is written locally **first and immediately**, and
 the server only hears about it afterwards.
 
@@ -270,24 +316,35 @@ the server only hears about it afterwards.
 
 ```
 personae/
-├── plugin.js         # the plugin: the pane, the rail, groups, colours, Apropos, delete chains
+├── plugin.yaml       # the manifest: name, version, license, tags — no tools, no hooks
+├── desktop/
+│   └── plugin.js     # the plugin: the pane, the rail, groups, colours, Apropos, delete chains
 ├── tests/
 │   ├── run.mjs       # headless harness — renders the pane with react-dom/server, asserts on the tree
 │   ├── classes.mjs   # every utility class must already exist in the app's compiled stylesheet
-│   ├── run.sh        # runs both
+│   ├── icons.mjs     # every codicon name must exist in the font the app pins
+│   ├── codicon-names.txt  # that font's own name list, snapshotted
+│   ├── run.sh        # runs all three
 │   └── sdk/          # a stand-in for @hermes/plugin-sdk, so the harness runs without the app
-├── deploy.sh         # copies plugin.js into the app's plugin folder, prints both hashes
+├── assets/           # the icon, the logo, the screenshot at the top
+├── deploy.sh         # copies desktop/plugin.js into the app's plugin folder, prints both hashes
 ├── package.json      # name, license, scripts — no dependencies
 ├── LICENSE           # GPL-3.0
 └── README.md         # this file
 ```
+
+The plugin lives under `desktop/` on purpose: **Install from Git** publishes that
+folder — and only that folder — into the app's own `desktop-plugins/personae/`, so
+what lands on a user's disk is one file, not this README and its test fixtures. The
+manifest is what the catalog and `hermes plugins validate` read; the app itself needs
+no agent-side code, so there is no `__init__.py` beside it.
 
 ---
 
 ## 🔧 Development
 
 ```bash
-./tests/run.sh          # 668 render checks + 135 class tokens, no app required
+./tests/run.sh          # 690 render checks + 136 class tokens + 36 glyph names, no app
 ```
 
 The harness needs **node ≥ 20.6** and a checkout of the desktop repo, for the same React
@@ -303,11 +360,16 @@ Deploying to a running app (hot-reloads in seconds):
 HOST=user@box WIN_DIR='C:/Users/you/AppData/Local/hermes/desktop-plugins/personae' ./deploy.sh
 ```
 
-Two rules worth keeping if you fork this:
+Three rules worth keeping if you fork this:
 
 - **Every class token must already exist in the app's stylesheet.** A plugin loads at
   *runtime*; a utility the app never used isn't in the CSS and does nothing.
   `tests/classes.mjs` fails the build instead of letting you ship a silent no-op.
+- **Every glyph name must exist in the font the app pins.** A codicon name the font
+  doesn't carry paints *nothing* — an empty slot beside the label that reads as "that
+  option has no icon", not as a bug. `tests/icons.mjs` checks every name this pane asks
+  for against `@vscode/codicons` 0.0.45's own stylesheet; core has been bitten by exactly
+  this (`git-fork` isn't in the font, `repo-forked` is).
 - **Test the markup, not your intentions.** The harness asserts on rendered output —
   labels included — so a rename shows up as a failing check rather than as a surprise in
   the UI.

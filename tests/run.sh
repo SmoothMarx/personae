@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Headless harness for the Messenger pane — renders it with react-dom/server
-# and asserts on the tree. Run it after every edit to plugin.js.
+# and asserts on the tree. Three suites: run.mjs (render), classes.mjs (every
+# Tailwind class exists in the app's own stylesheet), icons.mjs (every codicon
+# name exists in the font the app pins). Run it after every edit to plugin.js.
 #
 #   ./run.sh          # test the current plugin.js
 #
@@ -16,9 +18,11 @@ WORK=work
 rm -rf "$WORK"
 mkdir -p "$WORK/node_modules/@hermes"
 
-cp ../plugin.js "$WORK/plugin.js"
+cp ../desktop/plugin.js "$WORK/plugin.js"
 cp run.mjs "$WORK/run.mjs"
 cp classes.mjs "$WORK/classes.mjs"
+cp icons.mjs "$WORK/icons.mjs"
+cp codicon-names.txt "$WORK/codicon-names.txt"
 printf '{ "type": "module" }\n' >"$WORK/package.json"
 
 # tests/sdk stands in for @hermes/plugin-sdk; react + react-dom come from the repo.
@@ -47,4 +51,7 @@ render=$?
 HERMES_DESKTOP_SRC="${HERMES_DESKTOP_SRC:-$REPO/apps/desktop/src}" node classes.mjs
 classes=$?
 
-exit $(( render || classes ))
+node icons.mjs
+icons=$?
+
+exit $(( render || classes || icons ))

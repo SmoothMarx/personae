@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { jsx } from 'react/jsx-runtime'
 
 import plugin, { __internals } from './plugin.js'
-import { harness } from '@hermes/plugin-sdk'
+import { harness, host } from '@hermes/plugin-sdk'
 
 const h = harness()
 const results = []
@@ -19,6 +19,48 @@ const check = (name, ok, detail = '') => {
   results.push({ detail, name, ok })
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `\n        ${detail}`}`)
 }
+
+/** Where a menu label starts in the markup, with or without a `<span>` around
+ *  it. An option's label is a bare text node only while the row has no icon;
+ *  once it carries one it is `>Rename…</span>` (the shape core's own
+ *  `renderActionItem` uses). Anchoring a check on `>Rename…<` therefore breaks
+ *  the day the row gains a glyph — the wrapper was never the subject. */
+const labelAt = (html, label) => {
+  const wrapped = html.indexOf(`>${label}</span>`)
+  const bare = html.indexOf(`>${label}<`)
+
+  if (wrapped < 0) return bare
+  if (bare < 0) return wrapped
+
+  return Math.min(wrapped, bare)
+}
+const menuLabel = (html, label) => labelAt(html, label) >= 0
+
+/** The glyph an option carries: the nearest `data-codicon` BEFORE its label.
+ *  Every row here draws exactly one, and nothing draws one after a label, so
+ *  the closest preceding glyph is the row's own. */
+const glyphFor = (html, label) => {
+  const at = labelAt(html, label)
+
+  if (at < 0) return null
+
+  const hits = [...html.slice(0, at).matchAll(/data-codicon="([^"]+)"/g)]
+
+  return hits.length ? hits[hits.length - 1][1] : null
+}
+
+/** `label` sits inside a submenu TRIGGER rather than in an item: the trigger's
+ *  own slot, its glyph, then the label, all inside one short window. */
+const isSubmenuTrigger = (html, label) => {
+  const slot = 'data-slot="context-menu-sub-trigger"'
+
+  for (let at = html.indexOf(slot); at >= 0; at = html.indexOf(slot, at + 1)) {
+    if (labelAt(html.slice(at, at + 260), label) >= 0) return true
+  }
+
+  return false
+}
+
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -111,7 +153,7 @@ const ctx = {
       h.storage[key] = value
     }
   },
-  /** The plugin's own backend (`/api/plugins/messenger`), which is the only
+  /** The plugin's own backend (`/api/plugins/personae`), which is the only
    *  door to message bodies the SDK leaves open. `h.rest.byProfile` answers. */
   rest: async path => {
     h.rest.calls.push(path)
@@ -129,7 +171,7 @@ const ctx = {
 
 plugin.register(ctx)
 
-check('plugin id is the folder name', plugin.id === 'messenger', `got ${plugin.id}`)
+check('plugin id is the folder name', plugin.id === 'personae', `got ${plugin.id}`)
 check(
   'two contributions: the roster pane and the Scheduled jobs tile',
   contributions.length === 2 && contributions.every(c => c.area === 'panes'),
@@ -168,8 +210,8 @@ check('loading paints no rows', !markup.includes('data-profile='))
 
 // ── 3. the queries the pane opens ───────────────────────────────────────────
 
-const rosterQuery = h.queries.find(q => (q.queryKey || []).join('|') === 'messenger|roster') || {}
-const searchQuery = h.queries.find(q => (q.queryKey || [])[0] === 'messenger' && q.queryKey[1] === 'search') || {}
+const rosterQuery = h.queries.find(q => (q.queryKey || []).join('|') === 'personae|roster') || {}
+const searchQuery = h.queries.find(q => (q.queryKey || [])[0] === 'personae' && q.queryKey[1] === 'search') || {}
 
 check('roster query key is namespaced', Boolean(rosterQuery.queryKey), JSON.stringify(rosterQuery.queryKey))
 check('roster polls every 5s', rosterQuery.refetchInterval === 5000, `got ${rosterQuery.refetchInterval}`)
@@ -229,8 +271,8 @@ check('toasts stay silent while the bell is off', h.toasts.length === 0, JSON.st
 // ── 5. data state ───────────────────────────────────────────────────────────
 
 h.responses['profiles.list'] = () => ROSTER
-h.queryResults['messenger|roster'] = { data: rows, error: null, isError: false, isPending: false }
-h.queryResults['messenger|avatar|zulu'] = { data: { data: AVATAR_DATA_URL }, error: null, isError: false, isPending: false }
+h.queryResults['personae|roster'] = { data: rows, error: null, isError: false, isPending: false }
+h.queryResults['personae|avatar|zulu'] = { data: { data: AVATAR_DATA_URL }, error: null, isError: false, isPending: false }
 
 markup = render()
 
@@ -650,7 +692,7 @@ const SECTIONS = {
   collapsed: []
 }
 
-h.queryResults['messenger|roster'] = {
+h.queryResults['personae|roster'] = {
   data: rows,
   error: null,
   isError: false,
@@ -837,20 +879,20 @@ check(
 
 // ── 11. error + empty states ───────────────────────────────────────────────
 
-h.queryResults['messenger|roster'] = { data: undefined, error: new Error('boom'), isError: true, isPending: false }
+h.queryResults['personae|roster'] = { data: undefined, error: new Error('boom'), isError: true, isPending: false }
 
 markup = render()
 
 check('error state names the failure', markup.includes('Could not load profiles') && markup.includes('boom'))
 
-h.queryResults['messenger|roster'] = { data: [], error: null, isError: false, isPending: false }
+h.queryResults['personae|roster'] = { data: [], error: null, isError: false, isPending: false }
 
 markup = render()
 
 check('empty state is reachable', markup.includes('No profiles'))
 check('empty state carries the personae mark', markup.includes('data-personae-mark') && markup.includes('data:image/png;base64,'))
 
-h.queryResults['messenger|roster'] = { data: rows, error: null, isError: false, isPending: false }
+h.queryResults['personae|roster'] = { data: rows, error: null, isError: false, isPending: false }
 
 // ── 12. read-only guarantee ────────────────────────────────────────────────
 
@@ -980,11 +1022,15 @@ check(
     !/data-slot="context-menu-item">(Delete group|Fresh|Unassigned)</.test(markup),
   `moveHeader@${markup.indexOf('>Move to...<')}`
 )
+// Anchored on the label, not on the item slot's bare `>`: an option with a glyph
+// wraps its text in a <span> (core's own `renderActionItem` shape), so
+// `data-slot="context-menu-item">Open all in tabs` stopped matching the day the
+// row earned an icon — the wrapper was never the subject.
 check(
   'and offers the session verbs instead',
-  (markup.match(/data-slot="context-menu-item">Open newest session</g) || []).length === 2 &&
-    (markup.match(/data-slot="context-menu-item">Open all in tabs</g) || []).length === 2,
-  `newest=${(markup.match(/data-slot="context-menu-item">Open newest session</g) || []).length} tabs=${(markup.match(/data-slot="context-menu-item">Open all in tabs</g) || []).length}`
+  (markup.match(/>Open newest session</g) || []).length === 2 &&
+    (markup.match(/>Open all in tabs</g) || []).length === 2,
+  `newest=${(markup.match(/>Open newest session</g) || []).length} tabs=${(markup.match(/>Open all in tabs</g) || []).length}`
 )
 check(
   'group ops live on the group heading, where the noun matches the verb',
@@ -1004,7 +1050,7 @@ check('a profile is collapsed until it is clicked', __internals.toggleExpanded('
 check('clicking again collapses it', __internals.toggleExpanded('zulu') === false)
 
 __internals.toggleExpanded('zulu')
-h.queryResults['messenger|sessions|zulu'] = {
+h.queryResults['personae|sessions|zulu'] = {
   data: {
     zulu: [
       {
@@ -1034,7 +1080,7 @@ markup = render()
 
 check(
   'the expansion query is keyed by the OPEN SET',
-  (expandedQuery().queryKey || []).join('|') === 'messenger|sessions|zulu',
+  (expandedQuery().queryKey || []).join('|') === 'personae|sessions|zulu',
   JSON.stringify(expandedQuery().queryKey)
 )
 check('the expansion query polls like the roster', expandedQuery().refetchInterval === 5000, `got ${expandedQuery().refetchInterval}`)
@@ -1122,15 +1168,15 @@ check('a collapsed profile draws none', !defaultSlice.includes('data-session='),
 // top level reads as a table of contents.
 const sessionMenu = markup.slice(markup.indexOf('data-session="sess-zulu-9"'))
 const TOP_LEVEL = [
-  '>Select<',
-  '>Open<',
-  '>Session<',
-  '>Apropos (On that topic, beta)<',
-  '>Group<',
-  '>Appearance<',
-  '>Assign to project<'
+  'Select',
+  'Open',
+  'Session',
+  'Apropos (On that topic, beta)',
+  'Group',
+  'Appearance',
+  'Assign to project'
 ]
-const menuOrder = TOP_LEVEL.map(label => sessionMenu.indexOf(label))
+const menuOrder = TOP_LEVEL.map(label => labelAt(sessionMenu, label))
 
 check(
   'the session menu lists its seven verbs in Pedro\'s order',
@@ -1140,49 +1186,115 @@ check(
 check(
   'Open carries both intents, window first',
   (() => {
-    const i = sessionMenu.indexOf('>In new window<')
-    return i >= 0 && i < sessionMenu.indexOf('>In new tab<')
+    const i = labelAt(sessionMenu, 'In new window')
+    return i >= 0 && i < labelAt(sessionMenu, 'In new tab')
   })()
 )
 check(
   'Session carries the transcript verbs',
-  ['>Mark as unread<', '>Rename…<', '>Branch<', '>Copy id<', '>Export…<', '>Hide from Personae<', '>Archive<'].every(
-    label => sessionMenu.includes(label)
+  ['Mark as unread', 'Rename…', 'Branch', 'Copy id', 'Export…', 'Hide from Personae', 'Archive'].every(label =>
+    menuLabel(sessionMenu, label)
   )
 )
 check(
   'Delete is destructive, last, and behind a separator',
   (() => {
-    const del = sessionMenu.indexOf('>Delete session…<')
-    const sep = sessionMenu.indexOf('data-slot="context-menu-separator"', sessionMenu.indexOf('>Archive<'))
-    return del > sessionMenu.indexOf('>Archive<') && sep > 0 && sep < del && sessionMenu.includes('data-variant="destructive"')
+    const archiveAt = labelAt(sessionMenu, 'Archive')
+    const del = labelAt(sessionMenu, 'Delete session…')
+    const sep = sessionMenu.indexOf('data-slot="context-menu-separator"', archiveAt)
+
+    return archiveAt >= 0 && del > archiveAt && sep > 0 && sep < del && sessionMenu.includes('data-variant="destructive"')
   })(),
-  sessionMenu.slice(sessionMenu.indexOf('>Archive<'), sessionMenu.indexOf('>Archive<') + 300)
+  sessionMenu.slice(labelAt(sessionMenu, 'Archive'), labelAt(sessionMenu, 'Archive') + 300)
 )
 check(
   'Apropos (On that topic) offers both weights',
-  sessionMenu.includes('>From this session<') && sessionMenu.includes('>Create group<')
+  menuLabel(sessionMenu, 'From this session') && menuLabel(sessionMenu, 'Create group')
 )
 check(
   'Group offers creation and filing',
-  sessionMenu.includes('>New session group<') &&
+  menuLabel(sessionMenu, 'New session group') &&
     // The filing submenu only exists once the profile HAS groups, so its label
     // is asserted where groups exist (see the parity section below) — at this
     // point in the fixture zulu has none, which is itself the correct render.
-    !sessionMenu.includes('>Move to group<')
+    !menuLabel(sessionMenu, 'Move to group')
 )
-check('Appearance is a submenu', sessionMenu.includes('data-slot="context-menu-sub-trigger">Appearance<'))
-check('Assign to project is a submenu', sessionMenu.includes('data-slot="context-menu-sub-trigger">Assign to project<'))
+check('Appearance is a submenu', isSubmenuTrigger(sessionMenu, 'Appearance'))
+check('Assign to project is a submenu', isSubmenuTrigger(sessionMenu, 'Assign to project'))
 check(
   'the session items are context-menu items inside the submenu scope too',
   sessionMenu.includes('data-slot="context-menu-sub-content"') && sessionMenu.includes('data-slot="color-swatches"')
+)
+
+// ── the pop-up's glyphs ─────────────────────────────────────────────────────
+// Pedro, 2026-10-13: "add little icons to the options in the pop-up list when
+// right-clicking on a session". None of these is decoration: a verb core also
+// has wears core's own glyph (`app/chat/sidebar/session-actions-menu.tsx`) —
+// Rename a pencil, Branch a fork, Export a download, Archive a box, Delete a
+// bin — so it looks the same wherever the user meets it; the rest come from the
+// app's wider menu vocabulary. Whether the font can DRAW a name is a separate
+// gate (tests/icons.mjs): a name it does not carry paints nothing at all, which
+// reads as "that option has no icon" rather than as an error. The table covers
+// the rows this fixture renders; "Move to group" only exists once the profile
+// has groups, so it is asserted where it renders.
+const SESSION_GLYPHS = {
+  Appearance: 'symbol-color',
+  Archive: 'archive',
+  'Apropos (On that topic, beta)': 'lightbulb',
+  'Assign to project': 'project',
+  Branch: 'repo-forked',
+  'Copy id': 'copy',
+  'Create group': 'new-folder',
+  'Delete session…': 'trash',
+  'Export…': 'cloud-download',
+  'From this session': 'comment-discussion',
+  Group: 'folder',
+  'Hide from Personae': 'eye-closed',
+  'In new tab': 'browser',
+  'In new window': 'link-external',
+  'Mark as unread': 'mail',
+  'New session group': 'new-folder',
+  Open: 'browser',
+  'Rename…': 'edit',
+  Select: 'check',
+  Session: 'history'
+}
+
+check(
+  "every option in the session pop-up carries core's own glyph for its verb",
+  Object.entries(SESSION_GLYPHS).every(([label, icon]) => glyphFor(sessionMenu, label) === icon),
+  Object.entries(SESSION_GLYPHS)
+    .filter(([label, icon]) => glyphFor(sessionMenu, label) !== icon)
+    .map(([label, icon]) => `${label}: got ${glyphFor(sessionMenu, label)}, want ${icon}`)
+    .join('\n        ')
+)
+check(
+  'the transcript submenu draws one glyph per row, trigger included',
+  (() => {
+    const slot = 'data-slot="context-menu-sub-trigger"'
+    // Both ends on a TRIGGER SLOT, never on a label: the glyph is drawn before
+    // its label, so a slice ending at "Apropos…" would sweep the Apropos
+    // trigger's own lightbulb into the transcript submenu's list.
+    const from = sessionMenu.lastIndexOf(slot, labelAt(sessionMenu, 'Session'))
+    const to = sessionMenu.lastIndexOf(slot, labelAt(sessionMenu, 'Apropos (On that topic, beta)'))
+    const drawn = [...sessionMenu.slice(from, to).matchAll(/data-codicon="([^"]+)"/g)].map(m => m[1])
+
+    return drawn.join(' ') === 'history mail edit repo-forked copy cloud-download eye-closed archive trash'
+  })(),
+  (() => {
+    const slot = 'data-slot="context-menu-sub-trigger"'
+    const from = sessionMenu.lastIndexOf(slot, labelAt(sessionMenu, 'Session'))
+    const to = sessionMenu.lastIndexOf(slot, labelAt(sessionMenu, 'Apropos (On that topic, beta)'))
+
+    return [...sessionMenu.slice(from, to).matchAll(/data-codicon="([^"]+)"/g)].map(m => m[1]).join(' ')
+  })()
 )
 
 const projectsQuery = h.queries.filter(q => (q.queryKey || [])[1] === 'projects').pop() || {}
 
 check(
   'Assign to project asks projects.list for THIS profile',
-  (projectsQuery.queryKey || []).join('|') === 'messenger|projects|zulu',
+  (projectsQuery.queryKey || []).join('|') === 'personae|projects|zulu',
   JSON.stringify(projectsQuery.queryKey)
 )
 
@@ -1462,7 +1574,7 @@ check('a build with no archive backend reads as unavailable too', (await __inter
 ctx.rest = p7RealRest
 
 // The body swap: the roster is GONE, the list is in its place, with a way back.
-h.queryResults['messenger|view|all|zulu'] = {
+h.queryResults['personae|view|all|zulu'] = {
   data: [{ id: 'sess-zulu-9', last_active: nowSec - 60, source: 'telegram', title: 'flux work' }],
   error: null,
   isError: false,
@@ -1477,7 +1589,7 @@ check('the replaced body carries a back button', /aria-label="Back"/.test(markup
 check('and the sessions the view is for', /data-session="sess-zulu-9"/.test(markup))
 check('the header names the profile it belongs to', /View all[\s\S]{0,160}?zulu/.test(markup))
 
-h.queryResults['messenger|view|archived|zulu'] = {
+h.queryResults['personae|view|archived|zulu'] = {
   data: [{ archived: true, id: 'arc-1', last_active: nowSec - 90000, source: 'whatsapp', title: 'Archived thread' }],
   error: null,
   isError: false,
@@ -1491,7 +1603,7 @@ check(
   markup.includes('data-list-view="archived"') && /data-session="arc-1"/.test(markup)
 )
 
-h.queryResults['messenger|view|archived|zulu'] = {
+h.queryResults['personae|view|archived|zulu'] = {
   data: null,
   error: null,
   isError: false,
@@ -1629,20 +1741,20 @@ check('the next run reads as time ahead, not a timestamp', /in \d+ hr/.test(mark
 check('each job is addressable and deletable', /data-job="job-1"/.test(markup) && markup.includes('data-codicon="trash"'))
 check(
   'the pane asks for the profile-on-show screen',
-  h.queries.some(q => (q.queryKey || []).join('|') === 'messenger|screen|zulu'),
-  JSON.stringify(h.queries.map(q => (q.queryKey || []).join('|')).filter(k => k.startsWith('messenger|screen')))
+  h.queries.some(q => (q.queryKey || []).join('|') === 'personae|screen|zulu'),
+  JSON.stringify(h.queries.map(q => (q.queryKey || []).join('|')).filter(k => k.startsWith('personae|screen')))
 )
 
 // The live screen preview itself: a running screen paints the frame and says
 // it is live.
-h.queryResults['messenger|screen|zulu'] = {
+h.queryResults['personae|screen|zulu'] = {
   data: { installed: true, lease: { holder: 'agent' }, profile_key: 'zulu', running: true, supported: true },
   error: null,
   isError: false,
   isFetching: false,
   isPending: false
 }
-h.queryResults['messenger|screen-frame|zulu'] = {
+h.queryResults['personae|screen-frame|zulu'] = {
   data: { data_url: 'data:image/jpeg;base64,FRAME' },
   error: null,
   isError: false,
@@ -1653,13 +1765,13 @@ markup = renderToStaticMarkup(routinesPane.render())
 check('a running screen paints its live frame', markup.includes('data:image/jpeg;base64,FRAME'))
 check(
   'the hero polls the thumbnail for the profile on show',
-  h.queries.some(q => (q.queryKey || []).join('|') === 'messenger|screen-frame|zulu'),
-  JSON.stringify(h.queries.map(q => (q.queryKey || []).join('|')).filter(k => k.startsWith('messenger|screen')))
+  h.queries.some(q => (q.queryKey || []).join('|') === 'personae|screen-frame|zulu'),
+  JSON.stringify(h.queries.map(q => (q.queryKey || []).join('|')).filter(k => k.startsWith('personae|screen')))
 )
 
 // A human on the screen: the frame is withheld, and the pane says why instead
 // of showing a stale picture as live.
-h.queryResults['messenger|screen-frame|zulu'] = {
+h.queryResults['personae|screen-frame|zulu'] = {
   data: { data_url: null, suppressed: 'human_has_control' },
   error: null,
   isError: false,
@@ -1670,7 +1782,7 @@ markup = renderToStaticMarkup(routinesPane.render())
 check('a withheld frame says why, and is not shown', !markup.includes('FRAME') && markup.includes('Hidden'), markup.slice(0, 300))
 
 // A stopped screen is not a black box with no explanation.
-h.queryResults['messenger|screen|zulu'] = {
+h.queryResults['personae|screen|zulu'] = {
   data: { installed: true, lease: { holder: 'agent' }, profile_key: 'zulu', running: false, supported: true },
   error: null,
   isError: false,
@@ -1682,7 +1794,7 @@ check('a stopped screen says it is stopped', markup.includes('Screen stopped'))
 
 // An older Hermes without display.*: the whole hero goes away rather than
 // sitting in "connecting" forever.
-h.queryResults['messenger|screen|zulu'] = {
+h.queryResults['personae|screen|zulu'] = {
   data: undefined,
   error: { code: -32601, message: 'method not found' },
   isError: true,
@@ -1825,8 +1937,10 @@ await __internals.openProfileSessions(fakeRow, [])
 check('a profile with no sessions opens nothing', h.opens.length === 0)
 
 // The menu's own verb: dock the lot, take the main pane over for nothing.
+// (Its first argument is the PROFILE name, not a roster row — the menu knows
+// which row it was opened from, the dock only ever needed the name.)
 h.opens.length = 0
-const dockedCount = __internals.dockSessions(fakeRow, many(14))
+const dockedCount = await __internals.dockSessions('zulu', many(14))
 
 check(
   '"Open all in tabs" docks the cap and no more',
@@ -1838,6 +1952,173 @@ check(
   h.opens[0].id === 'r-0',
   h.opens[0]?.id
 )
+
+// Pedro, 2026-10-13 (item 2): "some session names are showing up as 'new session'
+// instead of their actual name". The strip draws the title of each tab's STORED
+// ROW, and a tile is filed into whichever per-profile bucket is visible when it
+// is CREATED — so a dock for a profile the app was never moved to files its tabs
+// under the profile the user came from, where no row exists to name them and
+// every one of them sits on core's "New session" placeholder.
+host.state.profile.set('default') // the app is on `default`; the dock is `zulu`
+h.opens.length = 0
+await __internals.dockSessions('zulu', many(3))
+
+check(
+  'a cross-profile dock moves the app with its first tab, and only that one',
+  h.opens.length === 3 &&
+    h.opens[0].options.keepAllProfilesScope === false &&
+    h.opens.slice(1).every(entry => entry.options.keepAllProfilesScope === true),
+  JSON.stringify(h.opens.map(entry => entry.options.keepAllProfilesScope))
+)
+check(
+  'and every tab after the switch still files under the profile it belongs to',
+  h.opens.every(entry => entry.options.profile === 'zulu' && entry.options.intent === 'tab'),
+  JSON.stringify(h.opens)
+)
+
+host.state.profile.set('zulu')
+h.opens.length = 0
+await __internals.dockSessions('zulu', many(3))
+
+check(
+  'a dock inside the profile the app is already on moves nothing',
+  h.opens.length === 3 && h.opens.every(entry => entry.options.keepAllProfilesScope === true),
+  JSON.stringify(h.opens.map(entry => entry.options.keepAllProfilesScope))
+)
+
+host.state.profile.set('default')
+h.opens.length = 0
+await __internals.openProfileSessions(fakeRow, many(1))
+
+check(
+  'with no sessions to dock, the profile open carries the switch itself',
+  h.opens.length === 1 &&
+    h.opens[0].options.intent === 'main' &&
+    h.opens[0].options.keepAllProfilesScope === false,
+  JSON.stringify(h.opens)
+)
+
+host.state.profile.set('default')
+h.opens.length = 0
+await __internals.openProfileSessions({ name: 'default' }, many(1))
+
+check(
+  'and an open inside the current profile switches nothing',
+  h.opens.length === 1 && !('keepAllProfilesScope' in h.opens[0].options),
+  JSON.stringify(h.opens)
+)
+
+// ── D-D follow-up: a session click under ANOTHER profile (2026-10-13) ───────
+// Core files session tabs into per-profile buckets and swaps the visible set
+// when `$activeGatewayProfile` moves, so the strip can only hold the clicked
+// profile's sessions once the app's OWN profile has moved there. The click is
+// therefore a profile MOVE: open with `keepAllProfilesScope: false` — the SDK's
+// explicit workspace-switch recipe — and only THEN dock the list.
+//
+// The order is the fix, so it is asserted rather than assumed: a tile is filed
+// into whichever bucket is visible when it is CREATED, and the SDK's generation
+// guard rejects a second dialing open ("superseded by a newer selection"). The
+// first open below is therefore held open on purpose — nothing may dock before
+// it settles.
+
+const realOpen = host.openSession
+const calls = []
+let heldOpen = null
+let releaseHeld = null
+
+host.openSession = (id, options) => {
+  calls.push(id)
+
+  if (!heldOpen) {
+    heldOpen = { id, options }
+
+    return new Promise(resolve => {
+      releaseHeld = () => {
+        // The SDK activates the profile as part of the same open
+        // (`requireActiveProfileForHydration`), so by the time it resolves the
+        // app IS on `zulu` — which is why the dock that follows needs no switch
+        // of its own.
+        if (options.keepAllProfilesScope === false) host.state.profile.set(options.profile)
+
+        return realOpen(id, options).then(resolve)
+      }
+    })
+  }
+
+  return realOpen(id, options)
+}
+
+host.state.profile.set('default') // the app is on `default`; the row is `zulu`
+h.opens.length = 0
+const switched = __internals.openSessionInProfile('zulu', many(14), 'r-3')
+
+await Promise.resolve()
+
+check(
+  'a click into another profile switches the app profile with the open',
+  heldOpen?.id === 'r-3' &&
+    heldOpen?.options?.profile === 'zulu' &&
+    heldOpen?.options?.keepAllProfilesScope === false,
+  JSON.stringify(heldOpen)
+)
+check(
+  'and docks nothing until that switch has landed',
+  calls.length === 1 && h.opens.length === 0,
+  JSON.stringify(calls)
+)
+
+releaseHeld()
+await switched
+host.openSession = realOpen
+
+const switchMove = h.opens[0]
+const dockedTabs = h.opens.slice(1)
+
+check(
+  'the clicked session takes the main pane, with no tab intent',
+  switchMove?.id === 'r-3' && switchMove?.options?.intent === undefined && switchMove?.options?.profile === 'zulu',
+  JSON.stringify(switchMove)
+)
+check(
+  'then the list docks beside it, minus the session already in front',
+  dockedTabs.length === 10 &&
+    dockedTabs.every(entry => entry.options.intent === 'tab' && entry.options.profile === 'zulu') &&
+    !dockedTabs.some(entry => entry.id === 'r-3'),
+  JSON.stringify(dockedTabs.map(entry => entry.id))
+)
+check(
+  'and the dock adds no second switch — the move already happened',
+  dockedTabs.every(entry => entry.options.keepAllProfilesScope === true),
+  JSON.stringify(dockedTabs.map(entry => entry.options.keepAllProfilesScope))
+)
+check(
+  'and the docked set is the list in order, capped at the dock limit',
+  JSON.stringify(dockedTabs.map(entry => entry.id)) ===
+    JSON.stringify(['r-0', 'r-1', 'r-2', 'r-4', 'r-5', 'r-6', 'r-7', 'r-8', 'r-9', 'r-10'])
+)
+
+// A click INSIDE the profile the app is already on stays what it always was:
+// open the session, leave the strip alone — no switch, no re-dock.
+host.state.profile.set('zulu')
+h.opens.length = 0
+await __internals.openSessionInProfile('zulu', many(14), 'r-5')
+
+check(
+  'a click inside the current profile just opens the session',
+  h.opens.length === 1 &&
+    h.opens[0].id === 'r-5' &&
+    h.opens[0].options.intent === undefined &&
+    h.opens[0].options.keepAllProfilesScope === undefined,
+  JSON.stringify(h.opens)
+)
+
+// A row with nothing openable is a no-op, not a half-move.
+h.opens.length = 0
+await __internals.openSessionInProfile('zulu', many(3), '')
+
+check('a click with no session id moves nothing', h.opens.length === 0)
+
+host.state.profile.set('default')
 
 // ── the pane's FIRST render: the inspector with no job (2026-10-09) ─────────
 // `jsx(RoutineDetail, { job: detail })` CALLS the component while the parent
@@ -2939,7 +3220,7 @@ const aproposMarkup = render()
 
 check(
   'the session menu offers Apropos (On that topic, beta)',
-  aproposMarkup.includes('>Apropos (On that topic, beta)<'),
+  menuLabel(aproposMarkup, 'Apropos (On that topic, beta)'),
   aproposMarkup.slice(aproposMarkup.indexOf('Apropos'), aproposMarkup.indexOf('Apropos') + 80)
 )
 
@@ -2948,7 +3229,7 @@ check(
 // it is what a silent revert would drop.
 check(
   'the Apropos entry is flagged beta in the session menu',
-  aproposMarkup.includes('Apropos (On that topic, beta)') && !aproposMarkup.includes('>Apropos (On that topic)<')
+  menuLabel(aproposMarkup, 'Apropos (On that topic, beta)') && labelAt(aproposMarkup, 'Apropos (On that topic)') < 0
 )
 
 const childRow = renderToStaticMarkup(
@@ -3223,7 +3504,7 @@ const copyRow = renderToStaticMarkup(
   })
 )
 
-check('the session menu offers Copy id', copyRow.includes('>Copy id<'))
+check('the session menu offers Copy id', menuLabel(copyRow, 'Copy id'))
 
 const failed = results.filter(r => !r.ok)
 
@@ -3859,13 +4140,56 @@ check(
     return (
       shownMarkup.includes('HIDDEN-ROW-X') &&
       shownMarkup.includes('data-session-hidden="HIDDEN-ROW-X"') &&
-      shownMarkup.includes('Unhide in Personae')
+      shownMarkup.includes('Unhide in Personae') &&
+      glyphFor(shownMarkup, 'Unhide in Personae') === 'eye'
     )
   })()
 )
 check(
   'the profile menu offers the reveal toggle only when something is hidden',
   renderZulu().includes('Show hidden (1)') && !renderZulu({ sessions: [] }).includes('Show hidden (')
+)
+
+// Pedro, 2026-10-13 (item 1): "also glyph the profile menu". Same wrapper, same
+// font, same rule as the session table above — a verb core already has wears
+// core's own glyph ("Edit profile…" the pencil), a tab verb a browser, and the
+// reveal toggle the eye whose opposite ("Hide from Personae") is already
+// `eye-closed`. The slice starts at the profile ROW and stops at the first
+// session row under it, so a lookup cannot wander into a session's own menu.
+const profileMenuOf = html => {
+  const start = html.indexOf('data-profile-row')
+  const from = html.indexOf('data-slot="context-menu-content"', start)
+  const to = html.indexOf('data-session=', from)
+
+  return from < 0 ? '' : html.slice(from, to < 0 ? undefined : to)
+}
+const PROFILE_GLYPHS = {
+  'Edit profile…': 'edit',
+  'New session': 'add',
+  'Open all in tabs': 'browser',
+  'Open newest session': 'history',
+  'Show hidden (1)': 'eye',
+  'Sort sessions': 'list-ordered'
+}
+
+check(
+  'every option in the profile pop-up carries a glyph too',
+  Object.entries(PROFILE_GLYPHS).every(
+    ([label, icon]) => glyphFor(profileMenuOf(renderZulu()), label) === icon
+  ),
+  Object.entries(PROFILE_GLYPHS)
+    .filter(([label, icon]) => glyphFor(profileMenuOf(renderZulu()), label) !== icon)
+    .map(([label, icon]) => `${label}: got ${glyphFor(profileMenuOf(renderZulu()), label)}, want ${icon}`)
+    .join('\n        ')
+)
+check(
+  'Sort sessions is still a submenu trigger, glyph and all',
+  isSubmenuTrigger(profileMenuOf(renderZulu()), 'Sort sessions')
+)
+check(
+  'and the way back out of hidden carries one too',
+  glyphFor(profileMenuOf(renderZulu({ showHidden: { zulu: true } })), 'Unhide all (1)') === 'eye',
+  profileMenuOf(renderZulu({ showHidden: { zulu: true } }))
 )
 check('and one call brings them all back', __internals.unhideAll('zulu') === undefined && __internals.hiddenFor('zulu').length === 0)
 
@@ -4776,8 +5100,16 @@ check(
   (() => {
     const withGroups = renderZulu()
 
-    return withGroups.includes('>New session group<') && withGroups.includes('>Move to group<')
-  })()
+    // Filing is the one verb that only exists once there are groups to file
+    // into, so its glyph is asserted HERE rather than in the session-menu table
+    // above, where the row is simply absent.
+    return (
+      menuLabel(withGroups, 'New session group') &&
+      menuLabel(withGroups, 'Move to group') &&
+      glyphFor(withGroups, 'Move to group') === 'move'
+    )
+  })(),
+  `Move to group: ${glyphFor(renderZulu(), 'Move to group')}`
 )
 
 // 6. VIEW HIDDEN. Pedro, 2026-10-10: "next to View All and View Archives,
@@ -4794,7 +5126,7 @@ check(
   renderZulu().includes('>viewHidden (1)<')
 )
 
-h.queryResults['messenger|view|hidden|zulu'] = {
+h.queryResults['personae|view|hidden|zulu'] = {
   data: [
     { id: 'h-1', last_active: nowSec - 60, title: 'Hid one' },
     { id: 'shown-2', last_active: nowSec - 120, title: 'Not hidden' }
@@ -4948,7 +5280,10 @@ if (process.env.DUMP_GROUPS) {
     /set_asset[\s\S]{0,140}asset: 'avatar'/.test(SRC7))
   check('…and removing a picture is offered, not only uploading', /clear: true/.test(SRC7))
   check('no avatar is cached forever any more', !SRC7.includes('staleTime: Infinity'))
-  check('the profile menu offers the editor', SRC7.includes("children: 'Edit profile\\u2026'"))
+  check(
+    'the profile menu offers the editor, with the pencil',
+    SRC7.includes("menuGlyph('edit', 'Edit profile\\u2026')")
+  )
   check('…and the dialog is mounted in the pane', SRC7.includes("'edit-profile-dialog'"))
 
   // (4) Deleting a session deletes the LINE it belongs to (core orphans the rest).
@@ -4982,18 +5317,26 @@ if (process.env.DUMP_GROUPS) {
 {
   const SRC8 = readFileSync(new URL('./plugin.js', import.meta.url), 'utf8')
 
-  // (1) The rename is a LABEL change: everything that PERSISTS state keeps the
-  //     old spelling, so no stored group, colour, hidden flag or section is
-  //     orphaned by it (and no migration is needed).
+  // (1) 1.2.0 renamed the machine id too (`messenger` -> `personae`), so the tab
+  //     label and the id finally agree. What is NOT renamed is anything that
+  //     PERSISTS state: the prefs key names and the `messenger-` wire prefix keep
+  //     their spelling — they are the contract with the pane's backend and with
+  //     Personae Mobile — and `migrateLegacyStorage()` carries saved storage
+  //     across to the new id, so nothing is orphaned.
   check('the plugin introduces itself as Personae', plugin.name === 'Personae', `got ${plugin.name}`)
   check('…and its tab label with it', pane.title === 'Personae', `got ${pane.title}`)
   check(
-    '…while the MACHINE name stays, so nothing already stored is orphaned',
-    plugin.id === 'messenger' &&
-      SRC8.includes("const META_KEY = 'messenger'") &&
+    'the machine id now matches the name',
+    plugin.id === 'personae' && SRC8.includes("const ID = 'personae'"),
+    `id=${plugin.id}`
+  )
+  check(
+    '…while every key that PERSISTS state keeps the old spelling (nothing orphaned)',
+    SRC8.includes("const LEGACY_META_KEY = 'messenger'") &&
       SRC8.includes("const COLORS_KEY = 'messenger-session-colors-v1'") &&
       SRC8.includes("const SECTIONS_KEY = 'messenger-sections-v1'") &&
-      SRC8.includes("const HIDDEN_KEY = 'messenger-hidden-v1'"),
+      SRC8.includes("const HIDDEN_KEY = 'messenger-hidden-v1'") &&
+      SRC8.includes("const SYNC_LOCAL_PREFIX = 'messenger-'"),
     `id=${plugin.id}`
   )
   check('the empty hidden view names Personae', h.i18n.viewHiddenEmpty.includes('Personae'), h.i18n.viewHiddenEmpty)
@@ -5285,7 +5628,11 @@ if (process.env.DUMP_GROUPS) {
     'a session opened into a tab from the pane carries the same wait',
     __internals.INTENT_OPEN.awaitHydration === true &&
       __internals.INTENT_OPEN.expectHistory === true &&
-      (SRC10.match(/, 'tab', INTENT_OPEN\)/g) || []).length === 3
+      // The session menu's own "In new tab" passes it straight; the dock builds
+      // every tab from it through one helper, which can only ever ADD the
+      // cross-profile switch — never drop the wait.
+      (SRC10.match(/, 'tab', INTENT_OPEN\)/g) || []).length === 1 &&
+      SRC10.includes("'tab', flags ? { ...INTENT_OPEN, ...flags } : INTENT_OPEN")
   )
   check(
     '…while a window open stays un-flagged — it may never get a tile here',
@@ -5672,7 +6019,7 @@ const puts = server => server.calls.filter(call => call.method === 'PUT')
     sync.noteLocal('messenger-expanded-v1', { zulu: true }),
     sync.noteLocal('messenger-activity-toasts', true),
     sync.noteLocal(__internals.SYNC_META_KEY, { revs: {} }),
-    sync.noteLocal('messenger-search', 'flux')
+    sync.noteLocal('personae-search', 'flux')
   ]
 
   await clock.advance(10000)
@@ -6034,6 +6381,54 @@ const puts = server => server.calls.filter(call => call.method === 'PUT')
       sync.state().dirty.length === 0,
     JSON.stringify(puts(server).slice(-1)[0].body)
   )
+}
+
+// ── the 1.2.0 id rename: saved prefs follow the plugin across it ────────────
+// Last, on purpose: register() re-reads storage, so it must not disturb the
+// state the checks above were asserting on.
+{
+  const legacy = globalThis.localStorage
+  const cells = {
+    'hermes.plugin.messenger.sections-v1': JSON.stringify([{ id: 'sec-old' }]),
+    'hermes.plugin.messenger-session-colors-v1': 'x'  // outside the namespace: untouched
+  }
+
+  globalThis.localStorage = {
+    get length() {
+      return Object.keys(cells).length
+    },
+    key: i => Object.keys(cells)[i] ?? null,
+    getItem: k => (k in cells ? cells[k] : null),
+    setItem: (k, v) => {
+      cells[k] = String(v)
+    },
+    removeItem: k => {
+      delete cells[k]
+    }
+  }
+
+  plugin.register(ctx)
+  const afterRenamed = { ...cells }
+
+  plugin.register(ctx)
+  const afterTwice = Object.keys(cells).length
+
+  check(
+    'the id rename carries saved prefs across on register()',
+    afterRenamed['hermes.plugin.personae.sections-v1'] === JSON.stringify([{ id: 'sec-old' }]) &&
+      afterRenamed['hermes.plugin.messenger.sections-v1'] !== undefined,
+    JSON.stringify(afterRenamed)
+  )
+  check(
+    '…a copy, never a move, and running it twice changes nothing',
+    afterRenamed['hermes.plugin.messenger-session-colors-v1'] === 'x' &&
+      Object.keys(cells).length === afterTwice &&
+      afterTwice === Object.keys(afterRenamed).length,
+    `${afterTwice} keys: ${Object.keys(cells).join(', ')}`
+  )
+
+  if (legacy === undefined) delete globalThis.localStorage
+  else globalThis.localStorage = legacy
 }
 
 const failedNow = results.filter(r => !r.ok)

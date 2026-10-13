@@ -1,0 +1,11 @@
+name: personae
+version: "1.2.0"
+description: "Personae — a messenger for your agents: one row per profile, its sessions underneath, and a status light for who is waiting on you."
+author: SmoothMarx
+license: GPL-3.0-or-later
+homepage: https://github.com/SmoothMarx/personae
+tags:
+  - desktop
+  - sessions
+  - profiles
+  - roster

@@ -1,7 +1,7 @@
 
 import { __internals } from './plugin.js'
 const { createSync } = __internals
-const base = 'http://localhost:9119/api/plugins/messenger'
+const base = 'http://localhost:9119/api/plugins/personae'
 const B = process.env.HERMES_PERSONAE_BEARER
 const rest = async (path, opts = {}) => {
   const r = await fetch(base + path, { method: opts.method || 'GET', headers: { Authorization: `Bearer ${B}`, 'Content-Type': 'application/json' }, body: opts.body === undefined ? undefined : JSON.stringify(opts.body) })
