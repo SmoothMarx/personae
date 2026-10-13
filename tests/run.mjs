@@ -6,12 +6,20 @@
  * seam, since a static render has no DOM to type a search into.
  */
 
+import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { jsx } from 'react/jsx-runtime'
 
-import plugin, { __internals } from './plugin.js'
+import plugin, { __internals, stripMarkdown } from './plugin.js'
 import { harness, host } from '@hermes/plugin-sdk'
+
+/** 0.12.0: the sha256 of `shared/markdown-text.js`, which is ALSO the sha256 of the block inlined
+ *  into `desktop/plugin.js` between the two sentinels, and of the phone's vendored copy
+ *  (`personae-mobile/src/logic/markdown-text.js`). One authored file, two byte-identical copies, and
+ *  this one constant is what fails the build on drift. Regenerate it by running
+ *  `scripts/vendor-markdown-text.sh`, which prints it. */
+const MARKDOWN_TEXT_SHA256 = 'd68979838c656d2d0e570495e815c088d3e7cd7f59ded38193a9f8f6cdc1a0da'
 
 const h = harness()
 const results = []
@@ -6429,6 +6437,63 @@ const puts = server => server.calls.filter(call => call.method === 'PUT')
 
   if (legacy === undefined) delete globalThis.localStorage
   else globalThis.localStorage = legacy
+}
+
+// ── 0.12.0 — the vendored markdown-text module, and the previews it cleans ───────────────────────
+// One authored file (`shared/markdown-text.js`), two byte-identical copies: the phone's
+// `src/logic/markdown-text.js` and the block inlined into `desktop/plugin.js` between the sentinels.
+// Drift is a build failure on BOTH sides — edit either copy without running
+// `scripts/vendor-markdown-text.sh` and this suite goes red, which is the whole mechanism.
+{
+  const src = readFileSync('./plugin.js', 'utf8')
+  const beginAt = src.indexOf('// ── BEGIN vendored markdown-text.js')
+  const beginEol = src.indexOf('\n', beginAt) + 1
+  const endAt = src.indexOf('// ── END vendored markdown-text.js')
+  const block = src.slice(beginEol, endAt)
+  const hash = value => createHash('sha256').update(value, 'utf8').digest('hex')
+
+  check(
+    '0.12.0 D1: the block inlined between the sentinels IS shared/markdown-text.js',
+    beginAt > 0 && endAt > beginAt && hash(block) === MARKDOWN_TEXT_SHA256,
+    `inlined sha256 ${hash(block)}`
+  )
+  check(
+    '0.12.0 D1: and the sentinel comment carries that same hash',
+    /sha256 ([0-9a-f]{64})/.exec(src.slice(beginAt, beginEol))?.[1] === MARKDOWN_TEXT_SHA256,
+    src.slice(beginAt, beginEol)
+  )
+
+  const mobileDir = process.env.PERSONAE_MOBILE_DIR || `${process.env.HOME}/Projects/personae-mobile`
+  try {
+    const mobile = readFileSync(`${mobileDir}/src/logic/markdown-text.js`, 'utf8')
+    check(
+      '0.12.0 D1: the phone holds the same bytes as this plugin',
+      hash(mobile) === MARKDOWN_TEXT_SHA256,
+      `${mobileDir}/src/logic/markdown-text.js`
+    )
+  } catch (error) {
+    check('0.12.0 D1: the phone holds the same bytes as this plugin', false, String(error))
+  }
+
+  // The previews themselves: a roster line shows a message the way a reader reads it.
+  check(
+    '0.12.0 D3: a **bold** preview renders as bold',
+    typeof stripMarkdown === 'function' && stripMarkdown('a **bold** word and `code` and *em*', 0) === 'a bold word and code and em',
+    typeof stripMarkdown === 'function' ? stripMarkdown('a **bold** word and `code` and *em*', 0) : 'no stripMarkdown on the inlined copy'
+  )
+  check(
+    '0.12.0 D4: a fenced preview leaks no backticks',
+    typeof stripMarkdown === 'function' && !stripMarkdown('before\n```js\nconst x = 1\n```\nafter', 0).includes('`'),
+    typeof stripMarkdown === 'function' ? stripMarkdown('before\n```js\nconst x = 1\n```\nafter', 0) : 'no stripMarkdown on the inlined copy'
+  )
+  check(
+    '0.12.0 D5: the roster row, the toast, the snippet and the title all go through it',
+    /preview: last \? stripMarkdown\(/.test(src) &&
+      /message: stripMarkdown\(row\.preview, 140\)/.test(src) &&
+      /const snippet = stripMarkdown\(/.test(src) &&
+      /return PREVIEW_BOILERPLATE\.some\(pattern => pattern\.test\(text\)\) \? '' : stripMarkdown\(text, 0\)/.test(src),
+    'one of the four preview call sites is missing its stripMarkdown call'
+  )
 }
 
 const failedNow = results.filter(r => !r.ok)
