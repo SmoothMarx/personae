@@ -5,8 +5,8 @@
 # Personae — Agent Messenger
 
 **Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions. Nothing else.
-Right now, it is a plugin for the **Hermes Desktop** app. 
 
+<a href="https://github.com/SmoothMarx/personae-mobile">Personae is also available for Android!</a>
 ![The Personae tab in the Hermes Desktop app: the profile rail on the left with the default profile expanded into its sessions, and the Scheduled jobs pane on the right](assets/personae-pane.png)
 
 ---
