@@ -4,7 +4,7 @@
 
 # Personae — Agent Messenger
 
-**Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions. Nothing else.
+**Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions.
 
 <h2><a href="https://github.com/SmoothMarx/personae-mobile">Personae is also available for Android!</a></h2>
 
@@ -18,6 +18,8 @@
 | --- | --- |
 | 🗂️ **Messenger-style** | Just like your favorite messenger app, a list of profiles (friends), where by clicking them shows all your conversations with that profile.|
 | 🟡 **Status lights** | Amber: waiting on you. Emerald: unread. Neutral: nothing. Numbered at 2+ |
+| 🕰️ **Cron Job Viewer** | A list of the cron jobs associated to that profile, with a toggle for easy on/off |
+| 🖥️ **Screen Preview** | If your profile is working a browser, view it! |
 | 🎨 **Colour that fills** | A profile's colour tints every session under it. Session → group → profile |
 | 🔍 **Search & filter** | Profiles *and* sessions, server-side; filter by activity, kind, or a profile set |
 | 🖱️ **Right-click menus** | Profile, session, group heading — the same verbs in each |
