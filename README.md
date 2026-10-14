@@ -15,8 +15,7 @@ Right now, it is a plugin for the **Hermes Desktop** app.
 
 | Capability | What it gives you |
 | --- | --- |
-| 🗂️ **Messenger-style** | One row per profile: face, name, a preview of the last session, its age |
-| 🔽 **Expand a face** | Its sessions — status dot, title, preview, age — newest first |
+| 🗂️ **Messenger-style** | Just like your favorite messenger app, a list of profiles (friends), where by clicking them shows all your conversations with that profile.|
 | 🟡 **Status lights** | Amber: waiting on you. Emerald: unread. Neutral: nothing. Numbered at 2+ |
 | 🎨 **Colour that fills** | A profile's colour tints every session under it. Session → group → profile |
 | 🔍 **Search & filter** | Profiles *and* sessions, server-side; filter by activity, kind, or a profile set |
