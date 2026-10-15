@@ -127,6 +127,7 @@ import {
   nextRunOverdueMs,
   profileColor,
   profileColorSoft,
+  resolveSiblingWsUrl,
   usePluginI18n,
   queryClient,
   useQuery,
@@ -7264,6 +7265,840 @@ function stampAge(value, nowMs) {
   return Number.isFinite(ms) ? relTime(ms, nowMs) : null
 }
 
+/* ── SCREEN: the RFB client ──────────────────────────────────────────────────
+ * Personae DRIVES a profile's Bot Desktop — Start, Stop, Install, watch and
+ * Take over — instead of printing "go to Bot Mode → Screen" and calling that a
+ * feature. Pedro, 2026-10-15: "The Screen tab / hero does nothing useful."
+ *
+ * The viewer is hand-written on purpose. A runtime-loaded plugin may import
+ * exactly `@hermes/plugin-sdk` and `react` (`contrib/runtime-loader.ts` rejects
+ * every other specifier), and noVNC is only within reach of core because Bot
+ * Mode is BUNDLED, not loaded. So this file speaks RFB itself:
+ *
+ *   handshake   fixed-size, because Xvnc runs `-SecurityTypes None`
+ *               (`tools/bot_desktop/rfb_filter.py`: "12-byte version, 1-byte
+ *               security choice, then ClientInit (1 byte)").
+ *   encodings   Raw (0) and CopyRect (1) only. CopyRect is the one cheap win —
+ *               it is a memcpy inside our own canvas — while ZRLE/Tight would
+ *               need their decoders. Advertising nothing else keeps the server
+ *               from sending something this viewer cannot read.
+ *   pacing      ONE outstanding FramebufferUpdateRequest: the next is sent only
+ *               after the previous frame was painted (`ack()`), so a busy screen
+ *               cannot queue megabytes behind a slow canvas.
+ *
+ * On the far side, `hermes_cli/web_routers/display.py` splices this profile's
+ * Xvnc socket into `/api/display/ws` and runs the client stream through
+ * `RfbClientFilter`, which DROPS input messages from anyone who does not hold
+ * the lease. That filter is the gate; a viewer's `viewOnly` is only a hint. Its
+ * lengths are fixed (SetPixelFormat 20, FramebufferUpdateRequest 10, KeyEvent 8,
+ * PointerEvent 6), so every builder below must be exactly that size or the
+ * parser over there desyncs and starts eating real messages.
+ *
+ * Integers on this wire are BIG-endian; only PIXEL data follows the negotiated
+ * pixel format's own endianness. Getting that backwards yields a handshake that
+ * hangs or a canvas that looks like static, and both read as "the pane is
+ * broken". */
+
+const RFB_VERSION_REPLY_38 = 'RFB 003.008\n'
+const RFB_SECURITY_NONE = 1
+/** ClientInit, shared desktop: the third and last fixed handshake byte. The
+ *  gateway's `RfbClientFilter` counts the handshake as 12 + 1 + 1, so a client
+ *  that skips this does not merely hang — it makes the bridge read the first
+ *  byte of SetPixelFormat as ClientInit and desync every message after it. */
+const RFB_CLIENT_INIT = new Uint8Array([1])
+const RFB_ENCODING_RAW = 0
+const RFB_ENCODING_COPY_RECT = 1
+const RFB_DESKTOP_SIZE = -223
+const RFB_CUT_TEXT_MAX = 256 * 1024
+
+/** The pixel format WE ask for: 32bpp little-endian truecolour, 8 bits a
+ *  channel. Asking for it explicitly is what makes the decoder a fixed shape. */
+function rfbRequestedFormat() {
+  return {
+    bigEndian: false,
+    blueMax: 255,
+    blueShift: 0,
+    bpp: 32,
+    depth: 24,
+    greenMax: 255,
+    greenShift: 8,
+    redMax: 255,
+    redShift: 16,
+    trueColour: true
+  }
+}
+
+/** A PIXEL_FORMAT block (16 bytes; RFC 6143 §7.4). */
+function rfbFormatBytes(format) {
+  const out = new Uint8Array(16)
+  const view = new DataView(out.buffer)
+
+  out[0] = format.bpp
+  out[1] = format.depth
+  out[2] = format.bigEndian ? 1 : 0
+  out[3] = format.trueColour ? 1 : 0
+  view.setUint16(4, format.redMax)
+  view.setUint16(6, format.greenMax)
+  view.setUint16(8, format.blueMax)
+  out[10] = format.redShift
+  out[11] = format.greenShift
+  out[12] = format.blueShift
+
+  return out
+}
+
+function parseRfbFormat(bytes, at = 0) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset + at, 16)
+
+  return {
+    bigEndian: view.getUint8(2) === 1,
+    blueMax: view.getUint16(8),
+    blueShift: view.getUint8(12),
+    bpp: view.getUint8(0),
+    depth: view.getUint8(1),
+    greenMax: view.getUint16(6),
+    greenShift: view.getUint8(11),
+    redMax: view.getUint16(4),
+    redShift: view.getUint8(10),
+    trueColour: view.getUint8(3) === 1
+  }
+}
+
+/** SetPixelFormat — 20 bytes: type, 3 pad, then the format. */
+function rfbSetPixelFormat(format = rfbRequestedFormat()) {
+  const out = new Uint8Array(20)
+
+  out.set(rfbFormatBytes(format), 4)
+
+  return out
+}
+
+/** SetEncodings — 4 + 4n bytes: type, 1 pad, u16 count, then i32 values. */
+function rfbSetEncodings(encodings) {
+  const out = new Uint8Array(4 + encodings.length * 4)
+  const view = new DataView(out.buffer)
+
+  out[0] = 2
+  view.setUint16(2, encodings.length)
+  encodings.forEach((encoding, index) => view.setInt32(4 + index * 4, encoding))
+
+  return out
+}
+
+/** FramebufferUpdateRequest — 10 bytes. `incremental: false` asks for a full
+ *  repaint of `rect` (the first frame); true asks for damage since the last. */
+function rfbUpdateRequest(rect, incremental) {
+  const out = new Uint8Array(10)
+  const view = new DataView(out.buffer)
+
+  out[0] = 3
+  out[1] = incremental ? 1 : 0
+  view.setUint16(2, rect.x)
+  view.setUint16(4, rect.y)
+  view.setUint16(6, rect.width)
+  view.setUint16(8, rect.height)
+
+  return out
+}
+
+/** KeyEvent — 8 bytes. */
+function rfbKeyMessage(down, keysym) {
+  const out = new Uint8Array(8)
+
+  out[0] = 4
+  out[1] = down ? 1 : 0
+  new DataView(out.buffer).setUint32(4, keysym >>> 0)
+
+  return out
+}
+
+/** PointerEvent — 6 bytes. */
+function rfbPointerMessage(mask, x, y) {
+  const out = new Uint8Array(6)
+  const view = new DataView(out.buffer)
+
+  out[0] = 5
+  out[1] = mask & 0xff
+  view.setUint16(2, x)
+  view.setUint16(4, y)
+
+  return out
+}
+
+/** The X11 keysyms this viewer can name without a keymap table. Everything
+ *  printable rides its Latin-1 code point, which is exactly what X expects for
+ *  ASCII (there is no per-keycode translation to do for 0x20–0xff). */
+const KEYSYM_NAMES = {
+  Alt: 0xffe9,
+  ArrowDown: 0xff54,
+  ArrowLeft: 0xff51,
+  ArrowRight: 0xff53,
+  ArrowUp: 0xff52,
+  Backspace: 0xff08,
+  CapsLock: 0xffe5,
+  ContextMenu: 0xff67,
+  Control: 0xffe3,
+  Delete: 0xffff,
+  End: 0xff57,
+  Enter: 0xff0d,
+  Escape: 0xff1b,
+  Home: 0xff50,
+  Insert: 0xff63,
+  Meta: 0xffe7,
+  NumLock: 0xff7f,
+  PageDown: 0xff56,
+  PageUp: 0xff55,
+  Pause: 0xff13,
+  PrintScreen: 0xff61,
+  ScrollLock: 0xff14,
+  Shift: 0xffe1,
+  Tab: 0xff09
+}
+
+const KEYSYM_CODES = {
+  NumpadAdd: 0xffab,
+  NumpadDecimal: 0xffae,
+  NumpadDivide: 0xffaf,
+  NumpadEnter: 0xff8d,
+  NumpadMultiply: 0xffaa,
+  NumpadSubtract: 0xffad
+}
+
+/** One DOM key → one keysym, or 0 when this viewer cannot name it. `code` is
+ *  consulted only where `key` is ambiguous (numpad, F-keys). */
+function keysymFor(key, code) {
+  if (Object.prototype.hasOwnProperty.call(KEYSYM_NAMES, key)) {
+    return KEYSYM_NAMES[key]
+  }
+
+  if (Object.prototype.hasOwnProperty.call(KEYSYM_CODES, code)) {
+    return KEYSYM_CODES[code]
+  }
+
+  if (/^Numpad[0-9]$/.test(code)) {
+    return 0xffb0 + Number(code.slice(-1))
+  }
+
+  if (/^F([1-9]|1[0-2])$/.test(key)) {
+    return 0xffbe + (Number(key.slice(1)) - 1)
+  }
+
+  // A printable character: its code point IS the keysym up to Latin-1. Beyond
+  // that it would need the Unicode→keysym table; 0 sends nothing, which is
+  // honest (the key is dropped) instead of sending a DIFFERENT key.
+  if (key.length === 1 && key.codePointAt(0) < 0x100) {
+    return key.codePointAt(0)
+  }
+
+  return 0
+}
+
+/** Modifier keysyms an event carries, in a fixed X order. */
+const RFB_MODIFIERS = [
+  ['ctrlKey', 0xffe3],
+  ['altKey', 0xffe9],
+  ['metaKey', 0xffe7],
+  ['shiftKey', 0xffe1]
+]
+
+/** The keysyms to send for one key event, in wire order. A press sends the
+ *  modifiers it needs and then the key; a release sends the key and then drops
+ *  the modifiers — noVNC's order, and the one that keeps a stuck modifier from
+ *  holding the bot's keyboard hostage after a focus change. */
+function keysymsForEvent(event, down) {
+  const key = keysymFor(String(event?.key || ''), String(event?.code || ''))
+
+  if (!key) {
+    return []
+  }
+
+  const modifiers = RFB_MODIFIERS.filter(([flag]) => event?.[flag]).map(([, keysym]) => keysym)
+
+  return down ? [...modifiers, key] : [key, ...modifiers.reverse()]
+}
+
+/** DOM button bits → RFB mask bits. They disagree: DOM is 1 left / 2 right /
+ *  4 middle, RFB is 1 left / 2 middle / 4 right. */
+function pointerMaskFor(buttons) {
+  const value = Number(buttons) || 0
+
+  return (value & 1) | ((value & 4) >>> 1) | ((value & 2) << 1)
+}
+
+/** A wheel tick as RFB's transient masks: bit 3 up, bit 4 down. Xvnc reads the
+ *  press (and the release that follows) as one scroll step. */
+function wheelMaskFor(deltaY) {
+  if (!deltaY) {
+    return 0
+  }
+
+  return deltaY < 0 ? 8 : 16
+}
+
+/** Raw rectangle → RGBA. Writes straight into the canvas' own pixel array
+ *  (`stride` bytes per row) and returns how many wire bytes it consumed.
+ *  Pure: bytes in, pixels out — which is how the harness proves the decoder
+ *  without a screen. `pixels` is a typed array (the canvas ImageData's data). */
+function decodeRawRect(bytes, at, format, pixels, targetAt, rectWidth, rectHeight, stride) {
+  const step = Math.max(1, Math.ceil(format.bpp / 8))
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length)
+  const redScale = format.redMax ? 255 / format.redMax : 0
+  const greenScale = format.greenMax ? 255 / format.greenMax : 0
+  const blueScale = format.blueMax ? 255 / format.blueMax : 0
+  let cursor = at
+
+  for (let row = 0; row < rectHeight; row += 1) {
+    let to = targetAt + row * stride
+
+    for (let column = 0; column < rectWidth; column += 1) {
+      let value
+
+      if (step === 4) {
+        value = view.getUint32(cursor, !format.bigEndian)
+      } else if (step === 2) {
+        value = view.getUint16(cursor, !format.bigEndian)
+      } else {
+        value = view.getUint8(cursor)
+      }
+
+      pixels[to] = ((value >>> format.redShift) & format.redMax) * redScale
+      pixels[to + 1] = ((value >>> format.greenShift) & format.greenMax) * greenScale
+      pixels[to + 2] = ((value >>> format.blueShift) & format.blueMax) * blueScale
+      pixels[to + 3] = 255
+      cursor += step
+      to += 4
+    }
+  }
+
+  return cursor - at
+}
+
+/** CopyRect inside the pixel array we already hold. Goes through a staging copy
+ *  because source and destination MAY overlap — scrolling is exactly that — and
+ *  a naive in-place copy smears the rows it is about to read. */
+function copyRectRegion(pixels, stride, region) {
+  const { destX, destY, height, sourceX, sourceY, width } = region
+  const staging = new Uint8ClampedArray(width * height * 4)
+
+  for (let row = 0; row < height; row += 1) {
+    const from = (sourceY + row) * stride + sourceX * 4
+
+    staging.set(pixels.subarray(from, from + width * 4), row * width * 4)
+  }
+
+  for (let row = 0; row < height; row += 1) {
+    pixels.set(staging.subarray(row * width * 4, (row + 1) * width * 4), (destY + row) * stride + destX * 4)
+  }
+}
+
+/** ServerInit: u16 width, u16 height, 16-byte pixel format, u32 name length. */
+function parseServerInit(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, 24)
+
+  return {
+    format: parseRfbFormat(bytes, 4),
+    height: view.getUint16(2),
+    nameLength: view.getUint32(20),
+    width: view.getUint16(0)
+  }
+}
+
+/** Is this 4-byte head a plausible ServerInit (width + height)? Used for the
+ *  one ambiguity in the handshake: after a security type of None some servers
+ *  send SecurityResult and some go straight to ServerInit, and a real desktop
+ *  never has a zero width or height. Testing the bytes beats a version table. */
+function looksLikeServerInit(head) {
+  const view = new DataView(head.buffer, head.byteOffset, 4)
+  const width = view.getUint16(0)
+  const height = view.getUint16(2)
+
+  return width > 0 && height > 0 && width <= 32767 && height <= 32767
+}
+
+/** The wire pump. Feed it bytes; it drives the handshake, decodes frames into
+ *  the pixel array the caller owns, and asks for exactly one update at a time.
+ *
+ *  `onSize({width, height})` must return the pixel array to draw into (the
+ *  canvas' `ImageData.data`); `onFramebuffer({rects})` is the caller's cue to
+ *  paint, after which it calls `ack()` — the backpressure pair. `send(bytes)`
+ *  pushes to the socket. */
+function createRfbStream({ onFramebuffer, onNote, onSize, send }) {
+  const stream = {
+    ack,
+    feed,
+    note: '',
+    pixels: null,
+    sent: 0,
+    size: { height: 0, width: 0 },
+    state: 'version'
+  }
+  const requested = rfbRequestedFormat()
+  let buffer = new Uint8Array(0)
+  let format = requested
+  let width = 0
+  let height = 0
+  let awaiting = false
+  let pendingRects = 0
+  let rectsThisFrame = []
+  let drewThisFrame = false
+
+  function append(chunk) {
+    const next = new Uint8Array(buffer.length + chunk.length)
+
+    next.set(buffer)
+    next.set(chunk, buffer.length)
+    buffer = next
+  }
+
+  function take(count) {
+    const slice = buffer.slice(0, count)
+
+    buffer = buffer.slice(count)
+
+    return slice
+  }
+
+  function fail(note) {
+    stream.state = 'dead'
+    stream.note = note
+    onNote?.(note)
+  }
+
+  function push(bytes) {
+    stream.sent += 1
+    send(bytes)
+  }
+
+  function requestFrame(incremental) {
+    if (stream.state !== 'ready' || awaiting) {
+      return
+    }
+
+    awaiting = true
+    push(rfbUpdateRequest({ height, width, x: 0, y: 0 }, incremental))
+  }
+
+  /** Called by the caller once the emitted frame is PAINTED. This, not a timer,
+   *  is what asks for the next update — the whole backpressure story. */
+  function ack() {
+    awaiting = false
+    requestFrame(true)
+  }
+
+  /** One handshake step. Returns false when more bytes are needed. */
+  function stepHandshake() {
+    if (stream.state === 'version') {
+      if (buffer.length < 12) {
+        return false
+      }
+
+      const greeting = String.fromCharCode(...take(12))
+
+      if (!greeting.startsWith('RFB 003.')) {
+        fail('the view sent something that is not RFB')
+
+        return false
+      }
+
+      const minor = Number(greeting.slice(8, 11)) || 8
+
+      stream.minor = minor
+
+      if (minor < 7) {
+        // A 3.3 screen decides the security type itself and expects ClientInit
+        // where a 3.7+ client sends its choice — 13 handshake bytes, against
+        // the 14 `RfbClientFilter` counts. There is no honest way to splice it,
+        // so say that instead of hanging on a socket that will never answer.
+        fail(`this screen speaks RFB 3.${minor}, and the gateway bridge splices 3.8 only`)
+
+        return false
+      }
+
+      push(new TextEncoder().encode(RFB_VERSION_REPLY_38))
+      stream.state = 'security'
+
+      return true
+    }
+
+    if (stream.state === 'security') {
+      if (buffer.length < 1) {
+        return false
+      }
+
+      const count = take(1)[0]
+
+      if (count === 0) {
+        if (buffer.length < 4) {
+          return false
+        }
+
+        const length = new DataView(take(4).buffer).getUint32(0)
+
+        if (buffer.length < length) {
+          return false
+        }
+
+        fail(`the screen refused the view: ${String.fromCharCode(...take(length)).trim()}`)
+
+        return false
+      }
+
+      if (buffer.length < count) {
+        return false
+      }
+
+      const types = Array.from(take(count))
+
+      if (!types.includes(RFB_SECURITY_NONE)) {
+        fail('the screen asks for authentication this pane cannot supply')
+
+        return false
+      }
+
+      push(new Uint8Array([RFB_SECURITY_NONE]))
+      stream.state = 'securityResult'
+
+      return true
+    }
+
+    if (stream.state === 'securityResult') {
+      if (buffer.length < 4) {
+        return false
+      }
+
+      const head = buffer.slice(0, 4)
+      const result = new DataView(head.buffer, head.byteOffset, 4).getUint32(0)
+      // A server that sends no SecurityResult goes straight to ServerInit, whose
+      // first four bytes are width+height — and a real desktop is never 0×0.
+      const withoutResult = result !== 0 && looksLikeServerInit(head)
+
+      if (result !== 0 && !withoutResult) {
+        fail('the screen refused the view')
+
+        return false
+      }
+
+      if (!withoutResult) {
+        take(4)
+      }
+
+      // ClientInit, ALWAYS, and before we wait for ServerInit: the server will
+      // not send one until it has this byte, and the bridge's filter has already
+      // budgeted for it (12 + 1 + 1 handshake bytes).
+      push(RFB_CLIENT_INIT)
+      stream.state = 'init'
+
+      return true
+    }
+
+    if (stream.state === 'init') {
+      if (buffer.length < 24) {
+        return false
+      }
+
+      const init = parseServerInit(buffer)
+
+      if (buffer.length < 24 + init.nameLength) {
+        return false
+      }
+
+      take(24 + init.nameLength)
+      width = init.width
+      height = init.height
+      format = init.format
+      stream.size = { height, width }
+      stream.pixels = onSize?.({ height, width }) || null
+      push(rfbSetPixelFormat(requested))
+      push(rfbSetEncodings([RFB_ENCODING_RAW, RFB_ENCODING_COPY_RECT]))
+      stream.state = 'ready'
+      requestFrame(false)
+
+      return true
+    }
+
+    return false
+  }
+
+  /** One rectangle of the message already being read. Consumes from `buffer`
+   *  only once the WHOLE rect is here: a half-decoded rectangle cannot be
+   *  replayed later, and eating its header twice would desync the stream. */
+  function stepRect() {
+    if (buffer.length < 12) {
+      return false
+    }
+
+    const head = new DataView(buffer.buffer, buffer.byteOffset, 12)
+    const x = head.getUint16(0)
+    const y = head.getUint16(2)
+    const rectWidth = head.getUint16(4)
+    const rectHeight = head.getUint16(6)
+    const encoding = head.getInt32(8)
+
+    if (encoding === RFB_ENCODING_RAW) {
+      const needed = 12 + rectWidth * rectHeight * Math.max(1, Math.ceil(format.bpp / 8))
+
+      if (buffer.length < needed) {
+        return false
+      }
+
+      const message = take(needed)
+
+      if (stream.pixels) {
+        decodeRawRect(message, 12, format, stream.pixels, y * width * 4 + x * 4, rectWidth, rectHeight, width * 4)
+      }
+
+      rectsThisFrame.push({ height: rectHeight, width: rectWidth, x, y })
+      drewThisFrame = true
+
+      return true
+    }
+
+    if (encoding === RFB_ENCODING_COPY_RECT) {
+      if (buffer.length < 16) {
+        return false
+      }
+
+      const tail = new DataView(buffer.buffer, buffer.byteOffset + 12, 4)
+
+      if (stream.pixels) {
+        copyRectRegion(stream.pixels, width * 4, {
+          destX: x,
+          destY: y,
+          height: rectHeight,
+          sourceX: tail.getUint16(0),
+          sourceY: tail.getUint16(2),
+          width: rectWidth
+        })
+      }
+
+      take(16)
+      rectsThisFrame.push({ height: rectHeight, width: rectWidth, x, y })
+      drewThisFrame = true
+
+      return true
+    }
+
+    if (encoding === RFB_DESKTOP_SIZE) {
+      // An unprompted resize: the new width/height ride x/y and the rect itself
+      // is empty. Re-allocating the pixel array here is what keeps every later
+      // rectangle aligned — the only other honest option is to drop the view.
+      take(12)
+      width = x || width
+      height = y || height
+      stream.size = { height, width }
+      stream.pixels = onSize?.({ height, width }) || stream.pixels
+
+      return true
+    }
+
+    fail(`the screen sent encoding ${encoding}, which this viewer does not speak`)
+
+    return false
+  }
+
+  /** One server message. `pendingRects` carries a partially-read
+   *  FramebufferUpdate across feeds: a frame arrives in many WebSocket chunks,
+   *  and its rect count must not be re-read when the next chunk lands. */
+  function stepMessage() {
+    if (pendingRects) {
+      while (pendingRects > 0) {
+        if (!stepRect()) {
+          return false
+        }
+
+        pendingRects -= 1
+      }
+
+      if (drewThisFrame) {
+        onFramebuffer?.({ rects: rectsThisFrame, height, width })
+      }
+
+      rectsThisFrame = []
+      drewThisFrame = false
+
+      return true
+    }
+
+    const type = buffer[0]
+
+    if (type === 0) {
+      if (buffer.length < 4) {
+        return false
+      }
+
+      pendingRects = new DataView(buffer.buffer, buffer.byteOffset, 4).getUint16(2)
+      take(4)
+
+      if (!pendingRects) {
+        return true
+      }
+
+      return stepMessage()
+    }
+
+    if (type === 1) {
+      if (buffer.length < 6) {
+        return false
+      }
+
+      const count = new DataView(buffer.buffer, buffer.byteOffset, 6).getUint16(4)
+
+      if (buffer.length < 6 + count * 6) {
+        return false
+      }
+
+      take(6 + count * 6)
+
+      return true
+    }
+
+    if (type === 2) {
+      take(1)
+
+      return true
+    }
+
+    if (type === 3) {
+      if (buffer.length < 8) {
+        return false
+      }
+
+      const length = new DataView(buffer.buffer, buffer.byteOffset, 8).getUint32(4)
+
+      if (length > RFB_CUT_TEXT_MAX) {
+        fail('the screen sent a clipboard payload larger than this viewer accepts')
+
+        return false
+      }
+
+      if (buffer.length < 8 + length) {
+        return false
+      }
+
+      take(8 + length)
+
+      return true
+    }
+
+    fail(`the screen sent message type ${type}, which this viewer does not speak`)
+
+    return false
+  }
+
+  function pump() {
+    while (stream.state !== 'dead') {
+      if (stream.state !== 'ready') {
+        if (!stepHandshake()) {
+          return
+        }
+
+        continue
+      }
+
+      if (!buffer.length) {
+        return
+      }
+
+      const before = buffer.length
+
+      if (!stepMessage()) {
+        return
+      }
+
+      if (buffer.length === before) {
+        return
+      }
+    }
+  }
+
+  function feed(chunk) {
+    if (stream.state === 'dead') {
+      return
+    }
+
+    append(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk))
+    pump()
+  }
+
+  return stream
+}
+
+/* ── SCREEN: verbs, lease and the live session ─────────────────────────────── */
+
+/** What this profile's screen offers, from one `display.status` snapshot. Pure,
+ *  so the harness can pin every tone without a gateway. */
+function screenVerbState(status, unavailable) {
+  const supported = Boolean(status?.supported)
+  const installed = Boolean(status?.installed)
+  const running = Boolean(status?.running)
+
+  return {
+    blocker: String(status?.blocker || ''),
+    canInstall: supported && !installed,
+    canStart: installed && !running,
+    canStop: running,
+    installable: supported,
+    running,
+    tone: screenTone(status, unavailable || null)
+  }
+}
+
+/** What a closed view socket means. `reobserve: true` is the retry that needs a
+ *  FRESH ticket — the display ticket is single-use and dies in 30 s, so a
+ *  reconnect without one is a guaranteed 4401 loop. */
+function screenCloseVerdict(code, reason) {
+  if (code === 4000) {
+    return { mode: 'watch', note: 'control-taken', reobserve: true }
+  }
+
+  if (code === 4001) {
+    return { mode: 'stopped', note: 'the screen stopped', reobserve: false }
+  }
+
+  if (code === 4401) {
+    return { mode: 'connecting', note: 'the view ticket expired', reobserve: true }
+  }
+
+  if (code === 4403) {
+    return { mode: 'error', note: String(reason || '') || 'the gateway refused the view', reobserve: false }
+  }
+
+  if (code === 1003) {
+    return { mode: 'error', note: 'the gateway refused a non-binary view', reobserve: false }
+  }
+
+  if (code === 1000 || code === 1001) {
+    return { mode: 'idle', note: '', reobserve: false }
+  }
+
+  return { mode: 'error', note: String(reason || '') || `the view closed (${code})`, reobserve: false }
+}
+
+/** Does THIS window hold the lease? The gateway names the holder by hash only
+ *  (the raw viewer id is a capability and never travels), so a human lease
+ *  whose hash is not ours belongs to somebody else. */
+function leaseHeldBy(lease, hash) {
+  return Boolean(lease && lease.holder === 'human' && hash && lease.viewer_hash === hash)
+}
+
+/** `viewer_hash` the way the lease broadcasts it: the first 12 hex digits of
+ *  sha256(viewer_id). The same shape Bot Mode computes, for the same reason. */
+async function viewerHashOf(viewerId) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(viewerId || '')))
+
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 12)
+}
+
+/** The RFB socket URL for a profile, ticket and all. `resolveSiblingWsUrl`
+ *  rides the same authenticated origin as the chat socket; the gateway's own
+ *  `?ticket=` is stripped because the display bridge authenticates on its OWN
+ *  single-use ticket (spending one credential twice is how a view 401s). */
+async function screenSocketUrl(profile, ticket) {
+  const base = await resolveSiblingWsUrl({ profile }, '/api/display/ws', { stripGatewayCredential: true })
+
+  return `${base}${base.includes('?') ? '&' : '?'}display_ticket=${encodeURIComponent(ticket)}`
+}
+
 /** Bots' portal tone (`screen-portal.tsx::portalTone`), minus the lease half
  *  this window can never hold: a plugin pane never attaches a screen viewer,
  *  so a human holding the lease reads as "someone has control", never "you". */
@@ -7403,9 +8238,11 @@ function timestampStale(frame) {
   return Boolean(frame.error && !frame.isPending)
 }
 
-/** The Screen viewer this plugin can offer: a live, larger view of the same
- *  thumbnail, in its own workspace tab. Takeover, install and start stay in
- *  Bot Mode's Screen pane — every pane must own its own lease holder. */
+/** The Screen viewer this plugin offers: the same profile's Bot Desktop, live
+ *  and drivable, in its own workspace tab. Each pane owns its own lease holder,
+ *  so two tabs of this pane are two viewers — and taking over in one evicts the
+ *  other, which is exactly what `display.lease` reports (Pedro, 2026-10-15:
+ *  "make Personae able to START/STOP/TAKE OVER the screen itself"). */
 const screenTabs = new Map()
 
 function openScreenPane(profile, label) {
@@ -7429,55 +8266,594 @@ function openScreenPane(profile, label) {
   screenTabs.set(profile, close)
 }
 
+/* ── SCREEN: the pane ──────────────────────────────────────────────────────── */
+
+/** The install stream, as MODULE state. A package manager runs for minutes and
+ *  the events arrive whatever the pane is doing, so the log lives outside React
+ *  and the pane simply reads it — losing the log because the tab closed would be
+ *  a lie about what happened on the host. */
+const $screenInstall = atom({ lines: [], running: false })
+
+function resetScreenInstall() {
+  $screenInstall.set({ lines: [], running: false })
+}
+
+function noteScreenInstallLog(payload) {
+  const state = $screenInstall.get()
+
+  $screenInstall.set({ lines: [...state.lines, { text: String(payload?.line || '') }].slice(-80), running: true })
+}
+
+function noteScreenInstallDone(payload) {
+  const state = $screenInstall.get()
+
+  $screenInstall.set({
+    lines: [...state.lines, { key: Number(payload?.code) ? 'screenInstallFailed' : 'screenInstallDone' }].slice(-80),
+    running: false
+  })
+}
+
+/** Stopping a screen somebody else is driving is a QUESTION, not a verb: the
+ *  gateway refuses it without `force`, so the pane asks first instead of
+ *  surfacing a refusal the user cannot act on. */
+function screenStopNeedsConfirm(status, hash) {
+  const lease = status?.lease || null
+
+  return Boolean(lease && lease.holder === 'human' && !leaseHeldBy(lease, hash))
+}
+
+/** One mounted Screen pane's live state. Held in a ref, never in React state:
+ *  the RFB pump and its socket must survive every re-render untouched. */
+function createScreenSession() {
+  return {
+    attaching: false,
+    closing: false,
+    frames: 0,
+    hash: '',
+    held: new Set(),
+    image: null,
+    retries: 0,
+    socket: null,
+    stream: null,
+    viewerId: ''
+  }
+}
+
+function screenSend(session, bytes) {
+  try {
+    session?.socket?.send?.(bytes)
+  } catch {
+    // A dying socket drops the keystroke, never the pane: the close handler is
+    // what repaints, and there is nobody to catch an exception for here.
+    return false
+  }
+
+  return true
+}
+
+/** A new ImageData for a framebuffer size, and the array the decoder writes
+ *  into. Returns null when there is no canvas yet — the caller treats that as
+ *  "decode nothing, still keep the stream aligned". */
+function allocateCanvas(canvas, session, size) {
+  const context = canvas?.getContext?.('2d')
+
+  if (!context || !size?.width || !size?.height) {
+    session.image = null
+
+    return null
+  }
+
+  canvas.width = size.width
+  canvas.height = size.height
+  session.image = context.createImageData(size.width, size.height)
+
+  return session.image.data
+}
+
+/** Paint the rectangles of one update and ACK it — the ack is what asks for the
+ *  next update, so a pane that paints slowly also receives slowly instead of
+ *  queueing frames it will never draw. */
+function paintScreenFrame(canvas, session, frame) {
+  const context = canvas?.getContext?.('2d')
+
+  if (context && session.image && frame?.rects?.length) {
+    const left = Math.max(0, Math.min(...frame.rects.map(rect => rect.x)))
+    const top = Math.max(0, Math.min(...frame.rects.map(rect => rect.y)))
+    const right = Math.min(session.image.width, Math.max(...frame.rects.map(rect => rect.x + rect.width)))
+    const bottom = Math.min(session.image.height, Math.max(...frame.rects.map(rect => rect.y + rect.height)))
+
+    if (right > left && bottom > top) {
+      context.putImageData(session.image, 0, 0, left, top, right - left, bottom - top)
+    }
+  }
+
+  session.frames += 1
+  session.stream?.ack()
+}
+
+/** Push every held key back up before losing the socket or the lease: a keydown
+ *  we forwarded and never released holds that key down on the bot's keyboard
+ *  until something else presses it. */
+function releaseHeldKeys(session) {
+  if (!session?.held?.size) {
+    return 0
+  }
+
+  const count = session.held.size
+
+  session.held.forEach(keysym => screenSend(session, rfbKeyMessage(false, keysym)))
+  session.held.clear()
+
+  return count
+}
+
+function detachScreen(session, onNote) {
+  if (!session) {
+    return
+  }
+
+  releaseHeldKeys(session)
+  session.closing = true
+  session.attaching = false
+
+  try {
+    session.socket?.close?.(1000, 'pane closed')
+  } catch {
+    session.socket = null
+  }
+
+  session.socket = null
+  session.stream = null
+  session.image = null
+  onNote?.({ controlling: false, mode: 'idle', note: '', watching: false })
+}
+
+/** Mint a ticket, open the RFB socket and start the pump. Resolves with the
+ *  session either way — a refused view is a NOTE, not a rejected promise the
+ *  caller has to remember to catch. */
+async function attachScreen(session, api) {
+  if (session.attaching || session.socket) {
+    return session
+  }
+
+  session.attaching = true
+  api.patch({ mode: 'connecting', note: '' })
+
+  try {
+    const observed = await host.request('display.observe', { profile: api.profile })
+
+    session.viewerId = String(observed?.viewer_id || '')
+    session.hash = await viewerHashOf(session.viewerId)
+
+    const socket = new WebSocket(await screenSocketUrl(api.profile, observed?.ticket))
+
+    socket.binaryType = 'arraybuffer'
+    session.socket = socket
+    session.stream = createRfbStream({
+      onFramebuffer: frame => paintScreenFrame(api.canvas(), session, frame),
+      onNote: note => {
+        // A protocol failure is a settled answer, not a blip: say it, and close
+        // the socket WITHOUT letting the close handler repaint over the reason.
+        session.attaching = false
+        session.failed = true
+        api.patch({ mode: 'error', note })
+
+        try {
+          session.socket?.close?.(1000, 'view failed')
+        } catch {
+          session.socket = null
+        }
+      },
+      onSize: size => allocateCanvas(api.canvas(), session, size),
+      send: bytes => screenSend(session, bytes)
+    })
+
+    socket.onmessage = event => session.stream?.feed(new Uint8Array(event.data))
+    socket.onerror = () => session.attaching = false
+    socket.onclose = event => {
+      const verdict = screenCloseVerdict(event?.code, event?.reason)
+      // A close WE caused — the pane unmounting, the profile switching, a view
+      // that already reported its own failure — must not repaint the pane with
+      // a verdict about a socket the user never saw.
+      const deliberate = session.closing || session.failed
+
+      session.attaching = false
+      session.closing = false
+      session.failed = false
+      session.socket = null
+      session.stream = null
+      releaseHeldKeys(session)
+
+      if (deliberate) {
+        return
+      }
+
+      api.patch({
+        controlling: false,
+        mode: verdict.mode,
+        note: verdict.note === 'control-taken' ? 'control-taken' : verdict.note,
+        watching: false
+      })
+
+      // A single-use ticket expires in 30 s, so a reconnect that needs one has
+      // to mint a new one; two attempts, then the pane stops retrying and says
+      // what happened instead of looping in the dark.
+      if (verdict.reobserve && session.retries < 2) {
+        session.retries += 1
+        setTimeout(() => attachScreen(session, api), 400)
+      }
+    }
+
+    session.retries = 0
+    api.patch({ mode: 'watching', note: '', watching: true })
+  } catch (error) {
+    session.attaching = false
+    session.socket = null
+    session.stream = null
+    api.patch({ mode: 'error', note: String(error?.message || error || 'the view could not be opened') })
+  }
+
+  return session
+}
+
+async function screenLease(session, api, action) {
+  const result = await host.request(action === 'take' ? 'display.lease.acquire' : 'display.lease.release', {
+    profile: api.profile,
+    reason: 'Personae',
+    viewer_id: session.viewerId
+  })
+
+  if (action === 'take') {
+    return leaseHeldBy(result?.lease, session.hash)
+  }
+
+  releaseHeldKeys(session)
+
+  return false
+}
+
+/** One key event from the canvas. Forwarded ONLY while this window holds the
+ *  lease — the bridge drops input from everyone else anyway, so sending it
+ *  would only lie to the user about who is typing. */
+function forwardKey(session, event, down) {
+  const keysyms = keysymsForEvent(event, down)
+
+  if (!keysyms.length) {
+    return false
+  }
+
+  event.preventDefault()
+  keysyms.forEach(keysym => {
+    if (down) {
+      session.held.add(keysym)
+    } else {
+      session.held.delete(keysym)
+    }
+
+    screenSend(session, rfbKeyMessage(down, keysym))
+  })
+
+  return true
+}
+
+/** A pointer position in framebuffer coordinates, from a DOM event on a scaled
+ *  canvas. The canvas is CSS-scaled to the pane's width, so the ratio is what
+ *  maps a click to the pixel the bot sees. */
+function screenPointer(session, canvas, event) {
+  const rect = canvas?.getBoundingClientRect?.()
+
+  if (!rect?.width || !session.image) {
+    return null
+  }
+
+  return {
+    mask: pointerMaskFor(event.buttons),
+    x: Math.max(0, Math.min(session.image.width - 1, Math.round(((event.clientX - rect.left) / rect.width) * session.image.width))),
+    y: Math.max(0, Math.min(session.image.height - 1, Math.round(((event.clientY - rect.top) / rect.height) * session.image.height)))
+  }
+}
+
+/** The Screen tab, in full: what this profile's screen IS, the verbs that change
+ *  it, and the live view you can drive. */
 function ScreenView({ profile }) {
   const t = usePluginI18n(ID)
+  const canvasRef = useRef(null)
+  const sessionRef = useRef(null)
+  const apiRef = useRef(null)
+  const [view, setView] = useState({ controlling: false, mode: 'idle', note: '', watching: false })
+  const [busy, setBusy] = useState('')
+  const [confirmStop, setConfirmStop] = useState(false)
+  const installState = useValue($screenInstall)
+
+  apiRef.current = {
+    canvas: () => canvasRef.current,
+    patch: changes => setView(previous => ({ ...previous, ...changes })),
+    profile
+  }
+
+  if (!sessionRef.current) {
+    sessionRef.current = createScreenSession()
+  }
+
+  const session = sessionRef.current
+  const statusKey = ['personae', 'screen', profile]
   const status = useQuery({
-    queryKey: ['personae', 'screen', profile],
+    queryKey: statusKey,
     queryFn: () => host.request('display.status', { profile }),
     refetchInterval: 15000,
     retry: false,
     staleTime: 5000
   })
-  const tone = screenTone(status.data || null, displayMissing(status.error))
-  const live = tone === 'live' || tone === 'other'
-  const frame = useQuery({
-    queryKey: ['personae', 'screen-frame', profile],
-    queryFn: () => host.request('display.thumbnail', { profile }),
-    enabled: live,
-    refetchInterval: 3000,
-    retry: false,
-    staleTime: 1500
+  const verbs = screenVerbState(status.data || null, displayMissing(status.error))
+  const lease = status.data?.lease || null
+  const heldElsewhere = screenStopNeedsConfirm(status.data, session.hash)
+  const report = (error, fallback) => {
+    const note = String(error?.message || error || fallback || '')
+
+    apiRef.current.patch({ mode: 'error', note: note || fallback })
+
+    return note
+  }
+  const refresh = () => queryClient.invalidateQueries({ queryKey: statusKey })
+
+  // The gateway is the authority on who holds the lease: the event only says
+  // SOMETHING changed (its payload names a profile home key, not a profile), so
+  // it triggers a refetch and `display.status` decides.
+  useEffect(() => {
+    const offLease = host.onEvent?.('display.lease', refresh)
+
+    return () => offLease?.()
+  }, [profile])
+
+  useEffect(() => {
+    if (!lease) {
+      return
+    }
+
+    setView(previous => {
+      if (!previous.controlling || leaseHeldBy(lease, session.hash)) {
+        return previous
+      }
+
+      return {
+        ...previous,
+        controlling: false,
+        mode: previous.mode === 'error' ? previous.mode : 'watch',
+        note: lease.holder === 'human' ? 'control-taken' : ''
+      }
+    })
+  }, [lease?.epoch, lease?.holder, lease?.viewer_hash])
+
+  // Running ⇒ the pane watches by itself. That is the whole point of a Screen
+  // tab: opening it should not still need a click before anything is visible.
+  useEffect(() => {
+    if (verbs.running) {
+      attachScreen(session, apiRef.current)
+    } else {
+      detachScreen(session, apiRef.current.patch)
+    }
+  }, [verbs.running, profile])
+
+  useEffect(() => () => detachScreen(session, () => undefined), [])
+
+  useEffect(() => {
+    const offLog = host.onEvent?.('display.install.log', noteScreenInstallLog)
+    const offDone = host.onEvent?.('display.install.done', payload => {
+      noteScreenInstallDone(payload)
+      refresh()
+    })
+
+    return () => {
+      offLog?.()
+      offDone?.()
+    }
+  }, [profile])
+
+  const run = async (verb, work) => {
+    setBusy(verb)
+
+    try {
+      await work()
+    } catch (error) {
+      report(error, t('screenFailed'))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const start = () => run('start', async () => {
+    await host.request('display.start', { profile })
+    refresh()
   })
-  const dataUrl = live ? frame.data?.data_url || null : null
+
+  const stop = force => run('stop', async () => {
+    setConfirmStop(false)
+    await host.request('display.stop', { force, profile })
+    refresh()
+  })
+
+  const install = () => run('install', async () => {
+    resetScreenInstall()
+    $screenInstall.set({ lines: [], running: true })
+    await host.request('display.install', { profile })
+  })
+
+  const takeOver = () => run('take', async () => {
+    await attachScreen(session, apiRef.current)
+    const held = await screenLease(session, apiRef.current, 'take')
+
+    apiRef.current.patch({ controlling: held, mode: 'watch', note: '' })
+    canvasRef.current?.focus?.()
+    refresh()
+  })
+
+  const handBack = () => run('hand', async () => {
+    await screenLease(session, apiRef.current, 'release')
+    apiRef.current.patch({ controlling: false, mode: 'watch', note: '' })
+    refresh()
+  })
+
+  const button = (key, label, onClick, options = {}) =>
+    jsx(
+      Button,
+      {
+        disabled: Boolean(busy) || Boolean(options.disabled),
+        onClick,
+        size: 'sm',
+        variant: options.variant || 'ghost',
+        children: busy === key ? t('screenWorking') : label
+      },
+      key
+    )
+
+  const note =
+    view.note === 'control-taken'
+      ? t('screenTaken')
+      : view.note === 'the screen stopped'
+        ? t('screenOff')
+        : view.note
 
   return jsxs('div', {
     className: 'grid min-w-0 grid-cols-1 gap-3 p-4',
     children: [
       jsxs('div', {
-        className: 'flex min-w-0 items-baseline gap-2',
+        className: 'flex min-w-0 flex-wrap items-center gap-2',
         children: [
-          jsx('span', { className: 'text-sm font-semibold', children: profile }),
-          jsx('span', {
-            className: 'text-xs text-(--ui-text-tertiary)',
-            children: t(screenCaptionKey(tone))
-          })
+          jsx('span', { className: 'text-sm font-semibold', children: profile }, 'name'),
+          jsxs('span', {
+            className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-tertiary)',
+            children: view.controlling ? t('screenDriving') : t(screenCaptionKey(verbs.tone)) + (verbs.running ? ` · ${status.data?.geometry || ''}` : '')
+          }, 'caption'),
+          button('take', t('screenTakeOver'), takeOver, { disabled: !verbs.running || view.controlling }),
+          view.controlling ? button('hand', t('screenHandBack'), handBack) : null
         ]
       }),
-      jsx('div', {
-        className:
-          'relative w-full overflow-hidden rounded-lg border border-(--ui-stroke-secondary) bg-black',
-        style: { aspectRatio: '16 / 10' },
-        children: dataUrl
-          ? jsx('img', { alt: '', className: 'absolute inset-0 size-full object-cover', src: dataUrl })
-          : jsx('span', {
-              className: 'absolute inset-0 grid place-items-center text-xs text-white/70',
-              children: t(screenCaptionKey(tone))
-            })
+      jsxs('div', {
+        className: 'flex min-w-0 flex-wrap items-center gap-1.5',
+        children: [
+          verbs.canStart ? button('start', t('screenStart'), start, { disabled: Boolean(verbs.blocker), variant: 'default' }) : null,
+          verbs.canStop ? button('stop', t('screenStop'), () => (heldElsewhere ? setConfirmStop(true) : stop(false)), { variant: 'destructive' }) : null,
+          verbs.canInstall ? button('install', t('screenInstall'), install, { variant: 'default' }) : null,
+          view.mode === 'error' || view.mode === 'stopped'
+            ? button('retry', t('screenReconnect'), () => run('retry', async () => attachScreen(session, apiRef.current)))
+            : null
+        ]
       }),
-      jsx('div', {
+      confirmStop
+        ? jsxs('div', {
+            className:
+              'flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) px-2 py-1.5',
+            children: [
+              jsx('span', {
+                className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: t('screenStopForce')
+              }, 'ask'),
+              jsxs('div', {
+                className: 'flex items-center gap-0.5',
+                children: [
+                  jsx(Button, { onClick: () => setConfirmStop(false), size: 'sm', variant: 'ghost', children: t('cancel') }, 'cancel'),
+                  jsx(Button, { onClick: () => stop(true), size: 'sm', variant: 'destructive', children: t('screenStop') }, 'force')
+                ]
+              }, 'verbs')
+            ]
+          }, 'confirm-stop')
+        : null,
+      verbs.blocker
+        ? jsx('div', {
+            className: 'rounded-md border border-(--ui-stroke-secondary) px-2 py-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+            children: verbs.blocker
+          }, 'blocker')
+        : null,
+      jsxs('div', {
+        className: 'relative min-w-0 overflow-hidden rounded-lg border border-(--ui-stroke-secondary) bg-black',
+        children: [
+          jsx('canvas', {
+            'data-personae-screen': view.mode,
+            onBlur: () => releaseHeldKeys(session),
+            onKeyDown: event => view.controlling && forwardKey(session, event, true),
+            onKeyUp: event => view.controlling && forwardKey(session, event, false),
+            onPointerDown: event => {
+              if (view.controlling) {
+                const at = screenPointer(session, canvasRef.current, event)
+
+                if (at) {
+                  screenSend(session, rfbPointerMessage(at.mask, at.x, at.y))
+                }
+              }
+            },
+            onPointerMove: event => {
+              if (view.controlling && event.buttons) {
+                const at = screenPointer(session, canvasRef.current, event)
+
+                if (at) {
+                  screenSend(session, rfbPointerMessage(at.mask, at.x, at.y))
+                }
+              }
+            },
+            onPointerUp: event => {
+              if (view.controlling) {
+                const at = screenPointer(session, canvasRef.current, event)
+
+                if (at) {
+                  screenSend(session, rfbPointerMessage(at.mask, at.x, at.y))
+                }
+              }
+            },
+            onWheel: event => {
+              const mask = wheelMaskFor(event.deltaY)
+
+              if (!view.controlling || !mask) {
+                return
+              }
+
+              event.preventDefault()
+              const at = screenPointer(session, canvasRef.current, event)
+
+              if (at) {
+                screenSend(session, rfbPointerMessage(at.mask | mask, at.x, at.y))
+                screenSend(session, rfbPointerMessage(at.mask, at.x, at.y))
+              }
+            },
+            ref: canvasRef,
+            style: { display: 'block', height: 'auto', width: '100%' },
+            tabIndex: 0
+          }, 'canvas'),
+          view.watching
+            ? null
+            : jsx('span', {
+                className:
+                  'pointer-events-none absolute inset-0 grid place-items-center px-3 text-center text-xs text-white/70',
+                children: t(verbs.running ? 'screenConnecting' : 'screenNotRunning')
+              }, 'overlay')
+        ]
+      }, 'stage'),
+      installState.running || installState.lines.length
+        ? jsxs('div', {
+            className: 'grid min-w-0 grid-cols-1 gap-1 rounded-md border border-(--ui-stroke-secondary) px-2 py-1.5',
+            children: [
+              jsx('span', {
+                className: 'text-[0.6875rem] uppercase tracking-wider text-(--ui-text-quaternary)',
+                children: t('screenInstallLog')
+              }, 'label'),
+              jsx('div', {
+                className: 'max-h-40 overflow-y-auto font-mono text-[0.6875rem] leading-relaxed text-(--ui-text-tertiary)',
+                children: installState.lines.map((line, index) =>
+                  jsx('div', { children: line.key ? t(line.key) : line.text || ' ' }, `line-${index}`)
+                )
+              }, 'lines')
+            ]
+          }, 'install')
+        : null,
+      jsxs('div', {
         className: 'text-xs text-(--ui-text-quaternary)',
-        children: t('screenTakeover')
-      })
+        children: [
+          note ? jsx('span', { children: note }, 'note') : null,
+          note ? jsx('span', { children: ' · ' }, 'dot') : null,
+          jsx('span', {
+            children: view.controlling ? t('screenHintDriving') : t('screenHintWatch')
+          }, 'hint')
+        ]
+      }, 'foot')
     ]
   })
 }
@@ -9179,7 +10555,23 @@ export default {
         screenMissing: 'No screen installed',
         screenOff: 'Screen stopped',
         screenOther: 'Someone else is on it',
-        screenTakeover: 'Takeover, install and start live in Bot Mode → Screen.',
+        screenDriving: 'You are driving',
+        screenFailed: 'The screen did not answer.',
+        screenHandBack: 'Hand back',
+        screenHintDriving: 'Click the view to type. Hand back to give the bot its screen.',
+        screenHintWatch: 'Watching live. Take over to drive.',
+        screenInstall: 'Install',
+        screenInstallDone: 'Install finished.',
+        screenInstallFailed: 'Install failed.',
+        screenInstallLog: 'Install log',
+        screenNotRunning: 'The screen is not running — Start it to watch or drive it.',
+        screenReconnect: 'Reconnect',
+        screenStart: 'Start',
+        screenStop: 'Stop',
+        screenStopForce: 'Someone else is driving. Stop the screen anyway?',
+        screenTaken: 'Someone else took control.',
+        screenTakeOver: 'Take over',
+        screenWorking: 'Working…',
         screenTitle: 'Screen',
         status: 'Status',
         search: 'Search profiles',
@@ -9481,5 +10873,44 @@ export const __internals = {
   sessionMatches,
   scheduleLabel,
   screenTone,
+  screenVerbState,
+  screenCloseVerdict,
+  screenSocketUrl,
+  createRfbStream,
+  rfbSetPixelFormat,
+  rfbSetEncodings,
+  rfbUpdateRequest,
+  rfbKeyMessage,
+  rfbPointerMessage,
+  parseServerInit,
+  looksLikeServerInit,
+  decodeRawRect,
+  copyRectRegion,
+  keysymFor,
+  keysymsForEvent,
+  pointerMaskFor,
+  wheelMaskFor,
+  leaseHeldBy,
+  viewerHashOf,
+  createScreenSession,
+  releaseHeldKeys,
+  attachScreen,
+  detachScreen,
+  screenLease,
+  forwardKey,
+  screenPointer,
+  paintScreenFrame,
+  allocateCanvas,
+  screenStopNeedsConfirm,
+  noteScreenInstallLog,
+  noteScreenInstallDone,
+  resetScreenInstall,
+  $screenInstall,
+  openScreenPane,
+  ScreenView,
+  ScreenHero,
+  rfbRequestedFormat,
+  parseRfbFormat,
+  rfbFormatBytes,
   visibleRows
 }

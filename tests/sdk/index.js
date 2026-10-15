@@ -17,6 +17,7 @@ const harness = () => {
   const g = globalThis
 
   g.__PERSONAE_HARNESS__ ||= {
+    events: {},
     i18n: {},
     newChats: [],
     opens: [],
@@ -25,6 +26,9 @@ const harness = () => {
     queryResults: {},
     requests: [],
     responses: {},
+    revealed: [],
+    siblingUrls: [],
+    workspaces: [],
     colors: [],
     errors: [],
     rest: { calls: [] },
@@ -35,6 +39,16 @@ const harness = () => {
   }
 
   return g.__PERSONAE_HARNESS__
+}
+
+/** Deliver a gateway event to whatever the plugin subscribed (and to nothing
+ *  else) — the Screen pane's lease/install handling is driven by these. */
+export function emit(type, payload) {
+  const handlers = harness().events[type] || []
+
+  handlers.forEach(handler => handler(payload))
+
+  return handlers.length
 }
 
 // ── host ────────────────────────────────────────────────────────────────────
@@ -105,6 +119,30 @@ export const host = {
   },
   notify(payload) {
     harness().toasts.push(payload)
+  },
+  /** Subscribe to a gateway event; returns the disposer core returns. */
+  onEvent(type, handler) {
+    const h = harness()
+
+    h.events[type] = [...(h.events[type] || []), handler]
+
+    return () => {
+      h.events[type] = (h.events[type] || []).filter(entry => entry !== handler)
+    }
+  },
+  /** The Screen pane's own tab. `render` is kept unrendered: the test calls it
+   *  to prove the pane opens SOMETHING, and asserts on the returned markup. */
+  openWorkspace(id, options = {}) {
+    const h = harness()
+
+    h.workspaces = [...h.workspaces, { id, options }]
+
+    return () => undefined
+  },
+  revealPane(id) {
+    const h = harness()
+
+    h.revealed = [...h.revealed, id]
   },
   notifyError(payload) {
     const h = harness()
@@ -474,6 +512,21 @@ export const queryClient = {
 
     return Promise.resolve()
   }
+}
+
+// ── sibling streams (the Bot Screen's raw RFB) ──────────────────────────────
+
+/** The real resolver mints an authenticated `ws(s)://<gateway>/<path>` on the
+ *  route's own connection, and `stripGatewayCredential` drops the gateway's
+ *  one-shot ticket so the display bridge can spend its OWN. Here the origin is
+ *  fixed and the call is recorded: what the test asserts on is the ticket the
+ *  plugin appends, and that the path is `/api/display/ws`. */
+export async function resolveSiblingWsUrl(route, path, options = {}) {
+  const h = harness()
+
+  h.siblingUrls = [...h.siblingUrls, { options, path, route }]
+
+  return `ws://harness.local${path.startsWith('/') ? path : `/${path}`}`
 }
 
 export { harness }

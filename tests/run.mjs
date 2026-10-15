@@ -1307,12 +1307,12 @@ check(
 )
 
 h.responses['projects.list'] = () => ({
-  projects: [{ id: 'p1', name: 'mmapp', primary_path: '/home/smoothmarx/Projects/mmapp' }]
+  projects: [{ id: 'p1', name: 'demo', primary_path: '/home/hermes/Projects/demo' }]
 })
 
 const projects = await projectsQuery.queryFn()
 
-check('the project list comes from the projects registry', projects[0]?.name === 'mmapp', JSON.stringify(projects))
+check('the project list comes from the projects registry', projects[0]?.name === 'demo', JSON.stringify(projects))
 check('the query is profile-scoped', h.requests.filter(r => r.method === 'projects.list').pop()?.params?.profile === 'zulu', JSON.stringify(h.requests.filter(r => r.method === 'projects.list').pop()?.params))
 
 // ── 17. every session verb lands on a real gateway RPC ─────────────────────
@@ -1322,7 +1322,7 @@ const lastRequest = () => h.requests[h.requests.length - 1]
 // The verbs only need the gateway to answer; the assertions are on the CALL.
 h.responses['session.archive'] = () => ({ archived: true })
 h.responses['session.title'] = () => ({ title: 'ok' })
-h.responses['session.workspace.move'] = () => ({ cwd: '/home/smoothmarx/Projects/mmapp' })
+h.responses['session.workspace.move'] = () => ({ cwd: '/home/hermes/Projects/demo' })
 
 await __internals.archiveSession('sess-zulu-9', 'zulu')
 
@@ -1367,12 +1367,12 @@ check(
   JSON.stringify(lastRequest())
 )
 
-await __internals.moveSessionToProject('sess-zulu-9', '/home/smoothmarx/Projects/mmapp', 'zulu')
+await __internals.moveSessionToProject('sess-zulu-9', '/home/hermes/Projects/demo', 'zulu')
 
 check(
   'Assign to project calls session.workspace.move with the folder as cwd',
   lastRequest().method === 'session.workspace.move' &&
-    lastRequest().params.cwd === '/home/smoothmarx/Projects/mmapp' &&
+    lastRequest().params.cwd === '/home/hermes/Projects/demo' &&
     lastRequest().params.session_key === 'sess-zulu-9' &&
     lastRequest().params.profile === 'zulu',
   JSON.stringify(lastRequest())
@@ -1814,6 +1814,509 @@ check(
   'a build with no Screen surface shows no hero at all',
   !markup.includes('Screen stopped') && !markup.includes('>Live<') && !markup.includes('Screen')
 )
+
+/* ── 22. THE SCREEN PANE DRIVES THE SCREEN ──────────────────────────────────
+ * Pedro, 2026-10-15: the Screen tab was a JPEG and the sentence "go to Bot
+ * Mode". These checks pin the replacement: the verbs, the handshake, the frame
+ * decoder, the input gate and the lease — the things that have to be right
+ * before a live view is worth a single click. */
+
+const bytes = (...parts) => {
+  const total = parts.reduce((sum, part) => sum + part.length, 0)
+  const out = new Uint8Array(total)
+  let at = 0
+
+  parts.forEach(part => {
+    out.set(part, at)
+    at += part.length
+  })
+
+  return out
+}
+const u16 = value => {
+  const out = new Uint8Array(2)
+
+  new DataView(out.buffer).setUint16(0, value)
+
+  return out
+}
+const u32 = value => {
+  const out = new Uint8Array(4)
+
+  new DataView(out.buffer).setUint32(0, value)
+
+  return out
+}
+const i32 = value => {
+  const out = new Uint8Array(4)
+
+  new DataView(out.buffer).setInt32(0, value)
+
+  return out
+}
+/** The pixel format the pane ASKS for, as a ServerInit block — so the fixture
+ *  and the viewer cannot drift apart without a check failing. */
+const rfbFormatBlock = () => __internals.rfbFormatBytes(__internals.rfbRequestedFormat())
+const rfbInit = (width, height, name = '') => {
+  const label = new TextEncoder().encode(name)
+  const out = bytes(u16(width), u16(height), rfbFormatBlock(), u32(label.length), label)
+
+  return out
+}
+/** 32bpp little-endian pixels are B, G, R, X on the wire — the shift order the
+ *  pane negotiates (blue 0 / green 8 / red 16). */
+const rfbPixel = (red, green, blue) => new Uint8Array([blue, green, red, 0])
+const rfbRawUpdate = rects =>
+  bytes(
+    new Uint8Array([0, 0]),
+    u16(rects.length),
+    ...rects.flatMap(rect => [u16(rect.x), u16(rect.y), u16(rect.width), u16(rect.height), i32(0), rect.pixels])
+  )
+const rfbCopyUpdate = (destX, destY, sourceX, sourceY, width, height) =>
+  bytes(new Uint8Array([0, 0]), u16(1), u16(destX), u16(destY), u16(width), u16(height), i32(1), u16(sourceX), u16(sourceY))
+const rfbHandshake = (minor = 8) => bytes(new TextEncoder().encode(`RFB 003.00${minor}\n`), new Uint8Array([1, 1]), u32(0), rfbInit(2, 2, 'xvnc'))
+
+const makeStream = () => {
+  const box = { frames: [], notes: [], pixels: null, sent: [], size: null }
+
+  box.stream = __internals.createRfbStream({
+    onFramebuffer: frame => box.frames.push(frame),
+    onNote: note => box.notes.push(note),
+    onSize: size => {
+      box.size = size
+      box.pixels = new Uint8ClampedArray(size.width * size.height * 4)
+
+      return box.pixels
+    },
+    send: part => box.sent.push(part)
+  })
+
+  return box
+}
+const readyStream = () => {
+  const box = makeStream()
+
+  box.stream.feed(rfbHandshake())
+
+  return box
+}
+
+// ── the handshake: fixed-size, because Xvnc runs -SecurityTypes None ────────
+
+const shaken = makeStream()
+
+shaken.stream.feed(rfbHandshake())
+check('the viewer answers the server version', new TextDecoder().decode(shaken.sent[0]) === 'RFB 003.008\n')
+check('…then picks None from the security list', shaken.sent[1].length === 1 && shaken.sent[1][0] === 1)
+check(
+  '…then sends ClientInit, the third handshake byte the bridge counts on',
+  shaken.sent[2].length === 1 && shaken.sent[2][0] === 1,
+  `sent so far: ${shaken.sent.map(part => part.length).join(',')}`
+)
+check(
+  '…asks for a 32bpp little-endian truecolour format it can decode',
+  shaken.sent[3].length === 20 && shaken.sent[3][4] === 32 && shaken.sent[3][6] === 0 && shaken.sent[3][7] === 1
+)
+check(
+  '…advertises Raw and CopyRect ONLY',
+  shaken.sent[4].length === 12 &&
+    new DataView(shaken.sent[4].buffer).getUint16(2) === 2 &&
+    new DataView(shaken.sent[4].buffer).getInt32(4) === 0 &&
+    new DataView(shaken.sent[4].buffer).getInt32(8) === 1
+)
+check('…and asks for one full frame', shaken.sent[5].length === 10 && shaken.sent[5][0] === 3 && shaken.sent[5][1] === 0)
+check('ServerInit sizes the framebuffer', shaken.size.width === 2 && shaken.size.height === 2 && shaken.pixels.length === 16)
+check('the server name is consumed with it, not left to desync the stream', shaken.stream.state === 'ready')
+
+// A 3.3 server: no security list, and 13 handshake bytes against the 14 the
+// gateway's bridge counts. It cannot be spliced — say so rather than hang.
+const old = makeStream()
+
+old.stream.feed(bytes(new TextEncoder().encode('RFB 003.003\n'), u32(1), rfbInit(1, 1)))
+check(
+  'a 3.3 screen is refused with the reason, not left hanging',
+  old.stream.state === 'dead' && /3\.3/.test(old.notes.join(' ')) && old.sent.length === 0
+)
+
+// A screen that wants a password is a settled NO, said out loud.
+const secured = makeStream()
+
+secured.stream.feed(bytes(new TextEncoder().encode('RFB 003.008\n'), new Uint8Array([1, 2])))
+check(
+  'a password-protected screen is refused with a reason, not silence',
+  secured.stream.state === 'dead' && /authentication/.test(secured.notes.join(' '))
+)
+
+const garbage = makeStream()
+
+garbage.stream.feed(new TextEncoder().encode('HTTP/1.1 404 Not Found\n'))
+check('a non-RFB greeting is named as such', garbage.stream.state === 'dead' && /not RFB/.test(garbage.notes.join(' ')))
+
+// ── frames: decoded, painted, and paced one request at a time ──────────────
+
+const framed = readyStream()
+
+framed.stream.feed(
+  rfbRawUpdate([{ height: 2, pixels: bytes(rfbPixel(255, 0, 0), rfbPixel(0, 255, 0), rfbPixel(0, 0, 255), rfbPixel(255, 255, 255)), width: 2, x: 0, y: 0 }])
+)
+check(
+  'a raw rectangle lands as RGBA in the canvas buffer',
+  framed.pixels[0] === 255 && framed.pixels[1] === 0 && framed.pixels[2] === 0 && framed.pixels[3] === 255 &&
+    framed.pixels[4] === 0 && framed.pixels[5] === 255 &&
+    framed.pixels[8] === 0 && framed.pixels[10] === 255 &&
+    framed.pixels[12] === 255 && framed.pixels[13] === 255 && framed.pixels[14] === 255
+)
+check('the frame is announced to the pane', framed.frames.length === 1 && framed.frames[0].rects.length === 1)
+check('NOTHING is requested while a frame is unpainted', framed.sent.length === 6, `sent=${framed.sent.length}`)
+
+framed.stream.ack()
+check(
+  '…and the next request exists only after the paint, and is incremental',
+  framed.sent.length === 7 && framed.sent[6][1] === 1,
+  `sent=${framed.sent.length}`
+)
+
+// The same bytes arriving one at a time — a WebSocket does not respect message
+// boundaries, so a viewer that only parses whole chunks renders nothing.
+const trickled = readyStream()
+const trickleBytes = rfbRawUpdate([{ height: 1, pixels: bytes(rfbPixel(9, 8, 7), rfbPixel(6, 5, 4)), width: 2, x: 0, y: 0 }])
+
+for (let index = 0; index < trickleBytes.length; index += 1) {
+  trickled.stream.feed(trickleBytes.slice(index, index + 1))
+}
+
+check('a frame split across many chunks still lands', trickled.frames.length === 1 && trickled.pixels[0] === 9 && trickled.pixels[4] === 6)
+
+// CopyRect: the one encoding that is a memcpy in our own canvas — and the one
+// that smears if the overlap is copied top-down.
+const scrolled = readyStream()
+
+scrolled.stream.feed(
+  rfbRawUpdate([{ height: 2, pixels: bytes(rfbPixel(1, 1, 1), rfbPixel(2, 2, 2), rfbPixel(3, 3, 3), rfbPixel(4, 4, 4)), width: 2, x: 0, y: 0 }])
+)
+scrolled.stream.ack()
+scrolled.stream.feed(rfbCopyUpdate(0, 0, 0, 1, 2, 1))
+check(
+  'a CopyRect moves pixels instead of re-sending them',
+  scrolled.pixels[0] === 3 && scrolled.pixels[4] === 4 && scrolled.pixels[8] === 3,
+  `${scrolled.pixels.slice(0, 12).join(',')}`
+)
+
+// Everything we do not decode still has to be consumed, or the next real
+// rectangle is read out of the middle of a clipboard payload.
+const mixed = readyStream()
+
+mixed.stream.feed(new Uint8Array([2])) // Bell
+mixed.stream.feed(bytes(new Uint8Array([1, 0]), u16(0), u16(2), new Uint8Array(12))) // SetColourMapEntries
+mixed.stream.feed(bytes(new Uint8Array([3, 0, 0, 0]), u32(4), new TextEncoder().encode('text'))) // ServerCutText
+mixed.stream.feed(rfbRawUpdate([{ height: 1, pixels: bytes(rfbPixel(7, 7, 7), rfbPixel(7, 7, 7)), width: 2, x: 0, y: 0 }]))
+check('Bell, colour map and clipboard are skipped without losing alignment', mixed.frames.length === 1 && mixed.pixels[0] === 7)
+
+const stranger = readyStream()
+
+stranger.stream.feed(bytes(new Uint8Array([9, 0, 0, 0])))
+check(
+  'a message this viewer does not speak stops the view and says so',
+  stranger.stream.state === 'dead' && /message type 9/.test(stranger.notes.join(' '))
+)
+
+// ── the decoder itself, outside the stream ─────────────────────────────────
+
+const wide = new Uint8ClampedArray(8)
+
+__internals.decodeRawRect(bytes(rfbPixel(255, 128, 0), rfbPixel(0, 0, 255)), 0, __internals.rfbRequestedFormat(), wide, 0, 2, 1, 8)
+check('the 32bpp decoder scales nothing it should not', wide[0] === 255 && wide[1] === 128 && wide[2] === 0 && wide[3] === 255 && wide[4] === 0 && wide[5] === 0 && wide[6] === 255 && wide[7] === 255)
+
+// 16bpp 5-6-5, the format a legacy Xvnc hands out if it ignores our request.
+const short = new Uint8ClampedArray(4)
+const fiveSixFive = { bigEndian: false, blueMax: 31, blueShift: 0, bpp: 16, depth: 16, greenMax: 63, greenShift: 5, redMax: 31, redShift: 11, trueColour: true }
+const packed = 0xf800 // pure red in 5-6-5
+
+__internals.decodeRawRect(new Uint8Array([packed & 0xff, packed >> 8]), 0, fiveSixFive, short, 0, 1, 1, 4)
+check('a 16bpp 5-6-5 pixel is scaled to full range', short[0] === 255 && short[1] === 0 && short[2] === 0 && short[3] === 255)
+
+// An overlapping CopyRect, which is exactly what scrolling produces.
+const overlap = new Uint8ClampedArray(16)
+
+overlap.set([1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255])
+__internals.copyRectRegion(overlap, 16, { destX: 2, destY: 0, height: 1, sourceX: 0, sourceY: 0, width: 2 })
+check('an overlapping CopyRect does not smear its own source rows', overlap[0] === 1 && overlap[8] === 1 && overlap[12] === 2)
+
+// ── input: keysyms, masks, and who is allowed to send them ─────────────────
+
+check(
+  'printable keys ride their own code point, named keys their keysym',
+  __internals.keysymFor('a', 'KeyA') === 97 &&
+    __internals.keysymFor('A', 'KeyA') === 65 &&
+    __internals.keysymFor('Enter', 'Enter') === 0xff0d &&
+    __internals.keysymFor('ArrowLeft', 'ArrowLeft') === 0xff51 &&
+    __internals.keysymFor('F5', 'F5') === 0xffc2 &&
+    __internals.keysymFor('3', 'Numpad3') === 0xffb3
+)
+check('a key this viewer cannot name sends NOTHING rather than a wrong key', __internals.keysymFor('Unidentified', 'Unidentified') === 0)
+check(
+  'a press carries its modifiers first, a release drops them last',
+  JSON.stringify(__internals.keysymsForEvent({ code: 'KeyC', ctrlKey: true, key: 'c' }, true)) === '[65507,99]' &&
+    JSON.stringify(__internals.keysymsForEvent({ code: 'KeyC', ctrlKey: true, key: 'c' }, false)) === '[99,65507]'
+)
+check(
+  'DOM button bits become RFB mask bits',
+  __internals.pointerMaskFor(1) === 1 && __internals.pointerMaskFor(2) === 4 && __internals.pointerMaskFor(4) === 2 && __internals.pointerMaskFor(3) === 5
+)
+check('a wheel tick is a transient RFB mask', __internals.wheelMaskFor(-1) === 8 && __internals.wheelMaskFor(1) === 16 && __internals.wheelMaskFor(0) === 0)
+check(
+  'KeyEvent and PointerEvent are exactly the sizes the bridge parses',
+  __internals.rfbKeyMessage(true, 0xff0d).length === 8 &&
+    __internals.rfbPointerMessage(5, 3, 7).length === 6 &&
+    __internals.rfbUpdateRequest({ height: 900, width: 1440, x: 0, y: 0 }, true).length === 10
+)
+
+// ── the lease: who is driving ──────────────────────────────────────────────
+
+const ourHash = await __internals.viewerHashOf('VIEWER-1')
+
+check('the viewer hash is 12 hex digits, derived from the id', /^[0-9a-f]{12}$/.test(ourHash) && ourHash === (await __internals.viewerHashOf('VIEWER-1')))
+check(
+  'the lease is ours only when its hash is ours',
+  __internals.leaseHeldBy({ holder: 'human', viewer_hash: ourHash }, ourHash) === true &&
+    __internals.leaseHeldBy({ holder: 'human', viewer_hash: 'someoneelse' }, ourHash) === false &&
+    __internals.leaseHeldBy({ holder: 'agent' }, ourHash) === false &&
+    __internals.leaseHeldBy(null, ourHash) === false
+)
+check(
+  'a closed view is classified by the code the bridge sends',
+  __internals.screenCloseVerdict(4000, 'control-taken').mode === 'watch' &&
+    __internals.screenCloseVerdict(4000).reobserve === true &&
+    __internals.screenCloseVerdict(4001).mode === 'stopped' &&
+    __internals.screenCloseVerdict(4401).reobserve === true &&
+    __internals.screenCloseVerdict(4403).mode === 'error' &&
+    __internals.screenCloseVerdict(1000).mode === 'idle' &&
+    /9999/.test(__internals.screenCloseVerdict(9999).note)
+)
+
+// ── the verbs, from one status snapshot ────────────────────────────────────
+
+const stopped = __internals.screenVerbState({ installed: true, lease: { holder: 'agent' }, running: false, supported: true })
+const uninstalled = __internals.screenVerbState({ installed: false, lease: { holder: 'agent' }, running: false, supported: true })
+const driving = __internals.screenVerbState({ installed: true, lease: { holder: 'agent' }, running: true, supported: true })
+const someone = __internals.screenVerbState({ installed: true, lease: { holder: 'human', viewer_hash: 'other' }, running: true, supported: true })
+
+check('a stopped screen offers Start, not Stop', stopped.canStart && !stopped.canStop && !stopped.canInstall)
+check('a screen with no packages offers Install, not Start', uninstalled.canInstall && !uninstalled.canStart)
+check('a running screen offers Stop', driving.canStop && driving.running && driving.tone === 'live')
+check("someone else's hands are a tone of their own", someone.tone === 'other' && someone.canStop)
+check(
+  'an unsupported host offers nothing at all',
+  !__internals.screenVerbState({ installed: false, running: false, supported: false }).canInstall &&
+    __internals.screenVerbState(null, true).tone === 'unavailable'
+)
+check(
+  'a host that cannot afford the screen carries its reason',
+  __internals.screenVerbState({ blocker: 'not enough memory', installed: true, running: false, supported: true }).blocker === 'not enough memory'
+)
+check(
+  'stopping somebody else is a question; stopping your own is not',
+  __internals.screenStopNeedsConfirm({ lease: { holder: 'human', viewer_hash: 'other' } }, ourHash) === true &&
+    __internals.screenStopNeedsConfirm({ lease: { holder: 'human', viewer_hash: ourHash } }, ourHash) === false &&
+    __internals.screenStopNeedsConfirm({ lease: { holder: 'agent' } }, ourHash) === false
+)
+
+// ── the pane itself ────────────────────────────────────────────────────────
+
+const screenStatus = (data, error = null) => {
+  h.queryResults['personae|screen|zulu'] = { data, error, isError: Boolean(error), isFetching: false, isPending: false }
+}
+const screenMarkup = () => renderToStaticMarkup(jsx(__internals.ScreenView, { profile: 'zulu' }))
+
+screenStatus({ blocker: 'not enough free memory to start a screen', installed: true, lease: { holder: 'agent' }, profile_key: 'zulu', running: false, supported: true })
+let screenHtml = screenMarkup()
+
+check(
+  'the pane offers Start for a stopped screen, and a Take over it cannot honour is DISABLED',
+  screenHtml.includes('>Start<') && /disabled=""[^>]*>Take over</.test(screenHtml),
+  screenHtml.slice(0, 400)
+)
+check('…and explains a host that cannot start one instead of offering a dead button', screenHtml.includes('not enough free memory'))
+check('…and says the view is empty because the screen is not running', screenHtml.includes('The screen is not running'))
+check('the empty stage still carries the canvas the stream paints into', screenHtml.includes('data-personae-screen'))
+
+screenStatus({ installed: false, lease: { holder: 'agent' }, profile_key: 'zulu', running: false, supported: true })
+screenHtml = screenMarkup()
+check('a profile with no packages at all is offered the install', screenHtml.includes('>Install<') && !screenHtml.includes('>Start<'))
+
+screenStatus({ geometry: '1440x900', installed: true, lease: { holder: 'agent' }, profile_key: 'zulu', running: true, supported: true })
+screenHtml = screenMarkup()
+check('a running screen offers Stop AND Take over', screenHtml.includes('>Stop<') && screenHtml.includes('>Take over<'))
+check('…and reports the geometry it is drawing', screenHtml.includes('1440x900'))
+
+screenStatus(undefined, { code: -32601, message: 'method not found' })
+screenHtml = screenMarkup()
+check(
+  'a Hermes with no display.* says so instead of hanging in "connecting"',
+  !screenHtml.includes('>Start<') && !screenHtml.includes('>Install<') && screenHtml.includes('data-personae-screen')
+)
+
+// The install log: module state, so a tab that closed mid-install still shows
+// what the host actually did.
+__internals.resetScreenInstall()
+screenStatus({ installed: false, lease: { holder: 'agent' }, profile_key: 'zulu', running: false, supported: true })
+check('no install has happened, so there is no log on screen', !screenMarkup().includes(h.i18n.screenInstallLog))
+
+__internals.noteScreenInstallLog({ line: 'Reading package lists…' })
+screenHtml = screenMarkup()
+check('an install line reaches the pane while it streams', screenHtml.includes(h.i18n.screenInstallLog) && screenHtml.includes('Reading package lists…'))
+
+__internals.noteScreenInstallDone({ code: 0 })
+check('the finish line is translated, not raw English', screenMarkup().includes(h.i18n.screenInstallDone))
+
+__internals.noteScreenInstallDone({ code: 1 })
+check('a failed install says failed', screenMarkup().includes(h.i18n.screenInstallFailed))
+
+check(
+  'the log is bounded — a chatty package manager cannot grow the pane forever',
+  (() => {
+    __internals.resetScreenInstall()
+
+    for (let index = 0; index < 120; index += 1) {
+      __internals.noteScreenInstallLog({ line: `line ${index}` })
+    }
+
+    const state = __internals.$screenInstall.get()
+
+    return state.lines.length === 80 && state.lines[79].text === 'line 119'
+  })()
+)
+__internals.resetScreenInstall()
+
+// The tab the hero opens: it renders the pane, and a second click focuses the
+// tab that already exists instead of stacking another one.
+const openedBefore = h.workspaces.length
+
+__internals.openScreenPane('zulu', 'Screen')
+check('the hero opens a Screen tab for that profile', h.workspaces.length === openedBefore + 1 && h.workspaces.at(-1).id === 'personae:screen:zulu')
+check('…and the tab really contains the pane', renderToStaticMarkup(h.workspaces.at(-1).options.render()).includes('data-personae-screen'))
+check('…titled with the profile', h.workspaces.at(-1).options.title.includes('zulu'))
+
+const revealedBefore = h.revealed.length
+
+__internals.openScreenPane('zulu', 'Screen')
+check('a second open reveals the existing tab rather than stacking one', h.workspaces.length === openedBefore + 1 && h.revealed.length === revealedBefore + 1)
+
+// ── the session: ticket, socket, lease, keys ───────────────────────────────
+
+const sockets = []
+
+class FakeSocket {
+  constructor(url) {
+    this.closed = null
+    this.sent = []
+    this.url = url
+    sockets.push(this)
+  }
+
+  send(part) {
+    this.sent.push(part)
+  }
+
+  close(code, reason) {
+    this.closed = { code, reason }
+    this.onclose?.({ code, reason })
+  }
+}
+
+const realWebSocket = globalThis.WebSocket
+
+globalThis.WebSocket = FakeSocket
+
+let tickets = 0
+
+h.responses['display.observe'] = () => ({ path: '/api/display/ws', ticket: `TICKET-${++tickets}`, viewer_id: 'VIEWER-1' })
+h.responses['display.lease.acquire'] = () => ({ lease: { epoch: 1, holder: 'human', since: 0, viewer_hash: ourHash } })
+h.responses['display.lease.release'] = () => ({ lease: { epoch: 2, holder: 'agent', since: 0, viewer_hash: null } })
+
+const session = __internals.createScreenSession()
+const patched = {}
+const api = { canvas: () => null, patch: changes => Object.assign(patched, changes), profile: 'zulu' }
+
+await __internals.attachScreen(session, api)
+
+check('attaching mints a viewer identity and keeps it', session.viewerId === 'VIEWER-1' && session.hash === ourHash)
+check('…dials the display bridge, not the chat socket', sockets.length === 1 && sockets[0].url.startsWith('ws://harness.local/api/display/ws'))
+check(
+  '…with the ONE-SHOT display ticket the bridge authenticates on, and no gateway credential at all',
+  /[?&]display_ticket=TICKET-1$/.test(sockets[0].url) && !/[?&]ticket=/.test(sockets[0].url),
+  sockets[0].url
+)
+check(
+  '…and the sibling resolver was asked to strip the gateway credential',
+  h.siblingUrls.at(-1).path === '/api/display/ws' && h.siblingUrls.at(-1).options.stripGatewayCredential === true && h.siblingUrls.at(-1).route.profile === 'zulu'
+)
+check('watching is a state the pane knows', patched.mode === 'watching' && patched.watching === true)
+check('attaching twice does not open a second view', (await __internals.attachScreen(session, api)) === session && sockets.length === 1)
+
+check('taking over acquires the lease for THIS viewer', (await __internals.screenLease(session, api, 'take')) === true)
+check(
+  '…and the RPC names the profile and the viewer id',
+  h.requests.at(-1).method === 'display.lease.acquire' && h.requests.at(-1).params.profile === 'zulu' && h.requests.at(-1).params.viewer_id === 'VIEWER-1'
+)
+check('handing back releases the same viewer', (await __internals.screenLease(session, api, 'release')) === false && h.requests.at(-1).method === 'display.lease.release')
+
+const before = sockets[0].sent.length
+
+__internals.forwardKey(session, { code: 'KeyA', key: 'a', preventDefault() {} }, true)
+check('a keystroke reaches the screen as a KeyEvent', sockets[0].sent.length === before + 1 && sockets[0].sent.at(-1).length === 8 && sockets[0].sent.at(-1)[1] === 1)
+check('…and is remembered as held', session.held.size === 1)
+check('losing the lease or the focus releases the keys it held', __internals.releaseHeldKeys(session) === 1 && sockets[0].sent.at(-1)[1] === 0 && session.held.size === 0)
+
+__internals.detachScreen(session, api.patch)
+check('detaching closes the socket it owns', session.socket === null && sockets[0].closed.code === 1000)
+
+// A view whose ticket expired mints a NEW one: reconnecting with a spent ticket
+// is a guaranteed 4401 loop, which is the bug this retry exists to avoid.
+patched.mode = 'watching'
+const retrySession = __internals.createScreenSession()
+const retryNotes = []
+const retryApi = {
+  canvas: () => null,
+  patch: changes => {
+    Object.assign(patched, changes)
+
+    if (changes.note) {
+      retryNotes.push(changes.note)
+    }
+  },
+  profile: 'zulu'
+}
+const socketsBefore = sockets.length
+
+await __internals.attachScreen(retrySession, retryApi)
+retrySession.socket.onclose({ code: 4401, reason: 'display ticket missing, expired or used' })
+check('an expired ticket is named as the cause before anything is retried', retryNotes.includes('the view ticket expired'), JSON.stringify(retryNotes))
+await new Promise(resolve => setTimeout(resolve, 700))
+check('…and asks for a FRESH one instead of giving up', sockets.length === socketsBefore + 2 && sockets.at(-1).url.includes('display_ticket=TICKET-3'))
+check('…and the retry lands back in watch mode', patched.mode === 'watching')
+__internals.detachScreen(retrySession, retryApi.patch)
+
+// A stop the pane caused must not be reported as a verdict about the view.
+const quietSession = __internals.createScreenSession()
+
+await __internals.attachScreen(quietSession, api)
+Object.assign(patched, { mode: 'watching', note: '' })
+__internals.detachScreen(quietSession, api.patch)
+check('closing the pane yourself never paints a failure over it', patched.mode === 'idle' && patched.note === '')
+
+globalThis.WebSocket = realWebSocket
+
+// Leave the screen query in a state the NEXT section can render: the fake
+// socket and the display responses above are this section's, not theirs.
+globalThis.WebSocket = realWebSocket
+h.queryResults['personae|screen|zulu'] = {
+  data: { installed: true, lease: { holder: 'agent' }, profile_key: 'zulu', running: false, supported: true },
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
 
 // The pure contracts behind the cards.
 check('schedules are named the way Bot Mode names them', __internals.scheduleLabel('every 1440m') === 'daily' && __internals.scheduleLabel('every 120m') === 'every 2 hours' && __internals.scheduleLabel('every 30m') === 'every 30m' && __internals.scheduleLabel('once in 2h') === '2h' && __internals.scheduleLabel('0 6 * * *') === '0 6 * * *')

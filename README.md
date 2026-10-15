@@ -27,6 +27,7 @@
 | 🌱 **Apropos** *(beta)* | A fresh session that already knows the background of the ones you picked |
 | 🗑️ **Honest deletes** | Deleting a group never deletes sessions; a chain goes only when you say so |
 | 🧩 **Bots-compatible** | Name, avatar and colour are the Bots tab's own store — change one, both change |
+| 🖥️ **Screen** | Your profile's own desktop, live in the pane: Start, Stop, Install, and **Take over** to drive it |
 
 ---
 
@@ -373,6 +374,16 @@ Three rules worth keeping if you fork this:
 - **Test the markup, not your intentions.** The harness asserts on rendered output —
   labels included — so a rename shows up as a failing check rather than as a surprise in
   the UI.
+- **A wire client needs a real server, not just fixtures.** The Screen viewer speaks RFB,
+  and the handshake is **12 + 1 + 1 bytes** — version, security choice, `ClientInit` —
+  because Xvnc runs `-SecurityTypes None`. Skipping that last byte looked perfect against
+  fixtures: the parser advanced, every check was green, and the only symptom was a socket
+  that closed. `tests/smoke.mjs` drives the viewer against a real Xvnc over its Unix socket
+  before this ships, and prints the bytes it sent. The same byte stream has to satisfy
+  `tools/bot_desktop/rfb_filter.py` on the gateway side, which frames client messages by
+  their exact lengths (`SetPixelFormat` 20, `FramebufferUpdateRequest` 10, `KeyEvent` 8,
+  `PointerEvent` 6) and counts the 14 handshake bytes itself: one wrong length desyncs the
+  bridge's parser, not just the pixels.
 
 ---
 
