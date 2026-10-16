@@ -6,18 +6,20 @@
  *
  * Needs a running screen for the profile whose socket you point at (the pane's own
  * Start, or `python -c "from tools.bot_desktop import runtime; runtime.start()"`), and a
- * copy of plugin.js beside it: `./tests/run.sh` builds tests/work, then
+ * copy of plugin.js built beside it: `./tests/run.sh` writes tests/work/plugin.js, then
  *
- *   cd tests/work && RFB_CAPTURE=../client-stream.bin node ../../tests/smoke.mjs
+ *   cd tests && RFB_CAPTURE=../client-stream.bin node smoke.mjs
  *
- * RFB_CAPTURE additionally writes the client→server byte stream, so the gateway's own
+ * PLUGIN_PATH overrides which plugin.js to import. RFB_CAPTURE waits out the handshake
+ * and writes the client→server byte stream, so the gateway's own
  * `tools/bot_desktop/rfb_filter.py` can be fed it (holder: byte-identical pass-through;
  * watcher: exactly the input messages dropped).
  */
 
 import net from 'node:net'
 
-import { __internals } from './plugin.js'
+const ENTRY = process.env.PLUGIN_PATH || new URL('./work/plugin.js', import.meta.url).href
+const { __internals } = await import(ENTRY)
 
 const SOCKET = process.env.RFB_SOCKET || `${process.env.HOME}/.hermes/bot-desktop/rfb.sock`
 const results = []
