@@ -2211,6 +2211,61 @@ const revealedBefore = h.revealed.length
 __internals.openScreenPane('zulu', 'Screen')
 check('a second open reveals the existing tab rather than stacking one', h.workspaces.length === openedBefore + 1 && h.revealed.length === revealedBefore + 1)
 
+// ── leaving the tab: a surface that takes the chat area needs a way out ────
+// Pedro, 2026-10-16: "I didn't really have a way to come back to this chat
+// without clicking on the session list."
+
+check(
+  'the DURABLE id wins for "back" — a runtime id would resolve to nothing',
+  JSON.stringify(__internals.screenBackTarget({ activeSessionId: 'runtime-1', focusedSessionProfile: 'zulu', focusedStoredSessionId: 'stored-1' }, 'default')) === '{"id":"stored-1","profile":"zulu"}' &&
+    JSON.stringify(__internals.screenBackTarget({ activeSessionId: 'runtime-1' }, 'default')) === '{"id":"runtime-1","profile":"default"}' &&
+    __internals.screenBackTarget({}, 'default') === null &&
+    __internals.screenBackTarget(null, 'default') === null
+)
+
+h.opens.length = 0
+check(
+  'back navigates to that exact session, on that session OWNER profile',
+  __internals.screenBackToSession({ id: 'stored-1', profile: 'zulu' }) === true &&
+    JSON.stringify(h.opens.at(-1)) === '{"id":"stored-1","options":{"profile":"zulu"}}',
+  JSON.stringify(h.opens)
+)
+check('with nothing to go back to, nothing navigates', __internals.screenBackToSession(null) === false && h.opens.length === 1)
+
+host.state.focusedStoredSessionId.set('stored-chat-1')
+host.state.focusedSessionProfile.set('yankee')
+__internals.openScreenPane('yankee', 'Screen')
+
+const leaveHtml = renderToStaticMarkup(h.workspaces.at(-1).options.render())
+
+check(
+  'the pane carries its own way back to the session it displaced',
+  leaveHtml.includes(`>${h.i18n.screenBack}</span>`) && leaveHtml.includes('data-codicon="arrow-left"'),
+  leaveHtml.slice(0, 300)
+)
+check(
+  '…and its own way out, through the tab teardown the strip ✕ runs',
+  leaveHtml.includes(`>${h.i18n.close}</span>`) && leaveHtml.includes('data-codicon="close"')
+)
+check(
+  'closing from the pane runs that teardown exactly once',
+  __internals.closeScreenPane('yankee') === true && __internals.closeScreenPane('yankee') === false
+)
+
+// Nothing focused when the hero was clicked (a fresh draft): no dangling
+// "back" pointing at nothing, but the way OUT is always there.
+host.state.focusedStoredSessionId.set(null)
+host.state.activeSessionId.set(null)
+__internals.openScreenPane('xray', 'Screen')
+
+const bareHtml = renderToStaticMarkup(h.workspaces.at(-1).options.render())
+
+check(
+  'a fresh draft leaves nothing to go back to, and the way out stays',
+  !bareHtml.includes(h.i18n.screenBack) && bareHtml.includes(`>${h.i18n.close}</span>`)
+)
+__internals.closeScreenPane('xray')
+
 // ── the session: ticket, socket, lease, keys ───────────────────────────────
 
 const sockets = []

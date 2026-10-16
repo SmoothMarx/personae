@@ -73,6 +73,10 @@ export const host = {
   state: {
     activeSessionId: atom(null),
     cwd: atom('/tmp'),
+    /** The durable id + owner of the focused chat, which is what a "back to
+     *  where I was" control navigates with (activeSessionId is a runtime id). */
+    focusedSessionProfile: atom('default'),
+    focusedStoredSessionId: atom(null),
     gateway: atom('127.0.0.1:9119'),
     model: atom('deepseek-flash'),
     profile: atom('default'),
@@ -131,13 +135,24 @@ export const host = {
     }
   },
   /** The Screen pane's own tab. `render` is kept unrendered: the test calls it
-   *  to prove the pane opens SOMETHING, and asserts on the returned markup. */
+   *  to prove the pane opens SOMETHING, and asserts on the returned markup.
+   *  The returned disposer mirrors core's: it tears down ONCE and fires
+   *  `onClose`, which is what the strip's ✕ and ⌘W run — a stub that skipped
+   *  the callback would hide a pane that never lets go of its tab. */
   openWorkspace(id, options = {}) {
     const h = harness()
+    const entry = { closed: false, id, options }
 
-    h.workspaces = [...h.workspaces, { id, options }]
+    h.workspaces = [...h.workspaces, entry]
 
-    return () => undefined
+    return () => {
+      if (entry.closed) {
+        return
+      }
+
+      entry.closed = true
+      options.onClose?.()
+    }
   },
   revealPane(id) {
     const h = harness()

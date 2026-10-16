@@ -27,7 +27,7 @@
 | 🌱 **Apropos** *(beta)* | A fresh session that already knows the background of the ones you picked |
 | 🗑️ **Honest deletes** | Deleting a group never deletes sessions; a chain goes only when you say so |
 | 🧩 **Bots-compatible** | Name, avatar and colour are the Bots tab's own store — change one, both change |
-| 🖥️ **Screen** | Your profile's own desktop, live in the pane: Start, Stop, Install, and **Take over** to drive it |
+| 🖥️ **Screen** | Your profile's own desktop, live in the pane: Start, Stop, Install, and **Take over** to drive it — with a way back to the session it displaced |
 
 ---
 

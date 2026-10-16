@@ -8245,6 +8245,47 @@ function timestampStale(frame) {
  *  "make Personae able to START/STOP/TAKE OVER the screen itself"). */
 const screenTabs = new Map()
 
+/** Where "back" goes, from the app's own focus atoms. The DURABLE id is the one
+ *  `openSession` takes — `activeSessionId` is a runtime id, and a runtime id
+ *  handed back to a reopen resolves to nothing. Pure, so the harness pins the
+ *  precedence instead of leaving it to reading order. */
+function screenBackTarget(state, fallbackProfile) {
+  const id = String(state?.focusedStoredSessionId || state?.activeSessionId || '').trim()
+
+  if (!id) {
+    return null
+  }
+
+  return { id, profile: String(state?.focusedSessionProfile || fallbackProfile || '') }
+}
+
+/** Front the session the user was reading when they opened this tab. A tab that
+ *  takes the chat area must not be a one-way door (Pedro, 2026-10-16: "I didn't
+ *  really have a way to come back to this chat"). */
+function screenBackToSession(target) {
+  if (!target?.id || typeof host.openSession !== 'function') {
+    return false
+  }
+
+  host.openSession(target.id, target.profile ? { profile: target.profile } : {})
+
+  return true
+}
+
+/** Close this profile's Screen tab from inside the pane — the same teardown the
+ *  tab strip's ✕ and ⌘W run (the disposer `openWorkspace` returned). */
+function closeScreenPane(profile) {
+  const entry = screenTabs.get(profile)
+
+  if (!entry) {
+    return false
+  }
+
+  entry.close()
+
+  return true
+}
+
 function openScreenPane(profile, label) {
   if (typeof host.openWorkspace !== 'function') {
     return
@@ -8256,14 +8297,26 @@ function openScreenPane(profile, label) {
     return
   }
 
+  // Captured at the CLICK, before the tab fronts: whatever was focused then is
+  // the surface the user is giving up, and it is the only honest answer to
+  // "back to where?".
+  const back = screenBackTarget(
+    {
+      activeSessionId: host.state?.activeSessionId?.get?.() || null,
+      focusedSessionProfile: host.state?.focusedSessionProfile?.get?.() || '',
+      focusedStoredSessionId: host.state?.focusedStoredSessionId?.get?.() || null
+    },
+    profile
+  )
+
   const close = host.openWorkspace(`${ID}:screen:${profile}`, {
     title: `${profile} · ${label}`,
     minWidth: '28rem',
     onClose: () => screenTabs.delete(profile),
-    render: () => jsx(ScreenView, { profile })
+    render: () => jsx(ScreenView, { back, onClose: () => closeScreenPane(profile), profile })
   })
 
-  screenTabs.set(profile, close)
+  screenTabs.set(profile, { back, close })
 }
 
 /* ── SCREEN: the pane ──────────────────────────────────────────────────────── */
@@ -8576,7 +8629,7 @@ function screenPointer(session, canvas, event) {
 
 /** The Screen tab, in full: what this profile's screen IS, the verbs that change
  *  it, and the live view you can drive. */
-function ScreenView({ profile }) {
+function ScreenView({ back, onClose, profile }) {
   const t = usePluginI18n(ID)
   const canvasRef = useRef(null)
   const sessionRef = useRef(null)
@@ -8714,18 +8767,27 @@ function ScreenView({ profile }) {
     refresh()
   })
 
-  const button = (key, label, onClick, options = {}) =>
-    jsx(
-      Button,
-      {
-        disabled: Boolean(busy) || Boolean(options.disabled),
-        onClick,
-        size: 'sm',
-        variant: options.variant || 'ghost',
-        children: busy === key ? t('screenWorking') : label
-      },
-      key
-    )
+  const button = (key, label, onClick, options = {}) => {
+    const content = busy === key ? t('screenWorking') : label
+    const props = {
+      disabled: Boolean(busy) || Boolean(options.disabled),
+      onClick,
+      size: 'sm',
+      variant: options.variant || 'ghost'
+    }
+
+    // An icon row is TWO static children, which is `jsxs` — `jsx` with an array
+    // makes React warn about static children on every render of the pane.
+    if (options.icon) {
+      return jsxs(
+        Button,
+        { ...props, children: [jsx(Codicon, { name: options.icon }, 'icon'), jsx('span', { children: content }, 'label')] },
+        key
+      )
+    }
+
+    return jsx(Button, { ...props, children: content }, key)
+  }
 
   const note =
     view.note === 'control-taken'
@@ -8740,13 +8802,18 @@ function ScreenView({ profile }) {
       jsxs('div', {
         className: 'flex min-w-0 flex-wrap items-center gap-2',
         children: [
+          // Leaving is a control in the pane, not only the strip's ✕: this tab
+          // takes the chat area, so it carries its own way out and its own way
+          // back to the session it displaced.
+          back ? button('back', t('screenBack'), () => screenBackToSession(back), { icon: 'arrow-left' }) : null,
           jsx('span', { className: 'text-sm font-semibold', children: profile }, 'name'),
-          jsxs('span', {
+          jsx('span', {
             className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-tertiary)',
             children: view.controlling ? t('screenDriving') : t(screenCaptionKey(verbs.tone)) + (verbs.running ? ` · ${status.data?.geometry || ''}` : '')
           }, 'caption'),
           button('take', t('screenTakeOver'), takeOver, { disabled: !verbs.running || view.controlling }),
-          view.controlling ? button('hand', t('screenHandBack'), handBack) : null
+          view.controlling ? button('hand', t('screenHandBack'), handBack) : null,
+          onClose ? button('close-screen', t('close'), onClose, { icon: 'close' }) : null
         ]
       }),
       jsxs('div', {
@@ -10570,6 +10637,7 @@ export default {
         routinesPaused: 'paused',
         routinesUpdateFailed: 'The job was not updated.',
         schedule: 'Schedule',
+        screenBack: 'Back to session',
         screenConnecting: 'Connecting…',
         screenHidden: 'Hidden — someone else is driving',
         screenLive: 'Live',
@@ -10930,6 +10998,9 @@ export const __internals = {
   resetScreenInstall,
   $screenInstall,
   openScreenPane,
+  closeScreenPane,
+  screenBackTarget,
+  screenBackToSession,
   ScreenView,
   ScreenHero,
   rfbRequestedFormat,
