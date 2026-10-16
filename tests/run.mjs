@@ -2115,10 +2115,19 @@ check(
   __internals.screenVerbState({ blocker: 'not enough memory', installed: true, running: false, supported: true }).blocker === 'not enough memory'
 )
 check(
-  'stopping somebody else is a question; stopping your own is not',
-  __internals.screenStopNeedsConfirm({ lease: { holder: 'human', viewer_hash: 'other' } }, ourHash) === true &&
-    __internals.screenStopNeedsConfirm({ lease: { holder: 'human', viewer_hash: ourHash } }, ourHash) === false &&
-    __internals.screenStopNeedsConfirm({ lease: { holder: 'agent' } }, ourHash) === false
+  'ANY human lease makes Stop a question — whose hands only change the wording',
+  __internals.screenStopQuestion({ lease: { holder: 'human', viewer_hash: 'other' } }, ourHash) === 'screenStopForce' &&
+    __internals.screenStopQuestion({ lease: { holder: 'human', viewer_hash: ourHash } }, ourHash) === 'screenStopForceSelf' &&
+    __internals.screenStopQuestion({ lease: { holder: 'agent' } }, ourHash) === '' &&
+    __internals.screenStopQuestion(null, ourHash) === '',
+  JSON.stringify([
+    __internals.screenStopQuestion({ lease: { holder: 'human', viewer_hash: ourHash } }, ourHash),
+    __internals.screenStopQuestion({ lease: { holder: 'agent' } }, ourHash)
+  ])
+)
+check(
+  'each verb sends exactly the keys the wire declares (4013/4000 on anything else)',
+  JSON.stringify(Object.keys(__internals.screenStopParams('zulu', true)).sort()) === '["force","profile"]'
 )
 
 // ── the pane itself ────────────────────────────────────────────────────────
@@ -2260,6 +2269,12 @@ check(
   h.requests.at(-1).method === 'display.lease.acquire' && h.requests.at(-1).params.profile === 'zulu' && h.requests.at(-1).params.viewer_id === 'VIEWER-1'
 )
 check('handing back releases the same viewer', (await __internals.screenLease(session, api, 'release')) === false && h.requests.at(-1).method === 'display.lease.release')
+check(
+  'acquire sends `reason`, release does NOT — the wire rejects an unknown key with 4000',
+  JSON.stringify(Object.keys(h.requests.filter(entry => entry.method === 'display.lease.acquire').at(-1).params).sort()) === '["profile","reason","viewer_id"]' &&
+    JSON.stringify(Object.keys(h.requests.filter(entry => entry.method === 'display.lease.release').at(-1).params).sort()) === '["profile","viewer_id"]',
+  JSON.stringify(h.requests.filter(entry => entry.method.startsWith('display.lease')).map(entry => [entry.method, Object.keys(entry.params)]))
+)
 
 const before = sockets[0].sent.length
 

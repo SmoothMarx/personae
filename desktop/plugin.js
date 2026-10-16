@@ -8293,13 +8293,21 @@ function noteScreenInstallDone(payload) {
   })
 }
 
-/** Stopping a screen somebody else is driving is a QUESTION, not a verb: the
- *  gateway refuses it without `force`, so the pane asks first instead of
- *  surfacing a refusal the user cannot act on. */
-function screenStopNeedsConfirm(status, hash) {
+/** Stopping a screen a HUMAN holds is a QUESTION, not a verb: the gateway
+ *  refuses the polite stop while any human holds the lease, so the pane has to
+ *  ask and then `force` it. Returns the i18n key of the question, or '' when a
+ *  plain Stop is enough — and which human holds only changes the WORDING, never
+ *  whether the question is asked. (Asking only about somebody ELSE is how the
+ *  pane offered Pedro a stop that the server could not honour: HE held the
+ *  lease, so the polite stop was refused and no force path was offered.) */
+function screenStopQuestion(status, hash) {
   const lease = status?.lease || null
 
-  return Boolean(lease && lease.holder === 'human' && !leaseHeldBy(lease, hash))
+  if (lease?.holder !== 'human') {
+    return ''
+  }
+
+  return leaseHeldBy(lease, hash) ? 'screenStopForceSelf' : 'screenStopForce'
 }
 
 /** One mounted Screen pane's live state. Held in a ref, never in React state:
@@ -8497,11 +8505,17 @@ async function attachScreen(session, api) {
 }
 
 async function screenLease(session, api, action) {
-  const result = await host.request(action === 'take' ? 'display.lease.acquire' : 'display.lease.release', {
-    profile: api.profile,
-    reason: 'Personae',
-    viewer_id: session.viewerId
-  })
+  // Each verb sends EXACTLY its own fields. Params models are `extra="forbid"`
+  // and the dispatcher answers 4000 for an unknown key (`contracts/registry.py`
+  // `validate_params`), and `reason` belongs to ACQUIRE only — release takes
+  // `viewer_id`/`force`. One shared param object is how a working Take over sits
+  // beside a Hand back that never leaves the client.
+  const params =
+    action === 'take'
+      ? { profile: api.profile, reason: 'Personae', viewer_id: session.viewerId }
+      : { profile: api.profile, viewer_id: session.viewerId }
+
+  const result = await host.request(action === 'take' ? 'display.lease.acquire' : 'display.lease.release', params)
 
   if (action === 'take') {
     return leaseHeldBy(result?.lease, session.hash)
@@ -8510,6 +8524,13 @@ async function screenLease(session, api, action) {
   releaseHeldKeys(session)
 
   return false
+}
+
+/** The params `display.stop` takes: `force` and the profile, nothing else (the
+ *  same `extra="forbid"` wire that turned a shared `reason` into a 4000 on
+ *  release). Pure, so the harness pins the key set. */
+function screenStopParams(profile, force) {
+  return { force: Boolean(force), profile }
 }
 
 /** One key event from the canvas. Forwarded ONLY while this window holds the
@@ -8586,7 +8607,7 @@ function ScreenView({ profile }) {
   })
   const verbs = screenVerbState(status.data || null, displayMissing(status.error))
   const lease = status.data?.lease || null
-  const heldElsewhere = screenStopNeedsConfirm(status.data, session.hash)
+  const stopQuestion = screenStopQuestion(status.data, session.hash)
   const report = (error, fallback) => {
     const note = String(error?.message || error || fallback || '')
 
@@ -8668,7 +8689,7 @@ function ScreenView({ profile }) {
 
   const stop = force => run('stop', async () => {
     setConfirmStop(false)
-    await host.request('display.stop', { force, profile })
+    await host.request('display.stop', screenStopParams(profile, force))
     refresh()
   })
 
@@ -8732,7 +8753,7 @@ function ScreenView({ profile }) {
         className: 'flex min-w-0 flex-wrap items-center gap-1.5',
         children: [
           verbs.canStart ? button('start', t('screenStart'), start, { disabled: Boolean(verbs.blocker), variant: 'default' }) : null,
-          verbs.canStop ? button('stop', t('screenStop'), () => (heldElsewhere ? setConfirmStop(true) : stop(false)), { variant: 'destructive' }) : null,
+          verbs.canStop ? button('stop', t('screenStop'), () => (stopQuestion ? setConfirmStop(true) : stop(false)), { variant: 'destructive' }) : null,
           verbs.canInstall ? button('install', t('screenInstall'), install, { variant: 'default' }) : null,
           view.mode === 'error' || view.mode === 'stopped'
             ? button('retry', t('screenReconnect'), () => run('retry', async () => attachScreen(session, apiRef.current)))
@@ -8746,7 +8767,7 @@ function ScreenView({ profile }) {
             children: [
               jsx('span', {
                 className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
-                children: t('screenStopForce')
+                children: t(stopQuestion || 'screenStopForce')
               }, 'ask'),
               jsxs('div', {
                 className: 'flex items-center gap-0.5',
@@ -10569,6 +10590,7 @@ export default {
         screenStart: 'Start',
         screenStop: 'Stop',
         screenStopForce: 'Someone else is driving. Stop the screen anyway?',
+        screenStopForceSelf: 'You are driving this screen. Stop it anyway?',
         screenTaken: 'Someone else took control.',
         screenTakeOver: 'Take over',
         screenWorking: 'Working…',
@@ -10901,7 +10923,8 @@ export const __internals = {
   screenPointer,
   paintScreenFrame,
   allocateCanvas,
-  screenStopNeedsConfirm,
+  screenStopQuestion,
+  screenStopParams,
   noteScreenInstallLog,
   noteScreenInstallDone,
   resetScreenInstall,
