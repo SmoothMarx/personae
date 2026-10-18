@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/personae-icon.png" width="128" height="128" alt="Personae — Agent Messenger">
-</p>
+![Personae cover: a classical bust with a blue face mask, beside the headline Sorted by who, not when. and a roster of four profiles](assets/personae-cover-full.png)
 
 # Personae — Agent Messenger
 
@@ -328,7 +326,7 @@ personae/
 │   ├── codicon-names.txt  # that font's own name list, snapshotted
 │   ├── run.sh        # runs all three
 │   └── sdk/          # a stand-in for @hermes/plugin-sdk, so the harness runs without the app
-├── assets/           # the icon, the logo, the screenshot at the top
+├── assets/           # the cover banner, the icon, and the screenshot
 ├── deploy.sh         # copies desktop/plugin.js into the app's plugin folder, prints both hashes
 ├── package.json      # name, license, scripts — no dependencies
 ├── LICENSE           # GPL-3.0
