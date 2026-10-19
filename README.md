@@ -2,7 +2,14 @@
 
 # Personae — Agent Messenger
 
-**Personae** is my take on what "Bots" should be. A simple messenger app, with all your profiles, along with their corresponding sessions.
+**Sorted by who, not when.**
+
+Not a chat window. A contacts list. Your profiles sit where your friends sit — each with
+its own threads, its own unread badge, its own place in the list.
+
+**Personae** is my take on what "Bots" should be. A simple messenger app, with all your
+profiles, along with their corresponding sessions. Nothing else.
+Right now, it is a plugin for the **Hermes Desktop** app.
 
 <h2><a href="https://github.com/SmoothMarx/personae-mobile">Personae is also available for Android!</a></h2>
 
@@ -174,6 +181,8 @@ offers the ones that make sense on the thing you clicked.
 | **Sort** | Manual, or by last activity |
 | **Copy id** | The exact profile or session id |
 | **Apropos (On that topic, beta)** | A new child session that knows this background |
+| **Archive all up to this point…** | Archive everything in that profile **older** than the session you clicked — the count is shown first, and nothing moves until you confirm |
+| **Unarchive** | Put an archived session back in the live list. It replaces **Archive** on an archived row (offering "archive" to something already archived is a no-op dressed as an action), and the bulk cut is not offered from inside the archive for the same reason |
 | **Delete** | Delete the session or the group — see below |
 
 Every option carries a small glyph. Where core has the same verb it is core's own —
@@ -205,10 +214,34 @@ One consequence worth knowing: the move is the app's own *workspace* switch, so 
 
 ---
 
+## 🔎 Search
+
+One box, and it reads three things per profile: the live session list (titles, previews,
+cwd), the **archive** — which no other listing can serve — and the **message bodies**
+(full-text, through the plugin's own backend, because transcript text is the one thing the
+app's RPC surface cannot read).
+
+* **A match outranks the view.** While a query is live the hits *are* what the profile row
+  draws — expanded or not — and no kind / activity / profile filter may hide a profile that
+  answers it. The filters come straight back when the box is empty.
+* **One row per session**, carrying how many messages matched and the conversational
+  match's text rather than a tool row's payload. A profile's remaining hits sit behind
+  `N more`, which opens a list you can filter, tick and batch.
+* **Unreadable bodies are stated, never implied.** If the backend is missing or refuses,
+  the line under the box says **Titles only** and names the profile. A search that cannot
+  read message text never draws the same screen as a search that found nothing.
+
+---
+
 ## ✅ Multi-select
 
-Tick several sessions and act once: **archive**, **delete**, or **Apropos** them into a
-single topic group. The selection bar shows what's ticked; the verbs do the rest.
+Tick several sessions and act once: **archive**, **close**, **delete**, or **Apropos** them
+into a single topic group. The selection bar shows what's ticked; the verbs do the rest.
+
+It works in the drill-downs too — **View all**, **View Archived**, **View hidden** and
+**View matches** — each of which carries its own filter box and tick toggle as well. A batch
+always resolves against the rows **on screen**, local filter included, so a verb can never
+reach something you cannot see.
 
 ---
 

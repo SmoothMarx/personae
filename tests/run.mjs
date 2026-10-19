@@ -69,7 +69,6 @@ const isSubmenuTrigger = (html, label) => {
   return false
 }
 
-
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 const nowSec = Math.floor(Date.now() / 1000)
@@ -163,10 +162,16 @@ const ctx = {
   },
   /** The plugin's own backend (`/api/plugins/personae`), which is the only
    *  door to message bodies the SDK leaves open. `h.rest.byProfile` answers. */
-  rest: async path => {
+  rest: async (path, options = {}) => {
     h.rest.calls.push(path)
 
-    const profile = new URLSearchParams(String(path).split('?')[1] || '').get('profile')
+    // A WRITE (method + body) is recorded separately: `calls` is asserted as bare
+    // paths all over this suite, and a POST is a different animal from a read.
+    if (options && options.method) {
+      h.rest.writes = [...(h.rest.writes || []), { body: options.body, method: options.method, path }]
+    }
+
+    const profile = options?.body?.profile ?? new URLSearchParams(String(path).split('?')[1] || '').get('profile')
     const entry = h.rest.byProfile?.[profile]
 
     if (entry instanceof Error) {
@@ -964,6 +969,7 @@ check(
   markup.includes('data-slot="context-menu-content"') ? 'content without a context-menu item' : 'no context menu rendered'
 )
 
+h.rest.calls.length = 0
 h.rest.byProfile = {
   zulu: {
     results: [
@@ -977,22 +983,41 @@ const sweptBody = await __internals.searchInSessions(['zulu', 'ghost'], 'flux')
 
 check(
   "the body search hits this plugin's own backend, per profile",
-  h.rest.calls.includes('/search?q=flux&profile=zulu&limit=40') &&
-    h.rest.calls.includes('/search?q=flux&profile=ghost&limit=40'),
+  h.rest.calls.includes('/search?q=flux&profile=zulu&limit=100&role=user,assistant') &&
+    h.rest.calls.includes('/search?q=flux&profile=ghost&limit=100&role=user,assistant'),
   JSON.stringify(h.rest.calls)
 )
 check(
-  'a body match rides ahead of the metadata hits and carries its snippet',
+  'the sweep asks for the endpoint’s ceiling, not 40 — a chatty session must not eat the page',
+  __internals.SEARCH_BODY_LIMIT === 100,
+  String(__internals.SEARCH_BODY_LIMIT)
+)
+check(
+  'and the ARCHIVE is swept per profile, so a title match in an archived chat is reachable',
+  h.rest.calls.includes('/archived?profile=zulu&limit=60') && h.rest.calls.includes('/archived?profile=ghost&limit=60'),
+  JSON.stringify(h.rest.calls)
+)
+check(
+  'a body match carries its snippet',
   sweptBody.zulu[0].body === true && sweptBody.zulu[0].id === 'sess-zulu-7' && sweptBody.zulu[0].preview === 'flux again',
   JSON.stringify(sweptBody.zulu?.map(hit => hit.id))
 )
 check(
-  'a session matching both ways appears once',
-  sweptBody.zulu.filter(hit => hit.id === 'sess-zulu-9').length === 1 && sweptBody.zulu[1].id === 'sess-zulu-9',
-  JSON.stringify(sweptBody.zulu?.map(hit => hit.id))
+  'a session matching BOTH ways keeps ONE row, enriched — the title survives, the snippet is the body hit',
+  (() => {
+    const rows = sweptBody.zulu.filter(hit => String(hit.id) === 'sess-zulu-9')
+
+    return rows.length === 1 && rows[0].body === true && rows[0].title === 'Flux capacitor retro' && rows[0].matches === 1
+  })(),
+  JSON.stringify(sweptBody.zulu?.filter(hit => String(hit.id) === 'sess-zulu-9'))
 )
 check('the FTS markers are stripped out of the snippet', sweptBody.zulu.every(hit => !/>>>|<<</.test(hit.preview)))
 check('a profile with no body hits is left alone', !Object.keys(sweptBody).includes('ghost'))
+check(
+  'a search that went fine publishes no health problem',
+  __internals.$searchHealth.get().unavailable === false && __internals.$searchHealth.get().failed.length === 0,
+  JSON.stringify(__internals.$searchHealth.get())
+)
 
 h.rest.byProfile = { zulu: new Error('backend down') }
 
@@ -1003,7 +1028,34 @@ check(
   sweptDown.zulu?.some(hit => hit.id === 'sess-zulu-9') === true,
   JSON.stringify(sweptDown)
 )
+check(
+  'AND the refusal is published — a dead backend may not draw the same screen as "no match"',
+  __internals.$searchHealth.get().failed.includes('zulu'),
+  JSON.stringify(__internals.$searchHealth.get())
+)
+
+{
+  const realRest = ctx.rest
+
+  delete ctx.rest
+
+  await __internals.searchInSessions(['zulu'], 'flux')
+
+  check(
+    'a build with no body-search backend says TITLES ONLY, not silence',
+    __internals.$searchHealth.get().unavailable === true
+  )
+
+  ctx.rest = realRest
+  await __internals.searchInSessions(['zulu'], 'flux')
+}
+
 check('bodyHit drops rows with no session id', __internals.bodyHit({ snippet: 'x' }).id === '')
+check(
+  'bodyHit reads the ROLE, so a tool row cannot outrank a sentence',
+  __internals.bodyHit({ role: 'tool', session_id: 's' }).conversational === false &&
+    __internals.bodyHit({ role: 'user', session_id: 's' }).conversational === true
+)
 
 // ── 15. the profile menu's reordering + "New session" ──────────────────────
 
@@ -1287,7 +1339,11 @@ check(
     const to = sessionMenu.lastIndexOf(slot, labelAt(sessionMenu, 'Apropos (On that topic, beta)'))
     const drawn = [...sessionMenu.slice(from, to).matchAll(/data-codicon="([^"]+)"/g)].map(m => m[1])
 
-    return drawn.join(' ') === 'history mail edit repo-forked copy cloud-download eye-closed archive trash'
+    // 1.4.0 adds "Archive all up to this point…" — a SECOND archive glyph, on
+    // purpose: it is the same family of verb (reversible, no data loss) at a
+    // different SCOPE, and the one-glyph-per-row rule is about every row having
+    // a glyph, not about every glyph being unique.
+    return drawn.join(' ') === 'history mail edit repo-forked copy cloud-download eye-closed archive archive trash'
   })(),
   (() => {
     const slot = 'data-slot="context-menu-sub-trigger"'
@@ -1296,6 +1352,15 @@ check(
 
     return [...sessionMenu.slice(from, to).matchAll(/data-codicon="([^"]+)"/g)].map(m => m[1]).join(' ')
   })()
+)
+check(
+  'the bulk archive cut is the row AFTER Archive and is NOT destructive',
+  (() => {
+    const item = /data-slot="context-menu-item"[^>]*>(?:(?!data-slot="context-menu-item")[\s\S])*?Archive all up to this point/.exec(sessionMenu)
+
+    return Boolean(item) && !/data-variant="destructive"/.test(item[0])
+  })(),
+  'a bulk verb that cannot lose data must not wear the delete dress'
 )
 
 const projectsQuery = h.queries.filter(q => (q.queryKey || [])[1] === 'projects').pop() || {}
@@ -1354,18 +1419,115 @@ check(
   JSON.stringify(h.opens)
 )
 
-check('Rename refuses an empty name (no RPC, no silent no-op)', (await __internals.renameSession('sess-zulu-9', 'zulu', '   ')) === false)
+// Rename has TWO doors, and which one is used is the whole fix (2026-10-16:
+// "every time I try to rename a session in my plug-in, it says 'Session not
+// found'"). `session.title` is a SESSION-SCOPED RPC — the gateway resolves its
+// session_id against the LIVE registry, so a STORED id can only ever answer
+// 4001. A live row (one carrying `resolved_id`) goes through core; every other
+// row goes through the pane's backend, which is the same write core's REST
+// title route performs.
+{
+  const before = h.requests.length
+  const restBefore = (h.rest.writes || []).length
 
-await __internals.renameSession('sess-zulu-9', 'zulu', 'Better name')
+  check(
+    'Rename refuses an empty name (no RPC, no backend write, no silent no-op)',
+    (await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', '   ')) === false &&
+      h.requests.length === before &&
+      (h.rest.writes || []).length === restBefore
+  )
+}
 
-check(
-  'Rename calls session.title with the profile',
-  lastRequest().method === 'session.title' &&
-    lastRequest().params.title === 'Better name' &&
-    lastRequest().params.session_id === 'sess-zulu-9' &&
-    lastRequest().params.profile === 'zulu',
-  JSON.stringify(lastRequest())
-)
+{
+  // ONE DOOR: a row that IS live still renames through the backend, because
+  // `session.title` cannot take a stored id and "try the RPC first" is how this
+  // bug came back twice. The runtime id must not appear on the wire at all.
+  const before = h.requests.length
+
+  h.rest.byProfile = { zulu: { ok: true, session_key: 'sess-zulu-9', title: 'Better name' } }
+  h.rest.writes = []
+
+  const renamed = await __internals.renameSession({ id: 'sess-zulu-9', resolved_id: 'runtime-9' }, 'zulu', 'Better name')
+
+  check(
+    'a LIVE row renames through the SAME backend door — no RPC, no runtime id on the wire',
+    renamed === true &&
+      h.requests.length === before &&
+      h.rest.writes?.[0]?.body?.session_id === 'sess-zulu-9' &&
+      !JSON.stringify(h.rest.writes).includes('runtime-9'),
+    JSON.stringify(h.rest.writes)
+  )
+}
+
+{
+  // The stored-id door. This is the case the user actually hits: the sessions in
+  // a list are almost never live in the gateway process.
+  const before = h.requests.length
+  const restCallsBefore = h.rest.calls.length
+
+  h.rest.byProfile = { zulu: { ok: true, session_key: 'sess-zulu-9', title: 'Archived-era name' } }
+  h.rest.writes = []
+
+  const renamed = await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'Archived-era name')
+
+  check('a STORED-only row renames through the pane backend', renamed === true)
+  check(
+    '…which is a POST /title carrying the profile, the stored id and the name',
+    h.rest.writes?.[0]?.method === 'POST' &&
+      h.rest.writes[0].path === '/title' &&
+      h.rest.writes[0].body?.profile === 'zulu' &&
+      h.rest.writes[0].body?.session_id === 'sess-zulu-9' &&
+      h.rest.writes[0].body?.title === 'Archived-era name',
+    JSON.stringify(h.rest.writes)
+  )
+  check(
+    '…and it does NOT fire the doomed session.title first (the gateway logs every rejected one)',
+    h.requests.length === before && h.rest.calls.length > restCallsBefore,
+    `requests +${h.requests.length - before}`
+  )
+}
+
+{
+  h.rest.byProfile = { zulu: { detail: 'no session sess-gone in zulu', error: 'session_not_found' } }
+
+  let said = ''
+
+  try {
+    await __internals.renameSession({ id: 'sess-gone' }, 'zulu', 'anything')
+  } catch (error) {
+    said = String(error.message || error)
+  }
+
+  check(
+    'a backend 404 becomes the backend’s own sentence, so the toast names the session',
+    said.includes('no session sess-gone in zulu'),
+    said
+  )
+}
+
+{
+  const realRest = ctx.rest
+
+  delete ctx.rest
+
+  let said = ''
+
+  try {
+    await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'anything')
+  } catch (error) {
+    said = String(error.message || error)
+  }
+
+  ctx.rest = realRest
+  h.rest.byProfile = {}
+
+
+  check(
+    'with no backend at all the failure SAYS so instead of blaming the session',
+    /needs the Personae backend/i.test(said),
+    said
+  )
+}
 
 await __internals.moveSessionToProject('sess-zulu-9', '/home/hermes/Projects/demo', 'zulu')
 
@@ -1470,8 +1632,6 @@ check(
   __internals.projectCwd({ folders: [{ path: '/b' }, { path: '/c' }] }) === '/b'
 )
 check('projectCwd refuses a project with no folder', __internals.projectCwd({ name: 'x' }) === null && __internals.projectCwd(null) === null)
-
-
 
 // ── 17. job-run sources never reach the pane as conversations ──────────────
 // The backend's listing deny-list (INTERNAL_LISTING_SOURCES) covers kanban /
@@ -4643,7 +4803,6 @@ check(
   })()
 )
 
-
 // ── 2026-10-10: hiding, deleting a live session, moving groups, Apropos groups ──
 // Pedro's six asks, in the order he wrote them. Each one pins the SHAPE (a
 // marker, a store value, a call order) rather than the pixels.
@@ -5811,7 +5970,6 @@ if (process.env.DUMP_GROUPS) {
   __internals.setSessionGroupColor('zulu', topicA, BLUE)
   writeFileSync(process.env.DUMP_GROUPS, render())
 }
-
 
 // ── round 7: what a row is CALLED, the chain delete, the profile editor ──────
 {
@@ -7068,6 +7226,386 @@ const puts = server => server.calls.filter(call => call.method === 'PUT')
     'one of the four preview call sites is missing its stripMarkdown call'
   )
 }
+
+// ── 1.4.0 — a search that FINDS the session, and the bulk archive cut ──────
+//
+// Pedro, 2026-10-16: "Search is not working, I tried searching for a keyword and
+// it didn't pop up the session I was expecting it to." Six defects sat behind
+// that one sentence, and every one of them is pinned below:
+//   D1 an EXPANDED profile drew its own recent sessions and swallowed its hits;
+//   D2 only five hits were ever drawn, and "N more" was dead text;
+//   D3 body hits arrived BM25-ranked with tool rows on top;
+//   D4 the archive was never swept, so an archived chat's title was unfindable;
+//   D5 a dead backend and "no match" drew the same screen;
+//   D6 the drill-downs had no search, no multiselect and no batch bar.
+// Plus the two asks: multiselect in "View Archived", and "Archive all up to this
+// point" (archive by default; a DELETE twin was explicitly NOT wanted).
+
+const i18nT = (key, ...args) => {
+  const value = h.i18n[key]
+
+  return typeof value === 'function' ? value(...args) : value ?? key
+}
+
+// ── D3: one row per session, and a sentence beats a tool dump ──────────────
+
+{
+  const grouped = __internals.mergeBodyHits({}, 'zulu', [
+    { role: 'tool', session_id: 's1', snippet: 'tool noise one' },
+    { role: 'assistant', session_id: 's1', snippet: 'the sentence the user meant' },
+    { role: 'tool', session_id: 's1', snippet: 'tool noise two' },
+    { role: 'tool', session_id: 's2', snippet: 'all tool here' },
+    { role: 'user', session_id: 's3', snippet: 'another sentence' }
+  ]).zulu
+  const at = id => grouped.findIndex(hit => hit.id === id)
+
+  check(
+    'ONE row per session, not one per message — and it carries the match count',
+    grouped.filter(hit => hit.id === 's1').length === 1 && grouped.find(hit => hit.id === 's1').matches === 3,
+    JSON.stringify(grouped)
+  )
+  check(
+    'the conversational match wins the snippet over the tool rows around it',
+    grouped.find(hit => hit.id === 's1').preview === 'the sentence the user meant' &&
+      grouped.find(hit => hit.id === 's1').toolOnly === false,
+    JSON.stringify(grouped.find(hit => hit.id === 's1'))
+  )
+  check(
+    'a conversational session sorts ahead of a tool-only one',
+    at('s2') > at('s1') && at('s2') > at('s3'),
+    grouped.map(hit => hit.id).join()
+  )
+  check('a tool-only session says so, so the row can be honest about its text', grouped.find(hit => hit.id === 's2').toolOnly === true)
+}
+
+// ── D-filters: an explicit query outranks the view filters ────────────────
+
+{
+  const rowsIn = [
+    { label: 'Zulu', messages: 4, name: 'zulu', preview: '' },
+    { label: 'Quiet', lastActiveMs: Date.now() - 10000, messages: 0, name: 'quiet', preview: '' }
+  ]
+  const filters = { activity: 'all', kind: 'noSessions', matchesByProfile: { zulu: [{ id: 'x' }] }, nowMs: Date.now(), profiles: [] }
+
+  check(
+    'a row that ANSWERS the query survives the view kind filter',
+    __internals.visibleRows(rowsIn, { ...filters, query: 'flux' }).map(row => row.name).join() === 'zulu'
+  )
+  check(
+    '…and with an empty box the very same filter applies again',
+    __internals.visibleRows(rowsIn, { ...filters, query: '' }).map(row => row.name).join() === 'quiet'
+  )
+}
+
+// ── the bulk cut: strictly older, same profile, never the clicked row ─────
+
+{
+  const list = [
+    { id: 'newer', last_active: nowSec - 10 },
+    { id: 'cut', last_active: nowSec - 100 },
+    { id: 'older-a', last_active: nowSec - 200 },
+    { id: 'older-b', last_active: nowSec - 5000 },
+    { id: 'no-time' },
+    { id: 'live-id', last_active: nowSec - 400, resolved_id: 'runtime-id' }
+  ]
+  const cut = __internals.sessionsUpTo(list, 'cut')
+
+  check('the cut takes STRICTLY older sessions', cut.map(s => s.id).join() === 'older-a,older-b,live-id', cut.map(s => s.id).join())
+  check('the clicked session is never in its own cut', !cut.some(s => s.id === 'cut'))
+  check('a session that cannot be placed in time is left alone', !cut.some(s => s.id === 'no-time'))
+  check('an unknown target cuts nothing', __internals.sessionsUpTo(list, 'nope').length === 0)
+  check('a target with no readable timestamp cuts nothing', __internals.sessionsUpTo(list, 'no-time').length === 0)
+  check(
+    'the target resolves by EITHER id a row answers to — stored or live',
+    __internals.sessionsUpTo(list, 'runtime-id').map(s => s.id).join() === 'older-b' &&
+      __internals.sessionsUpTo(list, 'live-id').map(s => s.id).join() === 'older-b',
+    `${__internals.sessionsUpTo(list, 'runtime-id').map(s => s.id).join()} / ${__internals.sessionsUpTo(list, 'live-id').map(s => s.id).join()}`
+  )
+}
+
+// ── D5: the debounce, and the two needles ─────────────────────────────────
+
+{
+  __internals.$searchInput.set('')
+  __internals.$searchQuery.set('')
+
+  __internals.scheduleSearch('p')
+
+  check('the box follows every keystroke', __internals.$searchInput.get() === 'p')
+  check('but a needle below the minimum never arms a sweep', __internals.$searchQuery.get() === '')
+
+  __internals.scheduleSearch('personae')
+
+  check('the SWEEP waits for a pause — the box is written, the needle is not', __internals.$searchQuery.get() === '')
+
+  await new Promise(resolve => setTimeout(resolve, __internals.SEARCH_DEBOUNCE_MS + 80))
+
+  check('…and lands on its own once typing stops', __internals.$searchQuery.get() === 'personae')
+
+  __internals.scheduleSearch('')
+
+  check('clearing the box clears the needle', __internals.$searchQuery.get() === '')
+}
+
+// ── D1/D2: an EXPANDED profile draws its matches, and the extra are a door ─
+
+const HITS_014 = [
+  { body: true, id: 'hit-1', last_active: nowSec - 20, matches: 3, preview: 'the personae search', title: '' },
+  { id: 'hit-2', last_active: nowSec - 60, preview: 'personae again', title: '' },
+  { id: 'hit-3', last_active: nowSec - 100, preview: 'personae', title: '' },
+  { id: 'hit-4', last_active: nowSec - 140, preview: 'personae', title: '' },
+  { id: 'hit-5', last_active: nowSec - 180, preview: 'personae', title: '' },
+  { id: 'hit-6', last_active: nowSec - 220, preview: 'personae', title: '' },
+  { id: 'hit-7', last_active: nowSec - 260, preview: 'personae', title: '' }
+]
+
+h.storage['messenger-expanded-v1'] = { zulu: true }
+h.storage['messenger-sections-v1'] = { collapsed: [], members: {}, sections: [] }
+plugin.register(ctx)
+h.queryResults['personae|roster'] = { data: rows, error: null, isError: false, isFetching: false, isPending: false }
+h.queryResults['personae|sessions|zulu'] = {
+  data: { zulu: [{ id: 'own-1', last_active: nowSec - 30, source: 'desktop', title: 'Own recent session' }] },
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
+h.queryResults['personae|search|personae|default|zulu'] = {
+  data: { zulu: HITS_014 },
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
+__internals.$searchQuery.set('personae')
+__internals.$searchHealth.set({ failed: [], unavailable: false })
+
+markup = render()
+
+check(
+  'an EXPANDED profile draws its MATCHES — the bug was that its own list swallowed them',
+  /data-session="hit-1"/.test(markup) && /data-session="hit-5"/.test(markup),
+  markup.slice(markup.indexOf('data-profile="zulu"'), markup.indexOf('data-profile="zulu"') + 400)
+)
+check(
+  '…and the profile’s own recent sessions do not push them out',
+  !markup.includes('data-session="own-1"'),
+  'the own-session list and the hit list both drew'
+)
+check('a body hit says how many messages matched', markup.includes('data-session-matches="3"'))
+check(
+  'the hits past the per-row cap are a DOOR, not dead text',
+  markup.includes('data-more-hits="2"') && !/data-more-hits="2"[^>]*disabled/.test(markup),
+  markup.match(/data-more-hits="[^"]*"/g)?.join(' ')
+)
+check(
+  'and the door targets the search drill-down for THAT profile and needle',
+  JSON.stringify(__internals.moreHitsTarget('zulu', 'personae')) ===
+    JSON.stringify({ kind: 'search', profile: 'zulu', query: 'personae' })
+)
+
+// ── D6: the drill-down is a list you can work on ──────────────────────────
+
+h.queryResults['personae|view|search|zulu|personae'] = {
+  data: HITS_014,
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
+__internals.$searchQuery.set('')
+__internals.$listView.set({ kind: 'search', profile: 'zulu', query: 'personae' })
+
+markup = render()
+
+check(
+  'View matches lists every hit, not the first five',
+  markup.includes('data-list-view="search"') && /data-session="hit-7"/.test(markup),
+  markup.slice(0, 260)
+)
+check('it names the needle and the profile it belongs to', /View matches[\s\S]{0,120}?personae/.test(markup))
+check('it carries its own filter box', /aria-label="Filter this list"/.test(markup))
+check('and its own select toggle', /aria-label="Select sessions"/.test(markup))
+check('the roster is not drawn behind it', !markup.includes('data-profile='))
+check(
+  'the query is PINNED, so clearing the search box cannot empty this screen',
+  __internals.$searchQuery.get() === '' && /data-session="hit-1"/.test(markup)
+)
+
+h.queryResults['personae|view|archived|zulu'] = {
+  data: [
+    { archived: true, id: 'arc-1', last_active: nowSec - 90000, source: 'whatsapp', title: 'Archived thread' },
+    { archived: true, id: 'arc-2', last_active: nowSec - 190000, source: 'desktop', title: 'Older thread' }
+  ],
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
+__internals.$listView.set({ kind: 'archived', profile: 'zulu' })
+
+markup = render()
+
+check(
+  'View Archived can MULTISELECT (Pedro, 2026-10-16)',
+  /aria-label="Select sessions"/.test(markup) && markup.includes('data-list-view="archived"')
+)
+check('View Archived can filter its own list', /aria-label="Filter this list"/.test(markup))
+check(
+  'an archived row is LABELLED archived in this list',
+  markup.includes('data-session-archived="arc-1"'),
+  markup.slice(markup.indexOf('data-session="arc-1"') - 80, markup.indexOf('data-session="arc-1"') + 80)
+)
+{
+  // The way back out of the archive. The bulk cut is a one-press verb, so the
+  // undo has to exist INSIDE the pane, on the row it applies to.
+  const arcMenu = markup.slice(markup.indexOf('data-session="arc-1"'))
+
+  check(
+    'an ARCHIVED row offers Unarchive instead of a no-op Archive',
+    labelAt(arcMenu, 'Unarchive') >= 0 && labelAt(arcMenu, 'Archive') < 0,
+    arcMenu.slice(0, 200)
+  )
+  check("…with the app's own unarchive glyph", glyphFor(arcMenu, 'Unarchive') === 'unarchive')
+  check(
+    'and the bulk cut is NOT offered from inside the archive — it would re-archive rows and report a count',
+    // The label carries a trailing ellipsis; asserting on a truncated string
+    // would pass for the wrong reason (nothing can match it).
+    labelAt(arcMenu, 'Archive all up to this point…') < 0
+  )
+  check(
+    'a LIVE row keeps Archive AND the cut, and never says Unarchive',
+    labelAt(sessionMenu, 'Unarchive') < 0 &&
+      labelAt(sessionMenu, 'Archive') >= 0 &&
+      labelAt(sessionMenu, 'Archive all up to this point…') >= 0,
+    sessionMenu.slice(0, 120)
+  )
+
+  h.requests.length = 0
+
+  const back = await __internals.unarchiveSession('arc-1', 'zulu')
+  const call = h.requests.filter(entry => entry.method === 'session.archive').pop()
+
+  check(
+    'Unarchive is core’s own archive RPC in reverse — archived:false, same session, same profile',
+    call?.params?.archived === false && call?.params?.session_id === 'arc-1' && call?.params?.profile === 'zulu',
+    JSON.stringify(call?.params)
+  )
+
+  await __internals.archiveSession('arc-1', 'zulu')
+
+  const inCall = h.requests.filter(entry => entry.method === 'session.archive').pop()
+
+  check(
+    '…and the pair differ in exactly the one field that matters',
+    inCall?.params?.archived === true && inCall?.params?.session_id === call?.params?.session_id,
+    JSON.stringify(inCall?.params)
+  )
+  check('both verbs answer from the gateway, not from pane state', back === undefined || typeof back === 'object' || back === null)
+}
+
+{
+  // The batch bar only paints in select mode (a click), so the VERBS are pinned
+  // on the source — the drill-down must reuse the roster's own four batch verbs
+  // rather than inventing a second set for the same list.
+  const src = readFileSync(new URL('./plugin.js', import.meta.url), 'utf8')
+  const view = src.slice(src.indexOf('function SessionListView({'), src.indexOf('/** Read a picked file as a data URL'))
+
+  check(
+    'the drill-down batch is the SAME bar with the same verbs',
+    /jsx\(\s*SelectBar/.test(view) &&
+      view.includes('onArchive: () => batch(archiveSessionEntry') &&
+      view.includes('onClose: () => batch(closeSession') &&
+      view.includes('onDelete: runDelete'),
+    'the drill-down draws its own verbs instead of the roster’s'
+  )
+  check(
+    'its ticks resolve against the rows AS DRAWN (local filter included)',
+    view.includes('selectedSessions([{ name: profile, sessions }], selectedKeys)'),
+    'the batch is resolved against a longer list than the one on screen'
+  )
+}
+
+// ── D5: silence is not an answer ──────────────────────────────────────────
+
+__internals.$listView.set(null)
+__internals.$searchQuery.set('zzz')
+h.queryResults['personae|search|zzz|default|zulu'] = { data: {}, error: null, isError: false, isFetching: false, isPending: false }
+
+markup = render()
+
+check('a search that matches nothing SAYS so', markup.includes('data-search-empty="zzz"'), markup.slice(0, 240))
+
+__internals.$searchHealth.set({ failed: [], unavailable: true })
+
+markup = render()
+
+check(
+  'a missing search backend says TITLES ONLY instead of looking empty',
+  markup.includes('data-search-health="unavailable"'),
+  markup.slice(0, 240)
+)
+
+__internals.$searchHealth.set({ failed: ['zulu'], unavailable: false })
+
+markup = render()
+
+check(
+  'a backend that refused for ONE profile names it',
+  markup.includes('data-search-health="failed"') && markup.includes('zulu'),
+  markup.slice(0, 240)
+)
+
+__internals.$searchHealth.set({ failed: [], unavailable: false })
+
+// ── the confirmation: the count IS the safety ─────────────────────────────
+
+markup = renderToStaticMarkup(
+  jsx(__internals.ArchiveCutBar, { busy: false, count: 4, onCancel: () => {}, onRun: () => {}, profile: 'zulu', t: i18nT })
+)
+
+check('the bulk archive asks first, with the COUNT in the question', markup.includes('Archive the 4 sessions older than this one?'))
+check('the bar is scoped to the profile it will act on', markup.includes('data-archive-cut="zulu:4"'))
+check('and its verbs are Cancel + Archive', labelAt(markup, 'Cancel') >= 0 && labelAt(markup, 'Archive') >= 0)
+check(
+  'archiving is NOT dressed as a delete — the default is the reversible verb',
+  !markup.includes('data-variant="destructive"') && !/Delete/.test(markup)
+)
+{
+  const src = readFileSync(new URL('./plugin.js', import.meta.url), 'utf8')
+
+  check(
+    '"Delete all up to this point" does not exist — Pedro excluded it',
+    !/Delete all up to this point/i.test(src) && !/deleteUpTo|deleteAllUpTo/i.test(src)
+  )
+}
+
+// ── and the drill-down lists the same hits the roster previewed ───────────
+
+h.rest.byProfile = { zulu: { results: [{ session_id: 'bh-1', snippet: 'a hit' }, { session_id: 'bh-2', snippet: 'another' }] } }
+
+const fullHits = await __internals.listSearchHits('zulu', 'personae')
+
+check(
+  'listSearchHits returns the profile’s own list for one needle',
+  fullHits.some(hit => hit.id === 'bh-1') && fullHits.some(hit => hit.id === 'bh-2'),
+  JSON.stringify(fullHits.map(hit => hit.id))
+)
+check('and an empty needle lists nothing rather than everything', (await __internals.listSearchHits('zulu', '  ')).length === 0)
+check(
+  'the drill-down filter matches what the ROW shows',
+  __internals.listMatch({ title: 'Flux capacitor retro' }, 'flux') &&
+    __internals.listMatch({ id: 'abc' }, 'abc') &&
+    !__internals.listMatch({ title: 'nope' }, 'flux')
+)
+
+// Hand the pane back the way the rest of the suite expects to find it.
+__internals.$listView.set(null)
+__internals.$searchQuery.set('')
+__internals.$searchInput.set('')
+__internals.$expanded.set({})
+h.rest.byProfile = {}
+
 
 const failedNow = results.filter(r => !r.ok)
 

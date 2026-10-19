@@ -520,6 +520,22 @@ const MARK_SRC =
 const DOCK_LIMIT = 10
 /** Shorter needles stay local — below this a session sweep is all cost. */
 const SEARCH_MIN_CHARS = 2
+/** The pane's search is a two-stage thing: the box updates on every keystroke
+ *  (an input that lags reads as broken) while the SWEEP — up to twenty-two
+ *  stores, live and archived — only fires once typing pauses. Measured on the
+ *  live roster: one sweep is ~0.1s of reads per profile, so a debounce is what
+ *  keeps a nine-character keyword from costing nine sweeps. */
+const SEARCH_DEBOUNCE_MS = 220
+/** Body hits asked of the pane's own backend PER PROFILE. The endpoint's ceiling
+ *  is 100; asking for 40 was the whole reason a session could be missing —
+ *  BM25 ranks a chatty session's tool rows above the one chat the user meant,
+ *  and 40 hits is three sessions' worth of noise. The pane groups these by
+ *  session, so the number that matters is how many SESSIONS are reachable. */
+const SEARCH_BODY_LIMIT = 100
+/** Archived sessions swept for a TITLE match. They are invisible to
+ *  `session.list`, so before this the only archived sessions a search could
+ *  ever reach were ones the FTS body read happened to hit. */
+const SEARCH_ARCHIVE_LIMIT = 60
 
 /** Plugin ctx, captured at register() — `storage` is what outlives the window. */
 let ctxRef = null
@@ -609,6 +625,50 @@ function normalizeExpanded(value) {
  *  (Pedro's D-A). Deliberately transient, not persisted: a relaunch starts at
  *  the roster instead of stranding the user inside a drill-down. */
 const $listView = atom(null)
+
+/** What the search BOX shows, keystroke by keystroke. Split from the needle the
+ *  sweep uses (below) so the input never lags: writing the box and scheduling
+ *  the work are two different jobs, and this pane renders them separately.
+ *  Transient like `$listView` — a reload starts with an empty box. */
+const $searchInput = atom('')
+/** The SETTLED needle: what `searchInSessions` is actually run against, written
+ *  only by `scheduleSearch` once typing pauses. An explicit query is the user's
+ *  strongest statement about what they want to see, which is why it outranks
+ *  the roster's filters and a profile's expanded list (see `visibleRows`). */
+const $searchQuery = atom('')
+/** How the search went, for the one case that must never be silent: if the
+ *  pane's backend is missing or refuses, the sweep is TITLES ONLY and the pane
+ *  has to say so. Before this, a dead backend and "no match" drew the same
+ *  screen — which is exactly how "search is not working" stays undiagnosable. */
+const $searchHealth = atom({ failed: [], unavailable: false })
+let searchTimer = null
+
+/** Debounce the sweep, not the box. Below the minimum needle the query is
+ *  cleared at once (no timer left armed to fire a stale search later). Pure
+ *  except for the two atoms and the one timer — the harness pins both halves. */
+function scheduleSearch(value) {
+  const next = String(value ?? '')
+
+  $searchInput.set(next)
+
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+
+  if (next.trim().length < SEARCH_MIN_CHARS) {
+    $searchQuery.set('')
+
+    return ''
+  }
+
+  searchTimer = setTimeout(() => {
+    searchTimer = null
+    $searchQuery.set(next)
+  }, SEARCH_DEBOUNCE_MS)
+
+  return next
+}
 /** The pane's refetch lever: the routines query is keyed on the epoch, so a
  *  pause / resume / delete / create asks for fresh data without a query client
  *  the plugin SDK does not hand out. */
@@ -2864,9 +2924,20 @@ async function fetchRoster() {
 /** Sessions of one profile, read through the source primary — no backend dial
  *  and no profile switch (`host.listPersistedSessions` opens that profile's
  *  state.db directly). This is what makes "a keyword in a conversation with
- *  profile X" reachable from this pane at all. */
+ *  profile X" reachable from this pane at all.
+ *
+ *  Three reads per profile, because each one has a blind spot the others cover:
+ *   1. the live page — titles, previews, cwd of the newest 200;
+ *   2. the ARCHIVE — `session.list` cannot serve it at all, so a title match in
+ *      a chat the user archived was simply unsearchable before this;
+ *   3. message bodies — the pane's own backend (FTS over `state.db`).
+ *  One broken profile contributes nothing: a search must not fail because one
+ *  store is unreadable. What it must NOT do is fail silently — the outcome is
+ *  published in `$searchHealth` and the pane says so. */
 async function searchInSessions(profiles, needle) {
   const byProfile = {}
+  const failed = []
+  let unavailable = false
 
   await Promise.all(
     profiles.map(async profile => {
@@ -2880,21 +2951,51 @@ async function searchInSessions(profiles, needle) {
           byProfile[profile] = hits
         }
       } catch {
-        // A profile with an unreadable or absent store contributes nothing; a
-        // search must not fail because one profile is broken.
+        // A profile with an unreadable or absent store contributes nothing.
       }
     })
   )
 
+  // The archive, through the same read the "View Archived" drill-down uses.
+  // `null` is "cannot tell" (no backend / refused), which is a different thing
+  // from an empty archive — only the latter means "nothing to find here".
   await Promise.all(
     profiles.map(async profile => {
-      const found = await bodySearch(profile, needle)
+      const rows = await listArchivedSessions(profile)
 
-      if (found) {
-        mergeBodyHits(byProfile, profile, found.results)
+      if (!Array.isArray(rows)) {
+        return
+      }
+
+      const hits = rows
+        .filter(session => sessionMatches(session, needle))
+        .map(session => ({ ...session, archived: true }))
+
+      if (hits.length) {
+        byProfile[profile] = [...hits, ...(byProfile[profile] || [])]
       }
     })
   )
+
+  const bodies = await Promise.all(profiles.map(async profile => [profile, await bodySearch(profile, needle)]))
+
+  for (const [profile, found] of bodies) {
+    if (found?.unavailable) {
+      unavailable = true
+
+      continue
+    }
+
+    if (found?.error) {
+      failed.push(profile)
+
+      continue
+    }
+
+    mergeBodyHits(byProfile, profile, found?.results)
+  }
+
+  $searchHealth.set({ failed, unavailable })
 
   return byProfile
 }
@@ -2903,21 +3004,38 @@ async function searchInSessions(profiles, needle) {
  *  `session.*` method returns session metadata), so the pane's own Python
  *  backend does the FTS read: `/api/plugins/personae/search`, read-only, one
  *  profile per call. `ctx.rest` is namespaced to this plugin, which is why
- *  that backend exists at all. A backend that is missing or unmounted returns
- *  null — the metadata sweep above is then all the search is, never an error. */
+ *  that backend exists at all.
+ *
+ *  Three answers, not two — "no match", "this profile's read refused" and "the
+ *  backend is not there at all" are DIFFERENT states, and collapsing them into
+ *  one null is what made a dead backend look like an empty result. The caller
+ *  publishes them (see `$searchHealth`); the UI is the one that decides how
+ *  loud to be about it.
+ *
+ *  `role=user,assistant` asks the backend for conversational rows only, and the
+ *  pane groups/deprioritises tool rows itself if the running backend predates
+ *  that filter (an unknown query parameter is ignored, so the call is safe
+ *  against both). Tool rows are the reason 40 hits could be 37 rows of escaped
+ *  JSON: BM25 loves them and they are never what a person is looking for. */
 async function bodySearch(profile, needle) {
   const rest = ctxRef?.rest
 
   if (typeof rest !== 'function') {
-    return null
+    return { results: [], unavailable: true }
   }
 
   try {
-    return await rest(
-      `/search?q=${encodeURIComponent(needle)}&profile=${encodeURIComponent(profile)}&limit=40`
+    const data = await rest(
+      `/search?q=${encodeURIComponent(needle)}&profile=${encodeURIComponent(profile)}&limit=${SEARCH_BODY_LIMIT}&role=user,assistant`
     )
-  } catch {
-    return null
+
+    if (!data || typeof data !== 'object' || data.error) {
+      return { error: String(data?.error || 'unreadable response'), results: [] }
+    }
+
+    return { results: Array.isArray(data.results) ? data.results : [] }
+  } catch (error) {
+    return { error: String(error?.message || error || 'search failed'), results: [] }
   }
 }
 
@@ -2927,12 +3045,17 @@ async function bodySearch(profile, needle) {
  *
  *  0.12.0: the markers come out HERE, "on the way in, not on the way out" — the
  *  snippet is the row's own text from this point on, so a later consumer cannot
- *  show it with `**` still in it by forgetting a call. */
+ *  show it with `**` still in it by forgetting a call.
+ *
+ *  1.4.0: `conversational` rides along, because the role is what decides which
+ *  of a session's matches is worth SHOWING. A tool row is machine output (file
+ *  dumps, escaped JSON) and it beat the user's own sentence under BM25. */
 function bodyHit(row) {
   const snippet = stripMarkdown(String(row?.snippet || '').replace(/>>>|<<</g, ''), 0)
 
   return {
     body: true,
+    conversational: String(row?.role || '').trim().toLowerCase() !== 'tool',
     id: String(row?.session_id || row?.id || ''),
     last_active: row?.timestamp || row?.last_active || null,
     preview: snippet,
@@ -2940,21 +3063,66 @@ function bodyHit(row) {
   }
 }
 
-/** Fold backend body matches into the sweep's per-profile map, ahead of the
- *  metadata hits and deduped by session id (a session can match on both). */
+/** Fold backend body matches into the sweep's per-profile map, AGGREGATED BY
+ *  SESSION.
+ *
+ *  The raw read is one row per matching MESSAGE, BM25-ranked — so "40 hits" is
+ *  routinely three sessions' worth of tool output drawn as forty near-identical
+ *  rows, with the chat the user actually meant ranked below the noise. One row
+ *  per session instead, carrying how many messages matched and the BEST text
+ *  the session has to show: a conversational match always beats a tool one, and
+ *  sessions with something conversational in them sort ahead of tool-only ones
+ *  (the backend's own relevance order is kept inside each group).
+ *
+ *  A session the metadata sweep already found keeps ONE row, ENRICHED: its
+ *  title is worth more than a snippet, and its place in the list is where the
+ *  other reads already put it. */
 function mergeBodyHits(byProfile, profile, results) {
-  const hits = (Array.isArray(results) ? results : []).map(bodyHit).filter(hit => hit.id)
+  const rows = (Array.isArray(results) ? results : []).map(bodyHit).filter(hit => hit.id)
 
-  if (!hits.length) {
+  if (!rows.length) {
     return byProfile
   }
 
-  const known = new Set((byProfile[profile] || []).map(hit => String(hit.id)))
-  const fresh = hits.filter(hit => !known.has(hit.id))
+  const order = []
+  const groups = new Map()
 
-  if (fresh.length) {
-    byProfile[profile] = [...fresh, ...(byProfile[profile] || [])]
+  for (const hit of rows) {
+    let group = groups.get(hit.id)
+
+    if (!group) {
+      group = { hit, matches: 0, toolOnly: true }
+      groups.set(hit.id, group)
+      order.push(hit.id)
+    }
+
+    group.matches += 1
+
+    // Only the FIRST conversational row may claim the snippet: the rows arrive
+    // in the backend's relevance order, so a later one cannot be better.
+    if (hit.conversational && group.toolOnly) {
+      group.hit = hit
+      group.toolOnly = false
+    }
   }
+
+  const grouped = order.map(id => {
+    const group = groups.get(id)
+
+    return { ...group.hit, matches: group.matches, toolOnly: group.toolOnly }
+  })
+  const known = byProfile[profile] || []
+  const enriched = known.map(hit => {
+    const match = grouped.find(entry => String(entry.id) === String(hit.id))
+
+    return match
+      ? { ...hit, body: true, matches: match.matches, preview: match.preview || hit.preview, toolOnly: match.toolOnly }
+      : hit
+  })
+  const fresh = grouped.filter(entry => !known.some(hit => String(hit.id) === String(entry.id)))
+  const ranked = [...fresh.filter(entry => !entry.toolOnly), ...fresh.filter(entry => entry.toolOnly)]
+
+  byProfile[profile] = [...ranked, ...enriched]
 
   return byProfile
 }
@@ -2989,11 +3157,35 @@ function matchesActivity(row, filter, nowMs) {
   return filter === 'recent' ? recent : !recent
 }
 
-/** One pass: kind → activity → profile → query. */
+/** One pass: query → kind → activity → profile.
+ *
+ *  The order is the fix, not a detail. A search is the user's most explicit
+ *  statement about what they want on screen, so a row that ANSWERS the query is
+ *  drawn before any view filter gets a vote: with the filters first, the
+ *  profile holding the match could be filtered out of the roster entirely (a
+ *  kind or activity filter the user set an hour ago), and "my session isn't
+ *  there" is exactly what that looks like. The filters resume the moment the
+ *  box is empty. */
 function visibleRows(rows, { activity, kind, matchesByProfile, nowMs, profiles, query }) {
   const needle = String(query || '').trim().toLowerCase()
 
   return rows.filter(row => {
+    if (needle) {
+      if (matchesByProfile?.[row.name]?.length) {
+        return true
+      }
+
+      return (
+        row.label.toLowerCase().includes(needle) ||
+        row.name.toLowerCase().includes(needle) ||
+        // 0.12.0 leaves THIS line alone, deliberately: it matches the RAW preview. The rows carry a
+        // stripped preview now (the display policy), but the matcher's job is search semantics, and
+        // stripping before matching would change which rows answer a query — a search change smuggled
+        // into a formatting batch is exactly the kind of thing nobody can attribute later.
+        row.preview.toLowerCase().includes(needle)
+      )
+    }
+
     if (kind === 'withSessions' && row.messages < 1) {
       return false
     }
@@ -3006,27 +3198,55 @@ function visibleRows(rows, { activity, kind, matchesByProfile, nowMs, profiles, 
       return false
     }
 
-    if (profiles.length && !profiles.includes(row.name)) {
+    return !(profiles.length && !profiles.includes(row.name))
+  })
+}
+
+/** `sessionIdOf(session)`, or the stored id when there is no live id to prefer. */
+function anySessionId(session) {
+  return String(session?.resolved_id || session?.id || '')
+}
+
+/** "Archive all up to this point" (Pedro, 2026-10-16): every session of ONE
+ *  profile whose last activity is STRICTLY older than the clicked one's.
+ *
+ *  Pure, and deliberately NOT "the rows below this one on screen": the drawn
+ *  list is capped at ten, sorted by whatever mode the user picked, and possibly
+ *  filtered — while this verb is a statement about the profile's whole history.
+ *  The caller therefore passes the FULL list (`session.list` at its ceiling),
+ *  and the count it reports is the count it will act on.
+ *
+ *  A session with no readable timestamp is LEFT OUT: it cannot be placed in
+ *  time, and archiving by guess is not something the user can undo one row at a
+ *  time. The clicked session is never in the result — archiving it is what the
+ *  ordinary Archive verb is for. */
+function sessionsUpTo(sessions, targetId) {
+  const list = Array.isArray(sessions) ? sessions : []
+  const wanted = String(targetId ?? '')
+  // A row answers to TWO ids — the durable stored one and, while it is live, a
+  // runtime one. Both must find the target and both must keep it out of its own
+  // cut, or the verb quietly does nothing depending on which id the caller had.
+  const isTarget = session => Boolean(wanted) && (anySessionId(session) === wanted || String(session?.id || '') === wanted)
+  const target = list.find(isTarget)
+
+  if (!wanted || !target) {
+    return []
+  }
+
+  const at = secondsToMs(target?.last_active || target?.started_at)
+
+  if (at === null) {
+    return []
+  }
+
+  return list.filter(session => {
+    if (isTarget(session)) {
       return false
     }
 
-    if (!needle) {
-      return true
-    }
+    const when = secondsToMs(session?.last_active || session?.started_at)
 
-    if (row.label.toLowerCase().includes(needle) || row.name.toLowerCase().includes(needle)) {
-      return true
-    }
-
-    // 0.12.0 leaves THIS line alone, deliberately: it matches the RAW preview. The rows carry a
-    // stripped preview now (the display policy), but the matcher's job is search semantics, and
-    // stripping before matching would change which rows answer a query — a search change smuggled
-    // into a formatting batch is exactly the kind of thing nobody can attribute later.
-    if (row.preview.toLowerCase().includes(needle)) {
-      return true
-    }
-
-    return Boolean(matchesByProfile?.[row.name]?.length)
+    return when !== null && when < at
   })
 }
 
@@ -3302,7 +3522,6 @@ function openProfileSessions(row, sessions) {
   // tab is what MOVES the app there, and the main open must not be created
   // before that has landed (see `switchingFlags`).
   const openMain = () => openSession(sessionIdOf(newest), name, 'main', rest.length ? null : switchingFlags(name))
-
   return rest.length ? dockSessions(name, rest).then(openMain) : Promise.resolve(openMain())
 }
 
@@ -3424,6 +3643,14 @@ function newSession(profile) {
 /** Soft-hide the session + its lineage; messages are kept (#98813). */
 function archiveSession(storedId, profile) {
   return host.request('session.archive', { archived: true, profile, session_id: String(storedId) })
+}
+
+/** The way back. `session.archive { archived: false }` is core's own unarchive —
+ *  the same call the archive view uses — so a chat hidden from every live
+ *  listing is one menu pick from returning (Pedro, 2026-10-16, after the bulk
+ *  "Archive all up to this point" made a one-way door out of it). */
+function unarchiveSession(storedId, profile) {
+  return host.request('session.archive', { archived: false, profile, session_id: String(storedId) })
 }
 
 // ── P11: multi-select ───────────────────────────────────────────────────────
@@ -3550,15 +3777,61 @@ async function runOverSessions(sessions, send) {
   return { done, failed: settled.length - done }
 }
 
-/** `session.title` is the verb core's own Rename uses; empty names are refused. */
-async function renameSession(storedId, profile, title) {
+/** Rename one session. Empty names are refused outright.
+ *
+ *  ONE DOOR, deliberately — and this is the PERMANENT fix, not a fallback.
+ *
+ *  Core's `session.title` is SESSION-SCOPED: the gateway resolves its
+ *  `session_id` against the LIVE registry (`_sessions.get(id)`) and answers
+ *  `4001 session not found` for anything else. Every id a session LIST shows is
+ *  a STORED id, and the two are different strings even for a session that is
+ *  live (`resolved_id` is the runtime one). So the RPC can never be the primary
+ *  path from a list, and an id-shaped "try the RPC first, then fall back" dance
+ *  is exactly what lets this bug come back: two id shapes, two failure modes,
+ *  and a fallback nobody sees firing.
+ *
+ *  The pane's backend `POST /title` performs the SAME write core's own REST
+ *  rename route performs (`resolve_session_id` → `set_session_title`) on the
+ *  profile's store, from either id shape. It is the only path, for live and
+ *  stored sessions alike — the one case the RPC additionally covered is a
+ *  session with NO db row yet (`pending_title`), and such a session is not in
+ *  any list to be renamed from.
+ *
+ *  A missing/older backend half is named as such instead of blamed on the
+ *  session: that confusion is what made "Session not found" so hard to read. */
+async function renameSession(session, profile, title) {
   const name = String(title || '').trim()
+  const storedId = String(session?.id || '').trim()
 
-  if (!name) {
+  if (!name || !storedId) {
     return false
   }
 
-  await host.request('session.title', { profile, session_id: String(storedId), title: name })
+  const rest = ctxRef?.rest
+
+  if (typeof rest !== 'function') {
+    throw new Error('Renaming needs the Personae backend, and it is not mounted in this build.')
+  }
+
+  let answer
+
+  try {
+    answer = await rest('/title', { body: { profile, session_id: storedId, title: name }, method: 'POST' })
+  } catch (error) {
+    const said = String(error?.message || error || '')
+
+    // 403/404 with no detail is the ROUTE missing, not the session: an older
+    // backend half predates /title.
+    throw new Error(
+      /\b40[34]\b/.test(said)
+        ? `Rename failed — the Personae backend half is older than the plugin (restart it): ${said}`
+        : `Rename failed: ${said || 'the backend did not answer'}`
+    )
+  }
+
+  if (!answer || answer.error) {
+    throw new Error(String(answer?.detail || 'Could not rename this session.'))
+  }
 
   return true
 }
@@ -4034,7 +4307,7 @@ async function renameAproposGroup(profile, groupId, name, sessions) {
 
   for (const child of plan) {
     try {
-      await renameSession(child.id, profile, child.title)
+      await renameSession({ id: child.id }, profile, child.title)
     } catch (error) {
       // The rename stands; a child that refused the write keeps its old label.
     }
@@ -4821,6 +5094,22 @@ async function listArchivedSessions(profile) {
   )
 }
 
+/** One profile's FULL hit list for one needle — what the roster draws the first
+ *  five of, and what `${extra} more` opens. Runs the same sweep the roster does
+ *  (metadata + archive + bodies) against a single profile, so the drill-down
+ *  cannot disagree with the row that opened it. */
+async function listSearchHits(profile, needle) {
+  const needle_ = String(needle || '').trim()
+
+  if (!needle_) {
+    return []
+  }
+
+  const byProfile = await searchInSessions([profile], needle_)
+
+  return byProfile[profile] || []
+}
+
 /** Load every expanded profile's sessions in one pass (the pane's query fn). */
 /** Profiles whose last `session.list` threw. Module-level so the pane can NAME
  *  them: a profile that failed to load and a profile with nothing in it drew the
@@ -5105,6 +5394,7 @@ function SessionRow({
   onDragStart,
   onRenameSubmit,
   onCreateAproposGroup,
+  onArchiveUpTo,
   onRightClickSelect,
   onSelect,
   onToggleSelect,
@@ -5135,6 +5425,14 @@ function SessionRow({
   // offers the way back without the profile list re-rendering for it.
   const hiddenState = useValue($hiddenSessions)
   const hidden = (hiddenState[String(profile)] || []).includes(storedId)
+  // A search hit from the ARCHIVE: the row is here because the query matched a
+  // chat that is not in any live list, so it says where it came from instead of
+  // looking like an ordinary recent session.
+  const archived = session?.archived === true
+  // How many messages of this session matched the needle (body hits only; the
+  // backend's raw read is one row per MESSAGE and the pane folds those into one
+  // row per session — see mergeBodyHits).
+  const matches = Number(session?.matches) > 1 ? Number(session.matches) : 0
   const parentLink = linkForRow(links, profile, session)
   const childCount = childrenOfRow(links, profile, session)
   // Two marks, ONE slot, before the name — where the eye lands:
@@ -5414,6 +5712,29 @@ function SessionRow({
                   'hidden-chip'
                 )
               : null,
+            archived
+              ? jsx(
+                  'span',
+                  {
+                    'data-session-archived': storedId,
+                    className:
+                      'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
+                    children: 'archived'
+                  },
+                  'archived-chip'
+                )
+              : null,
+            matches
+              ? jsx(
+                  'span',
+                  {
+                    'data-session-matches': String(matches),
+                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                    children: `${matches} matches`
+                  },
+                  'matches'
+                )
+              : null,
             age
               ? jsx('span', { className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)', children: age })
               : null,
@@ -5503,11 +5824,44 @@ function SessionRow({
                         },
                         'hide-session'
                       ),
-                      jsx(
-                        ContextMenuItem,
-                        { onSelect: () => archiveSession(storedId, profile), children: menuGlyph('archive', 'Archive') },
-                        'archive'
-                      ),
+                      // An ARCHIVED row gets the way back instead of the verb it
+                      // already has: "Archive" on something already archived is a
+                      // no-op dressed as an action, and after a bulk cut the user
+                      // needs the undo more than a second door in.
+                      archived
+                        ? jsx(
+                            ContextMenuItem,
+                            {
+                              onSelect: () => unarchiveSession(storedId, profile),
+                              children: menuGlyph('unarchive', 'Unarchive')
+                            },
+                            'unarchive'
+                          )
+                        : jsx(
+                            ContextMenuItem,
+                            { onSelect: () => archiveSession(storedId, profile), children: menuGlyph('archive', 'Archive') },
+                            'archive'
+                          ),
+                      // "Archive all up to this point" (Pedro, 2026-10-16): this
+                      // session marks a CUT — everything in the profile with an
+                      // older last activity goes with it. The count is read from
+                      // the profile's full list and confirmed before anything
+                      // moves (see the pane's openArchiveUpTo): the rows on
+                      // screen are a capped page, and a bulk verb that acts on a
+                      // different set than it reported is one nobody can trust.
+                      // Not offered on an already-archived row: the cut names a
+                      // boundary in a LIVE list, and from inside the archive it
+                      // would re-archive rows and report a number as work done.
+                      archived
+                        ? null
+                        : jsx(
+                            ContextMenuItem,
+                            {
+                              onSelect: () => onArchiveUpTo?.(session, profile),
+                              children: menuGlyph('archive', 'Archive all up to this point…')
+                            },
+                            'archive-upto'
+                          ),
                       // Last, behind a separator, and destructive: it is the one
                       // verb here that cannot be undone, and a slip on a
                       // neighbouring item must not reach it. Core's own
@@ -5935,11 +6289,13 @@ function ProfileRow({
   row,
   sessionOrder,
   hits,
+  searching,
   isCurrent,
   nowMs,
   drag,
   dropAt,
   onDragStart,
+  onArchiveUpTo,
   renamingGroup,
   onCreateAproposGroup,
   onDeleteGroup,
@@ -5990,18 +6346,22 @@ function ProfileRow({
   const age = ageLabel(row.lastActiveMs, nowMs)
   const subtitle = row.preview || (row.messages ? '' : 'no sessions yet')
   const shown = (hits || []).slice(0, SESSIONS_PER_ROW)
-  // Expanded shows the profile's own recent sessions; collapsed shows what the
-  // search found. The session list wins when both apply — opening a row is an
-  // explicit act, and the search hits are one keystroke away again.
+  // While a query is live the MATCHES are this row's list, expanded or not.
+  // That ordering is the whole fix for "I searched for a keyword and it didn't
+  // pop up the session I was expecting" (Pedro, 2026-10-16): the profile's own
+  // recent sessions are the answer to a different question, and they used to
+  // win outright — so a profile that happened to be OPEN drew its ten latest
+  // sessions and swallowed every hit for it.
   // The list the user dragged into shape wins over recency — but only the
   // profile's own sessions: search hits keep the relevance order they came in.
-  const listed = expanded
-    ? withAproposChildren(
-        sortProfileSessions(sessions || [], sortMode, sessionOrder?.[row.name]),
-        links,
-        row.name
-      )
-    : shown
+  const listed =
+    searching || !expanded
+      ? shown
+      : withAproposChildren(
+          sortProfileSessions(sessions || [], sortMode, sessionOrder?.[row.name]),
+          links,
+          row.name
+        )
   // Hiding is a VIEW, not a mutation (see HIDDEN_KEY): the pane filters its own
   // list, core's session list is untouched, and the row is one click away from
   // coming back. Pedro, 2026-10-10: "hiding only hides it from view in the
@@ -6010,14 +6370,19 @@ function ProfileRow({
   const hiddenIds = new Set(hiddenState[String(row.name)] || [])
   const hiddenCount = listed.filter(session => hiddenIds.has(String(session?.id))).length
   const revealed = Boolean(showHidden?.[row.name])
-  const visible = revealed ? listed : listed.filter(session => !hiddenIds.has(String(session?.id)))
-  const extra = expanded ? 0 : (hits || []).length - shown.length
+  // …but a MATCH is a match: a hidden session that answers the query is drawn
+  // WITH its `hidden` chip and its Unhide verb, because "where did that chat
+  // go" is one of the things a search is for. Hiding still governs the
+  // profile's own list, which is what the footer's counter is about.
+  const visible = searching ? listed : revealed ? listed : listed.filter(session => !hiddenIds.has(String(session?.id)))
+  const extra = searching || !expanded ? (hits || []).length - shown.length : 0
   // Only the EXPANDED list is grouped: a search-hit list is about the needle,
   // not about filing — and `sessionGroupBlocks` hands back a single anonymous
   // block when there are no groups, which is the flat list it has always been.
-  const groupBlocks = expanded
-    ? sessionGroupBlocks(visible, groupState, row.name, releasedState[String(row.name)] || [])
-    : [{ collapsed: false, id: null, name: '', sessions: visible }]
+  const groupBlocks =
+    expanded && !searching
+      ? sessionGroupBlocks(visible, groupState, row.name, releasedState[String(row.name)] || [])
+      : [{ collapsed: false, id: null, name: '', sessions: visible }]
   // The colour this profile's rows are filled with — his pick in the editor, and
   // NOTHING unless he picked one (see fillOf: "fill is opt-in").
   const fill = fillOf(row)
@@ -6383,7 +6748,8 @@ function ProfileRow({
                       nowMs,
                       onRename: onRenameSession,
                       onRenameCancel,
-                      onRenameSubmit: name => onRenameSubmit(row.name, session.id, name),
+                      // The SESSION, not its id: renaming needs the live id too (see renameSession).
+                      onRenameSubmit: name => onRenameSubmit(row.name, session, name),
                       dragging: drag?.kind === 'session' && String(drag.id) === String(session.id),
                       dropSide: dropAt?.sessionSide,
                       dropTarget: String(dropAt?.session || '') === String(session.id),
@@ -6397,6 +6763,11 @@ function ProfileRow({
                       // (sessionId, groupId) was the arity bug that made moving a
                       // session into a group a silent no-op.
                       onMoveGroup,
+                      // The bulk-archive cut (see sessionsUpTo): the row supplies
+                      // the session it was picked on, the PANE reads the
+                      // profile's full list and confirms the count before
+                      // anything moves.
+                      onArchiveUpTo,
                       onCreateAproposGroup: () =>
                         onCreateAproposGroup({
                           profile: row.name,
@@ -6485,10 +6856,23 @@ function ProfileRow({
           )
         : null,
       extra > 0
-        ? jsx('div', {
-            className: 'px-2 py-1 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
-            children: `${extra} more`
-          })
+        ? jsx(
+            'button',
+            {
+              // A door, not a dead line of text. `${extra} more` used to say
+              // there were more matches and offer no way to reach them, so a
+              // session ranked sixth was unreachable by any route from the
+              // roster. This opens the drill-down on the SAME needle, where the
+              // whole per-profile hit list is drawn.
+              'data-more-hits': String(extra),
+              className:
+                'min-w-0 px-2 py-1 pl-4 text-left text-[0.6875rem] text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover)',
+              onClick: () => $listView.set(moreHitsTarget(row.name, $searchQuery.get())),
+              type: 'button',
+              children: `${extra} more`
+            },
+            'more-hits'
+          )
         : null
     ]
   })
@@ -9446,15 +9830,31 @@ function RoutinesPane() {
   })
 }
 
+/** The drill-down's own filter: the fields the ROW shows, so typing what you
+ *  can read finds the row you can see. */
+function listMatch(session, needle) {
+  return [sessionLabel(session), session?.preview, session?.id, session?.source].some(value =>
+    String(value || '').toLowerCase().includes(needle)
+  )
+}
+
 /** P7 drill-down (Pedro's D-A): the pane body IS replaced by one profile's
- *  session list — "View all" (every session it has) or "View Archived" — with a
- *  back button. Deliberately NOT a workspace tab: the roster stays one click
- *  away. "View all" needs no backend (`session.list` takes the limit); the
- *  archive comes from the pane's own `/archived` read. */
+ *  session list — "View all" (every session it has), "View Archived", "View
+ *  hidden" (the pane's own store) or "View matches" (one search's hits, opened
+ *  from a row's `${extra} more`) — with a back button. Deliberately NOT a
+ *  workspace tab: the roster stays one click away. "View all" needs no backend
+ *  (`session.list` takes the limit); the other two come from the pane's own
+ *  backend reads.
+ *
+ *  1.4.0: it is also a LIST the user can work on — multiselect with the same
+ *  batch bar as the roster (Pedro, 2026-10-16: "In 'View Archived', allow the
+ *  user to multiselect"), and a filter of its own, because this is where the
+ *  hundreds of old sessions actually live. */
 function SessionListView({
   editingSession,
   kind,
   nowMs,
+  onArchiveUpTo,
   onBack,
   onRenameCancel,
   onRenameSession,
@@ -9469,25 +9869,96 @@ function SessionListView({
   // session.list, narrowed by the store — and the narrowing is a hook, so
   // unhiding a row takes it out of this list on the spot.
   const hiddenKind = kind === 'hidden'
+  // `${extra} more` on a roster row opens THIS list on the same needle: the
+  // profile's hit list in full, where the roster only ever drew the first few.
+  // The query is PINNED into `$listView` by whoever opened it, so clearing the
+  // search box afterwards cannot empty this screen.
+  const searchKind = kind === 'search'
+  const needle = String(useValue($listView)?.query || '').trim().toLowerCase()
   const hiddenState = useValue($hiddenSessions)
   const hiddenIds = new Set((hiddenState[String(profile)] || []).map(String))
+  // One filter box for every kind: these pages run to hundreds of rows, and the
+  // drill-down is where a user looks for something they can already name.
+  const [filter, setFilter] = useState('')
+  // P11 select mode, the same shape and the same verbs the roster has. The
+  // drill-down is where a list of OLD sessions actually gets cleaned up, so
+  // acting on them one right-click at a time was the whole complaint (Pedro,
+  // 2026-10-16: "In 'View Archived', allow the user to multiselect").
+  const [selecting, setSelecting] = useState(false)
+  const [selectedKeys, setSelectedKeys] = useState([])
+  const [status, setStatus] = useState('')
+  const [armedDelete, setArmedDelete] = useState(false)
+  const [busy, setBusy] = useState(false)
   const listed = useQuery({
-    queryKey: ['personae', 'view', kind, profile],
+    // The search kind is keyed on the NEEDLE as well: two different keywords
+    // are two different lists, and a cache key that ignored it would serve the
+    // previous search's rows.
+    queryKey: searchKind ? ['personae', 'view', kind, profile, needle] : ['personae', 'view', kind, profile],
     queryFn: () =>
-      archived
-        ? listArchivedSessions(profile)
-        : hiddenKind
-          ? listHiddenSessions(profile)
-          : listAllSessions(profile),
-    refetchInterval: archived ? false : POLL_MS,
+      searchKind
+        ? listSearchHits(profile, needle)
+        : archived
+          ? listArchivedSessions(profile)
+          : hiddenKind
+            ? listHiddenSessions(profile)
+            : listAllSessions(profile),
+    refetchInterval: archived || searchKind ? false : POLL_MS,
     retry: false,
     staleTime: 5000
   })
   const fetched = Array.isArray(listed.data) ? listed.data : []
-  const sessions = hiddenKind ? fetched.filter(session => hiddenIds.has(String(session?.id || ''))) : fetched
   // `null` from the fetcher is the archive's "no backend" answer — distinct
   // from "[]" (a reachable archive with nothing in it).
   const unavailable = archived && !listed.isPending && listed.data === null
+  const drawn = hiddenKind ? fetched.filter(session => hiddenIds.has(String(session?.id || ''))) : fetched
+  const typed = filter.trim().toLowerCase()
+  const sessions = typed ? drawn.filter(session => listMatch(session, typed)) : drawn
+  // The batch resolves against what is ON SCREEN, local filter included: a tick
+  // set resolved against a longer list is the one way a bulk verb reaches a row
+  // the user cannot see (see menus-and-selection.md).
+  const ticks = selectedSessions([{ name: profile, sessions }], selectedKeys)
+  const batch = async (send, label) => {
+    setBusy(true)
+
+    const { done, failed } = await runOverSessions(ticks, send)
+
+    setBusy(false)
+    setArmedDelete(false)
+    setStatus(failed ? `${done} ${label} · ${failed} ${t('failed')}` : `${done} ${label}`)
+    setSelectedKeys([])
+    await queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+    await queryClient.invalidateQueries({ queryKey: ['personae', 'view'] })
+  }
+  const runDelete = () => {
+    if (!armedDelete) {
+      setArmedDelete(true)
+      setStatus(`${ticks.length} ${t('selected')} — ${t('delete')}?`)
+
+      return undefined
+    }
+
+    return batch(deleteSessionEntry, t('deleted'))
+  }
+  const runApropos = async () => {
+    setBusy(true)
+
+    try {
+      const made = await aproposSelection(ticks)
+
+      setStatus(`${made} ${t('aproposMade')}`)
+    } catch (error) {
+      setStatus(t('failed'))
+      host.notifyError?.(String(error?.message || error))
+    }
+
+    setBusy(false)
+  }
+  const leaveSelect = () => {
+    setSelecting(false)
+    setSelectedKeys([])
+    setArmedDelete(false)
+    setStatus('')
+  }
 
   let body
 
@@ -9497,12 +9968,16 @@ function SessionListView({
     body = jsx(EmptyState, { description: t('viewArchiveUnavailable'), title: t('viewArchived') })
   } else if (!sessions.length) {
     body = jsx(EmptyState, {
-      description: archived
-        ? t('viewArchivedEmpty')
-        : hiddenKind
-          ? t('viewHiddenEmpty')
-          : t('viewAllEmpty'),
-      title: archived ? t('viewArchived') : hiddenKind ? t('viewHidden') : t('viewAll')
+      description: typed
+        ? t('viewFilterEmpty')
+        : searchKind
+          ? t('viewSearchEmpty')
+          : archived
+            ? t('viewArchivedEmpty')
+            : hiddenKind
+              ? t('viewHiddenEmpty')
+              : t('viewAllEmpty'),
+      title: searchKind ? t('viewSearch') : archived ? t('viewArchived') : hiddenKind ? t('viewHidden') : t('viewAll')
     })
   } else {
     body = jsx('div', {
@@ -9517,11 +9992,38 @@ function SessionListView({
                 String(editingSession.id) === String(session.id)
             ),
             nowMs,
+            // The bulk-archive cut travels with the row in here too: this list
+            // is where the old sessions the user wants gone actually live.
+            onArchiveUpTo,
             onRename: onRenameSession,
             onRenameCancel,
-            onRenameSubmit: name => onRenameSubmit(profile, session.id, name),
+            // The SESSION, not its id: renaming needs the live id too (see renameSession).
+            onRenameSubmit: name => onRenameSubmit(profile, session, name),
+            // Right-click makes the row the selection (never a mode change: the
+            // menu is an explicit act, and entering a mode from it would put a
+            // batch bar over a list the user only wanted one verb in).
+            onRightClickSelect: key => setSelectedKeys(keys => clickSelect(keys, key)),
+            onSelect: (name, storedId) => {
+              setSelecting(true)
+              setSelectedKeys([sessionKey(name, storedId)])
+            },
+            onToggleSelect: key => {
+              const next = tickState(selectedKeys, key)
+
+              setArmedDelete(false)
+              setSelectedKeys(next.keys)
+              setStatus('')
+
+              // Unticking the LAST row is how select mode ends (the same rule
+              // the roster follows — see tickState).
+              if (next.empty) {
+                setSelecting(false)
+              }
+            },
             profile,
             profileSessions: sessions,
+            selected: (selectedKeys || []).includes(sessionKey(profile, session.id)),
+            selecting,
             session
           },
           `view-${profile}-${session.id}`
@@ -9555,11 +10057,17 @@ function SessionListView({
                   jsx('span', {
                     className:
                       'shrink-0 text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
-                    children: archived ? t('viewArchived') : hiddenKind ? t('viewHidden') : t('viewAll')
+                    children: searchKind
+                      ? t('viewSearch')
+                      : archived
+                        ? t('viewArchived')
+                        : hiddenKind
+                          ? t('viewHidden')
+                          : t('viewAll')
                   }),
                   jsx('span', {
                     className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: profile
+                    children: searchKind ? `“${needle}” · ${profile}` : profile
                   })
                 ]
               },
@@ -9587,14 +10095,113 @@ function SessionListView({
                   },
                   'unhide-all-view'
                 )
+              : null,
+            sessions.length
+              ? jsx(
+                  Tip,
+                  {
+                    label: selecting ? t('selectOff') : t('selectOn'),
+                    children: jsx(Button, {
+                      'aria-label': t('select'),
+                      'aria-pressed': selecting ? 'true' : 'false',
+                      className: cn('shrink-0 rounded-md', selecting ? 'text-(--ui-accent)' : 'text-(--ui-text-tertiary)'),
+                      onClick: () => (selecting ? leaveSelect() : setSelecting(true)),
+                      size: 'icon-xs',
+                      variant: 'ghost',
+                      children: jsx(Codicon, { name: 'checklist' })
+                    })
+                  },
+                  'view-select'
+                )
               : null
           ]
         },
         'view-toolbar'
       ),
+      jsxs(
+        'div',
+        {
+          className: 'flex min-w-0 items-center gap-1 px-2.5 pb-1.5',
+          children: [
+            jsx(SearchField, {
+              'aria-label': t('filterSessions'),
+              containerClassName: cn('min-w-0 flex-1', filter ? 'opacity-100!' : 'opacity-50 focus-within:opacity-100'),
+              inputClassName: 'w-full text-[0.75rem] placeholder:text-(--ui-text-tertiary)',
+              onChange: setFilter,
+              placeholder: t('filterSessions'),
+              value: filter
+            })
+          ]
+        },
+        'view-filter'
+      ),
+      selecting
+        ? jsx(
+            SelectBar,
+            {
+              armed: armedDelete,
+              busy,
+              count: ticks.length,
+              onApropos: runApropos,
+              onArchive: () => batch(archiveSessionEntry, t('archived')),
+              onClear: () => {
+                setArmedDelete(false)
+                setSelectedKeys([])
+              },
+              onClose: () => batch(closeSession, t('closed')),
+              onDelete: runDelete,
+              onDone: leaveSelect,
+              onSelectAll: () => {
+                setArmedDelete(false)
+                setSelectedKeys(allSessionKeys([{ name: profile, sessions }]))
+              },
+              status,
+              t
+            },
+            'view-select-bar'
+          )
+        : null,
       body
     ]
   })
+}
+
+/** Where `${extra} more` goes: the drill-down for ONE profile's hits on ONE
+ *  needle. Pure — the door is one line of wiring, the decision is testable. */
+function moreHitsTarget(profile, query) {
+  return { kind: 'search', profile: String(profile), query: String(query || '') }
+}
+
+/** The confirmation for a bulk archive cut. A component (not inline JSX) so the
+ *  count it prints and the verbs it offers can be rendered and checked without
+ *  a live click: this is the one verb in the pane that touches many sessions at
+ *  once, and "how many, exactly?" is the question it exists to answer. */
+function ArchiveCutBar({ count, onCancel, onRun, profile, busy, t }) {
+  return jsxs(
+    'div',
+    {
+      'data-archive-cut': `${profile}:${count}`,
+      className:
+        'mx-2.5 mb-1.5 flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) px-2 py-1.5',
+      children: [
+        jsx('span', {
+          className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+          children: t('archiveUpToAsk', count)
+        }, 'ask'),
+        jsxs('div', {
+          className: 'flex shrink-0 items-center gap-0.5',
+          children: [
+            jsx(Button, { onClick: onCancel, size: 'sm', variant: 'ghost', children: t('cancel') }, 'cancel'),
+            // Ghost, never destructive: archiving is reversible and the row's
+            // own Archive wears the same dress. The count is the safety, not a
+            // colour.
+            jsx(Button, { disabled: Boolean(busy), onClick: onRun, size: 'sm', variant: 'ghost', children: t('archive') }, 'run')
+          ]
+        }, 'actions')
+      ]
+    },
+    'archive-cut'
+  )
 }
 
 /** Read a picked file as a data URL — the only shape `profiles.set_asset`
@@ -9859,7 +10466,17 @@ function MessengerPane() {
   const toasts = useValue($activityToasts)
   // Which profiles' last load threw — drawn as a note on their own row.
   const failedProfiles = new Set((useValue($loadFailures) || []).map(String))
-  const [query, setQuery] = useState('')
+  // The search box and the needle it drives are TWO atoms (see scheduleSearch):
+  // the box follows every keystroke, the sweep waits for a pause. `query` is
+  // therefore the SETTLED needle, which is what `visibleRows`, the query keys
+  // and `searching` all key off.
+  const queryInput = useValue($searchInput)
+  const query = useValue($searchQuery)
+  const health = useValue($searchHealth)
+  // "Archive all up to this point" — the pending cut, confirmed in the bar
+  // above the list (never a modal: this pane asks in place, like the row's own
+  // delete strip).
+  const [archiveCut, setArchiveCut] = useState(null)
   const [kind, setKind] = useState('all')
   const [activity, setActivity] = useState('all')
   const [profiles, setProfiles] = useState([])
@@ -9932,9 +10549,9 @@ function MessengerPane() {
 
   /** Commit an inline session rename, then drop the field. The list picks the
    *  new title up on its next poll (the query key does not change). */
-  const submitSessionRename = async (profile, sessionId, name) => {
+  const submitSessionRename = async (profile, session, name) => {
     try {
-      await renameSession(sessionId, profile, name)
+      await renameSession(session, profile, name)
     } catch (error) {
       host.notifyError?.(String(error?.message || error))
     }
@@ -9944,6 +10561,55 @@ function MessengerPane() {
   const nowMs = Date.now()
   const shown = visibleRows(rows, { activity, kind, matchesByProfile: hits, nowMs, profiles, query })
   const blocks = groupRows(shown, model)
+  // A search that found NOTHING anywhere is its own answer, and a silent one is
+  // what makes a working search look broken: the pane says so instead of
+  // drawing an unchanged roster.
+  const noHits = searching && shown.length === 0
+  // "Archive all up to this point" (Pedro, 2026-10-16). Two steps on purpose:
+  // READ the profile's whole history (`session.list`) to work out the cut, then
+  // confirm the count before anything moves. The rows on screen are a capped,
+  // sorted, possibly filtered page — a bulk verb that computed its set from them
+  // would report one number and act on another.
+  const openArchiveUpTo = async (session, profile) => {
+    let entries = []
+
+    try {
+      entries = sessionsUpTo(await listAllSessions(profile), sessionIdOf(session) || session?.id)
+    } catch (error) {
+      host.notifyError?.(String(error?.message || error))
+
+      return
+    }
+
+    if (!entries.length) {
+      setSelectStatus(t('nothingOlder'))
+
+      return
+    }
+
+    setSelectStatus('')
+    setArmedDelete(false)
+    setArchiveCut({ entries, profile })
+  }
+  const runArchiveCut = async () => {
+    const cut = archiveCut
+
+    if (!cut) {
+      return undefined
+    }
+
+    setBatching(true)
+
+    const { done, failed } = await runOverSessions(cut.entries, archiveSessionEntry)
+
+    setBatching(false)
+    setArchiveCut(null)
+    setSelectStatus(failed ? `${done} ${t('archived')} · ${failed} ${t('failed')}` : `${done} ${t('archived')}`)
+    await queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+    await queryClient.invalidateQueries({ queryKey: ['personae', 'view'] })
+
+    return undefined
+  }
   // Resolved against the WHOLE roster, not the visible slice: filtering a row
   // out of view must not quietly drop it from the batch.
   // Resolved against the rows AS DRAWN (see rowsWithSessions): one list per
@@ -10160,6 +10826,7 @@ function MessengerPane() {
       editingSession,
       kind: view.kind,
       nowMs,
+      onArchiveUpTo: openArchiveUpTo,
       onBack: () => $listView.set(null),
       onRenameCancel: () => setEditingSession(null),
       onRenameSession: (session, name) => setEditingSession({ id: session.id, profile: name }),
@@ -10255,6 +10922,8 @@ function MessengerPane() {
                           $listView.set({ kind, profile: name })
                           setRoutineProfile(name)
                         },
+                        onArchiveUpTo: openArchiveUpTo,
+                        searching,
                         drag,
                         dropAt,
                         onDragStart: startDrag,
@@ -10489,9 +11158,9 @@ function MessengerPane() {
             'aria-label': t('search'),
             containerClassName: cn('min-w-0 flex-1', query ? 'opacity-100!' : 'opacity-50 focus-within:opacity-100'),
             inputClassName: 'w-full text-[0.75rem] placeholder:text-(--ui-text-tertiary)',
-            onChange: setQuery,
+            onChange: scheduleSearch,
             placeholder: t('searchPlaceholder'),
-            value: query
+            value: queryInput
           }),
           jsx(FilterMenu, { ...filters, onActivity: setActivity, onKind: setKind, onProfiles: setProfiles, rows, t })
         ]
@@ -10500,6 +11169,40 @@ function MessengerPane() {
         ? jsx('div', {
             className: 'px-2.5 pb-1 text-[0.6875rem] text-(--ui-text-quaternary)',
             children: t('searching')
+          })
+        : null,
+      // The search's own receipt, and the one thing that must never be quiet:
+      // if the pane's backend is not reachable the sweep is TITLES ONLY, and
+      // "no match" plus "could not read the bodies" used to draw the same
+      // screen — which is why "search is not working" was undiagnosable.
+      searching && (health?.unavailable || health?.failed?.length)
+        ? jsx('div', {
+            className: 'min-w-0 truncate px-2.5 pb-1 text-[0.6875rem] text-(--ui-text-quaternary)',
+            'data-search-health': health?.unavailable ? 'unavailable' : 'failed',
+            title: (health?.failed || []).join(', '),
+            children: health?.unavailable
+              ? t('searchUnavailable')
+              : `${t('searchTitlesOnly')}: ${(health?.failed || []).join(', ')}`
+          })
+        : null,
+      noHits
+        ? jsx('div', {
+            className: 'min-w-0 truncate px-2.5 pb-1 text-[0.6875rem] text-(--ui-text-quaternary)',
+            'data-search-empty': needle,
+            children: `${t('searchNothing')} “${needle}”`
+          })
+        : null,
+      // The cut is confirmed HERE rather than in a dialog: this pane asks in
+      // place everywhere else (a row's delete strip), and the count is the whole
+      // point of the confirmation.
+      archiveCut
+        ? jsx(ArchiveCutBar, {
+            busy: batching,
+            count: archiveCut.entries.length,
+            onCancel: () => setArchiveCut(null),
+            onRun: runArchiveCut,
+            profile: archiveCut.profile,
+            t
           })
         : null,
       body
@@ -10670,6 +11373,7 @@ export default {
         apropos: 'Apropos (beta)',
         aproposMade: 'Apropos groups created',
         archive: 'Archive',
+        unarchive: 'Unarchive',
         archived: 'archived',
         delete: 'Delete',
         deleted: 'deleted',
@@ -10696,6 +11400,15 @@ export default {
         unhideAll: 'Unhide all',
         viewBack: 'Back',
         viewSessions: 'sessions',
+        viewSearch: 'View matches',
+        viewSearchEmpty: 'No sessions matched this keyword.',
+        viewFilterEmpty: 'Nothing in this list matches the filter.',
+        filterSessions: 'Filter this list',
+        searchNothing: 'Nothing matched',
+        searchTitlesOnly: 'Titles only (message search refused)',
+        searchUnavailable: 'Titles only — message search is unavailable in this build.',
+        archiveUpToAsk: count => `Archive the ${count} sessions older than this one?`,
+        nothingOlder: 'Nothing older to archive',
         withSessions: 'With sessions'
       }
     })
@@ -10788,6 +11501,7 @@ export const __internals = {
   $listView,
   allSessionKeys,
   archiveSession,
+  unarchiveSession,
   archiveSessionEntry,
   aproposChildren,
   aproposCreateGroup,
@@ -10957,10 +11671,25 @@ export const __internals = {
   setSessionColor,
   toggleExpanded,
   bodyHit,
+  bodySearch,
   matchesActivity,
   mergeBodyHits,
   searchInSessions,
   sessionMatches,
+  listSearchHits,
+  listMatch,
+  moreHitsTarget,
+  ArchiveCutBar,
+  sessionsUpTo,
+  anySessionId,
+  scheduleSearch,
+  $searchHealth,
+  $searchInput,
+  $searchQuery,
+  SEARCH_BODY_LIMIT,
+  SEARCH_DEBOUNCE_MS,
+  SEARCH_MIN_CHARS,
+  SessionListView,
   scheduleLabel,
   screenTone,
   screenVerbState,

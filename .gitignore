@@ -7,3 +7,7 @@ package-lock.json
 # editor / OS noise
 .DS_Store
 *.log
+
+# python bytecode
+__pycache__/
+*.pyc
