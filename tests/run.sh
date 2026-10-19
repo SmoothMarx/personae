@@ -12,6 +12,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Portability first: an artefact that only runs on this machine is tested by the
+# first stranger who tries it. Cheap check, and it fails the run, not the user.
+if [ -x ./portability.sh ]; then
+  ./portability.sh || { echo; echo "portability check failed — fix the leak above"; exit 1; }
+  echo
+fi
+
 REPO="${HERMES_DESKTOP_REPO:-$HOME/.hermes/hermes-agent}"
 WORK=work
 

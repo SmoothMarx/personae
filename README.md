@@ -381,6 +381,34 @@ no agent-side code, so there is no `__init__.py` beside it.
 
 ---
 
+## 🚚 Portability (what this repo guarantees)
+
+Every file here has to run on someone else's machine. That is not politeness — it is the
+only way the author's use of the code counts as a test of it. A deployed artefact that
+only works on the box it was written on is tested by the first stranger who tries it.
+
+So machine-specific values live in the **environment**, never in a tracked file:
+
+| Variable | What it means | Default |
+| --- | --- | --- |
+| `HOST` | where the desktop app runs (`ssh` needs to reach it) | required — `deploy.sh` refuses without it |
+| `WIN_DIR` | that app's plugin folder, as *it* sees it | required — same |
+| `HERMES_HOME` | the Hermes home to read stores from | `~/.hermes` |
+| `HERMES_AGENT_DIR` | the agent install (for the venv, React, the RPC layer) | `~/.hermes/hermes-agent` |
+| `HERMES_DESKTOP_REPO` | the desktop repo the harness borrows React from | `~/.hermes/hermes-agent` |
+| `PERSONAE_E2E_PROFILE` | the profile the live end-to-end spends its turns on | `bizzy-talk` |
+
+`tests/portability.sh` enforces it: it scans the tracked tree and fails on private
+hostnames, real home directories, and LAN/tailnet addresses — while letting
+placeholders (`/home/you/…`, `user@box`) through, because a README must stay copyable.
+`tests/run.sh` runs it first, so a repo that cannot be shipped is not a green repo.
+
+A guard nobody has seen fail is a guess, so this one is self-tested: plant a private ssh
+alias and a LAN address in a tracked file, and it must go red. It took two fixes before
+it could — `grep -P` and `grep -E` are *conflicting matchers*, and with stderr suppressed
+the exit was swallowed as "no leaks". Even this paragraph had to avoid the literals, or
+it tripped on itself.
+
 ## 🔧 Development
 
 ```bash
