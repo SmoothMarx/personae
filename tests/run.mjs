@@ -1522,6 +1522,7 @@ check(
   h.rest.byProfile = {}
 
 
+
   check(
     'with no backend at all the failure SAYS so instead of blaming the session',
     /needs the Personae backend/i.test(said),
@@ -1632,6 +1633,7 @@ check(
   __internals.projectCwd({ folders: [{ path: '/b' }, { path: '/c' }] }) === '/b'
 )
 check('projectCwd refuses a project with no folder', __internals.projectCwd({ name: 'x' }) === null && __internals.projectCwd(null) === null)
+
 
 // ── 17. job-run sources never reach the pane as conversations ──────────────
 // The backend's listing deny-list (INTERNAL_LISTING_SOURCES) covers kanban /
@@ -2813,7 +2815,10 @@ await switched
 host.openSession = realOpen
 
 const switchMove = h.opens[0]
-const dockedTabs = h.opens.slice(1)
+// The click now opens TWICE — once to carry the switch, once to land after the
+// dock — so the tabs are "the opens with tab intent", not "everything after the
+// first open".
+const dockedTabs = h.opens.filter(entry => entry.options.intent === 'tab')
 
 check(
   'the clicked session takes the main pane, with no tab intent',
@@ -7606,6 +7611,85 @@ __internals.$searchInput.set('')
 __internals.$expanded.set({})
 h.rest.byProfile = {}
 
+// ── 2026-10-17: the second click, done for you ──────────────────────────────
+// "every time I click on a session from a different profile, it always opens a
+// random session from that profile. Only when I click it a second time do I
+// land on the desired session." A cross-profile open carries a real workspace
+// switch (`switchWorkspace` + `showAllProfiles: false`), and a switch RESTORES
+// that profile's own tile set — so the navigation races a restore that knows
+// nothing about the clicked id. The fix checks what is actually in front and
+// clicks again, bounded.
+{
+  const sessions = many(3) // s-0..s-2 / r-0..r-2
+  const plainOpens = () => h.opens.filter(entry => entry.options.intent === undefined)
+
+  host.state.profile.set('default')
+
+  // 1. The reported bug: the switch lands on a DIFFERENT session of the profile.
+  h.opens.length = 0
+  h.openLandsOn = 'r-0'
+
+  await __internals.openSessionInProfile('zulu', sessions, 'r-1')
+
+  check(
+    'a cross-profile click opens the clicked session TWICE: once to move, once to land',
+    h.opens[0].id === 'r-1' && h.opens[0].options.keepAllProfilesScope === false,
+    JSON.stringify(h.opens.map(entry => `${entry.id}:${entry.options.intent || 'switch'}`))
+  )
+  check(
+    '…and the landing open is LAST, after the dock — a tab open focuses its own tile',
+    h.opens[h.opens.length - 1].id === 'r-1' &&
+      h.opens[h.opens.length - 1].options.intent === undefined &&
+      h.opens[h.opens.length - 1].options.keepAllProfilesScope === undefined,
+    JSON.stringify(h.opens.map(entry => `${entry.id}:${entry.options.intent || 'switch'}`))
+  )
+  check(
+    '…and the app ends up focused on the clicked session',
+    host.state.focusedStoredSessionId.get() === 'r-1',
+    String(host.state.focusedStoredSessionId.get())
+  )
+
+  // 2. Nothing to dock (the clicked session is the only one): one open, one land.
+  host.state.profile.set('default')
+  h.opens.length = 0
+  h.openLandsOn = 'r-1'
+
+  await __internals.openSessionInProfile('zulu', [sessions[1]], 'r-1')
+
+  check(
+    'with nothing to dock, a cross-profile click is a single open',
+    plainOpens().length === 1 && h.opens.length === 1,
+    JSON.stringify(plainOpens().map(entry => entry.id))
+  )
+
+  // 3. Same profile: one plain open, no switch flags, no re-assert.
+  host.state.profile.set('zulu')
+  h.opens.length = 0
+
+  await __internals.openSessionInProfile('zulu', sessions, 'r-2')
+
+  check(
+    'a click INSIDE the active profile stays a single open',
+    h.opens.length === 1 && h.opens[0].id === 'r-2' && h.opens[0].options.keepAllProfilesScope === undefined,
+    JSON.stringify(h.opens)
+  )
+
+  // 4. "Open all in tabs" rides the same switch, so its main open gets the same
+  //    guarantee — and the re-assert must not add an open when nothing drifted.
+  host.state.profile.set('default')
+  h.opens.length = 0
+
+  await __internals.openProfileSessions({ name: 'zulu' }, many(2))
+
+  check(
+    'opening a whole profile still finishes on its main session, with no extra open',
+    h.opens.length === 2 && h.opens[1].options.intent === 'main' && host.state.focusedStoredSessionId.get() === 'r-0',
+    JSON.stringify(h.opens.map(entry => `${entry.id}:${entry.options.intent || 'switch'}`))
+  )
+
+  host.state.profile.set('default')
+  host.state.focusedStoredSessionId.set(null)
+}
 
 const failedNow = results.filter(r => !r.ok)
 

@@ -208,6 +208,12 @@ session tabs into per-profile buckets and a tab is filed into the bucket that is
 when it is created. **Open all in tabs** (right-click a profile) docks the same list
 without moving anything.
 
+And a cross-profile click opens the session **twice**: once to carry the move, and once
+at the very end. Every tab open focuses its own tile, so without that landing open the
+dock would leave you on the last tab — which reads as "it opened a random session, and
+only the second click lands on the one I wanted". The landing open is a plain open (no
+second switch), and it also covers a switch that restored a different conversation.
+
 One consequence worth knowing: the move is the app's own *workspace* switch, so the
 **Sessions** sidebar collapses onto the profile you moved to — widen it again with
 **All profiles** there.

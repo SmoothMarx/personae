@@ -3522,7 +3522,11 @@ function openProfileSessions(row, sessions) {
   // tab is what MOVES the app there, and the main open must not be created
   // before that has landed (see `switchingFlags`).
   const openMain = () => openSession(sessionIdOf(newest), name, 'main', rest.length ? null : switchingFlags(name))
-  return rest.length ? dockSessions(name, rest).then(openMain) : Promise.resolve(openMain())
+  // …and the main open can be undone by the very switch it rides on, exactly
+  // like a cross-profile session click (see reassertOpen).
+  const settle = () => reassertOpen(name, sessionIdOf(newest))
+
+  return (rest.length ? dockSessions(name, rest).then(openMain) : Promise.resolve(openMain())).then(settle)
 }
 
 /** Pedro, 2026-10-13: clicking a SESSION under another profile is a PROFILE
@@ -3552,6 +3556,45 @@ function openProfileSessions(row, sessions) {
  *
  *  Clicking INSIDE the profile the app is already on stays what it always was:
  *  open the session, leave the strip alone. */
+/** The session the app says is in front, as a STORED id (runtime ids are
+ *  reminted per resume, so they cannot be compared with what we clicked).
+ *  `null` on an SDK that does not expose it — and then the caller does nothing
+ *  rather than guessing. */
+function focusedStoredSession() {
+  const atom = host.state?.focusedStoredSessionId
+  const read = atom?.get
+
+  return typeof read === 'function' ? String(read.call(atom) || '') : ''
+}
+
+/** A cross-profile click needs a SECOND open, and this is why.
+ *
+ *  `planPluginOpenSession` turns that click into `switchWorkspace: profile` +
+ *  `showAllProfiles: false` — a real workspace switch. A switch RE-HOMES the
+ *  app: it restores that profile's own persisted tile set and brings up the
+ *  conversation core had in front there. So the navigation to the clicked id
+ *  races a restore that does not know about it, and the user lands on some
+ *  other session of the right profile — Pedro, 2026-10-17: "every time I click a
+ *  session from a different profile it opens a random session from that
+ *  profile; only the second click lands on the one I wanted".
+ *
+ *  So: check what is actually in front, and if it is not the target, click
+ *  again — the user's own workaround, done for them. Bounded (no poll loop): a
+ *  second mismatch means something else is wrong and saying so is cheaper than
+ *  fighting it. */
+function reassertOpen(profile, storedId, attempts = 0) {
+  const wanted = String(storedId)
+  const focused = focusedStoredSession()
+
+  if (!focused || focused === wanted || attempts >= 2) {
+    return Promise.resolve(focused === wanted)
+  }
+
+  return Promise.resolve(openSession(wanted, profile)).then(() =>
+    focusedStoredSession() === wanted ? true : reassertOpen(profile, wanted, attempts + 1)
+  )
+}
+
 function openSessionInProfile(profile, sessions, openId) {
   const name = String(profile || '')
   const id = String(openId || '')
@@ -3564,8 +3607,18 @@ function openSessionInProfile(profile, sessions, openId) {
     return openSession(id, name)
   }
 
-  return openSession(id, name, null, { expectHistory: true, keepAllProfilesScope: false }).then(() =>
-    dockSessions(name, sessions, id)
+  // The order is the fix, in three steps:
+  //  1. the click's own open carries the switch (core files tabs into whichever
+  //     profile is visible when they are CREATED, so the move must land first);
+  //  2. the profile's list docks beside it;
+  //  3. and only THEN is the clicked session put back in front — because every
+  //     tab open FOCUSES ITS OWN TILE, so the dock that follows step 1 would
+  //     otherwise leave the user on the last tab. That is the "random session"
+  //     the user was seeing, deterministically, on every cross-profile click
+  //     (the second click takes the same-profile path above and docks nothing).
+  return openSession(id, name, null, { expectHistory: true, keepAllProfilesScope: false })
+    .then(() => dockSessions(name, sessions, id))
+    .then(() => reassertOpen(name, id)
   )
 }
 

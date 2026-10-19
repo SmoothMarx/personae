@@ -103,9 +103,18 @@ export const host = {
   newChat(profile) {
     harness().newChats.push(profile)
   },
-  /** Open a session in the workspace. */
+  /** Open a session in the workspace. The app FOCUSES what it opened, so the
+   *  stub must too — `focusedStoredSessionId` is the atom the cross-profile fix
+   *  reads. `h.openLandsOn` forces where the NEXT open lands, which is how a
+   *  test reproduces "the switch restored a different session". */
   async openSession(id, options) {
-    harness().opens.push({ id, options })
+    const h = harness()
+
+    h.opens.push({ id, options })
+
+    const landing = h.openLandsOn
+    h.openLandsOn = null
+    host.state.focusedStoredSessionId.set(landing ?? id)
   },
   /** Sessions of another profile, read through the source primary. */
   async listPersistedSessions(route, options) {
