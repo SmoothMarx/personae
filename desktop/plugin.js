@@ -5082,22 +5082,53 @@ function nextSessionLimit({ count, ids, limit, wanted }) {
   return Math.min(SESSIONS_FILL_CAP, Math.max(limit + 1, limit * 6))
 }
 
-let archivedMemberCache = {}
+let memberRowCache = {}
 
-/** The archive page a group's members may need. Polls run every few seconds and
- *  a 500-row archive read per poll per profile is 200 KB of JSON nobody changed
- *  — so it is cached for one poll cycle's worth of staleness, not fetched fresh. */
-async function archivedMemberRows(profile) {
-  const key = String(profile)
-  const hit = archivedMemberCache[key]
+/** Rows for the members the profile's page could not answer, BY ID.
+ *
+ *  `session.list` serves live rows inside its page and nothing else, so three
+ *  members are invisible to it: an ARCHIVED one, one older than the page, and one
+ *  whose id a compaction has since reminted. Asking "which of the newest N are
+ *  these?" cannot be made to work for those; asking "what is behind these ids?"
+ *  can — the pane's own backend resolves each id through its lineage and returns
+ *  the live tip. Cached briefly: the roster polls every few seconds and this is a
+ *  write-free read of a handful of ids.
+ *
+ *  An older backend has no `/resolve`; the archive listing is then the only page
+ *  it can offer, and it is used as the fallback rather than leaving the box empty. */
+async function resolvedMemberRows(profile, ids) {
+  const rest = ctxRef?.rest
+
+  if (typeof rest !== 'function' || !ids.length) {
+    return []
+  }
+
+  const key = `${profile}|${ids.map(String).sort().join(',')}`
+  const hit = memberRowCache[key]
 
   if (hit && Date.now() - hit.at < 15000) {
     return hit.rows
   }
 
-  const rows = (await listArchivedSessions(key, SESSIONS_FILL_CAP)) || []
+  let rows = []
 
-  archivedMemberCache = { ...archivedMemberCache, [key]: { at: Date.now(), rows } }
+  try {
+    const data = await rest('/resolve', { body: { ids, profile }, method: 'POST' })
+
+    rows = Array.isArray(data?.sessions) ? data.sessions : []
+  } catch {
+    rows = []
+  }
+
+  if (!rows.length) {
+    const archived = (await listArchivedSessions(profile, SESSIONS_FILL_CAP)) || []
+
+    rows = archived
+      .filter(row => ids.map(String).includes(String(row?.id)))
+      .map(row => ({ ...row, archived: true }))
+  }
+
+  memberRowCache = { ...memberRowCache, [key]: { at: Date.now(), rows } }
 
   return rows
 }
@@ -5141,20 +5172,22 @@ async function listProfileSessions(profile) {
   }
 
   // A wanted member the live page cannot serve leaves a box that claims a
-  // session it cannot draw — and nothing tells the user why. Two shapes:
-  // `session.list` NEVER returns an archived session (so filing one from "View
-  // Archived" made an empty group), and it stops at the 500-row cap (so a very
-  // old one did the same). Ask the archive for exactly the missing ids; the row
-  // carries its archived chip, and the box draws what the store says it holds.
+  // session it cannot draw, and nothing tells the user why. THREE shapes, not
+  // one: `session.list` never returns an ARCHIVED session, it stops at the
+  // 500-row cap, and a compaction REmints a session's id — so an id filed
+  // before a compaction names a row the page no longer has. A page cannot be
+  // filtered into answering any of them; the ids have to be RESOLVED, which is
+  // what the pane's backend does (lineage included).
   const have = rowIdSet(loaded.sessions)
   const missing = wanted.map(String).filter(id => !have.has(id))
 
   if (missing.length) {
-    const archived = await archivedMemberRows(profile)
-
-    for (const row of archived || []) {
-      if (missing.includes(String(row?.id))) {
-        loaded.sessions = [...loaded.sessions, { ...row, archived: true }]
+    for (const row of await resolvedMemberRows(profile, missing)) {
+      // The row reports the live TIP; `_lineage_root_id` is what keeps a
+      // membership filed before a compaction matching (rowIdentities reads
+      // both), so the box keeps holding what the store says it holds.
+      if (!rowIdSet(loaded.sessions).has(String(row?.id))) {
+        loaded.sessions = [...loaded.sessions, row]
       }
     }
   }

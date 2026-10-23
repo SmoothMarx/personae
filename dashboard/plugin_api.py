@@ -37,7 +37,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
@@ -73,8 +73,9 @@ async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "plugin": "personae",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "readOnly": False,
+        "resolve": True,
         "state": True,
         "title": True,
         "search_roles": True,
@@ -218,6 +219,85 @@ async def set_title(request: Request) -> JSONResponse:
             db.close()
         except Exception:
             pass
+
+
+@router.post("/resolve")
+async def resolve(request: Request) -> JSONResponse:
+    """Rows for specific stored session ids, whatever state they are in.
+
+    A group's box draws its members out of ``session.list``, which only ever serves LIVE
+    rows inside its page — so a member that is archived, older than that page, or whose id
+    was reminted by a compaction is a member the pane cannot draw: the group claims a
+    session and shows nothing. This answers the question the pane actually has: "what is
+    behind THESE ids?" — each resolved through its lineage, so an id filed before a
+    compaction still finds the live tip (and the tip is what the row reports).
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - a malformed body is an empty request, not a 500
+        body = {}
+
+    profile = str(body.get("profile") or "")
+    ids = [str(value) for value in (body.get("ids") or []) if str(value or "").strip()][:50]
+
+    if not ids:
+        return JSONResponse({"profile": profile, "sessions": []})
+
+    try:
+        db = _store(profile)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}", "profile": profile, "sessions": []})
+
+    if db is None:
+        return JSONResponse({"profile": profile, "sessions": []})
+
+    denied = _denied_sources()
+    out: List[Dict[str, Any]] = []
+
+    try:
+        for wanted in ids:
+            try:
+                chain = db._session_lineage_root_to_tip(wanted) or []
+            except Exception:  # noqa: BLE001 - an id with no lineage is still an id
+                chain = []
+
+            tip = chain[-1] if chain else wanted
+            row: Optional[Dict[str, Any]] = None
+
+            for candidate in (tip, wanted):
+                try:
+                    row = db.get_session(candidate)
+                except Exception:  # noqa: BLE001
+                    row = None
+
+                if row:
+                    break
+
+            if not row:
+                continue
+
+            if (row.get("source") or "").strip().lower() in denied:
+                continue
+
+            out.append(
+                {
+                    "_lineage_root_id": chain[0] if chain else row.get("id"),
+                    "archived": bool(row.get("archived")),
+                    "id": row.get("id"),
+                    "last_active": row.get("last_activity_at") or row.get("last_active"),
+                    "message_count": row.get("message_count"),
+                    "preview": row.get("preview") or "",
+                    "source": row.get("source") or "",
+                    "title": row.get("title") or row.get("display_name") or "",
+                }
+            )
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return JSONResponse({"count": len(out), "profile": profile, "sessions": out})
 
 
 @router.get("/archived")

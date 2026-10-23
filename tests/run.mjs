@@ -7838,6 +7838,83 @@ h.rest.byProfile = {}
   __internals.$sessionGroups.set({})
 }
 
+// ── 2026-10-17: a member the page cannot serve is RESOLVED, not filtered ────
+// `session.list` serves live rows inside its page and nothing else. Filing an
+// ARCHIVED session, one older than the page, or one whose id a compaction has
+// reminted leaves a group that holds a session and draws nothing — which is what
+// "I can't add it, and if it is added I don't see it" looks like from outside.
+{
+  const realList = h.responses['session.list']
+  const profile = 'resolver'
+  const live = Array.from({ length: 12 }, (_, i) => ({
+    id: `rv-${i}`,
+    last_activity_at: 9000 - i,
+    preview: `row ${i}`,
+    resolved_id: `rr-${i}`,
+    source: 'desktop',
+    title: `Recent ${i}`
+  }))
+
+  h.responses['session.list'] = ({ limit }) => ({ sessions: live.slice(0, limit || 10) })
+  __internals.$sessionGroups.set({})
+  __internals.$expanded.set({})
+
+  const group = __internals.createSessionGroup(profile, 'job hunt', [])
+
+  // The id the pane filed: the session has since COMPACTED, so the page knows the
+  // tip only. This is the case a page filter can never solve.
+  __internals.moveSessionsToGroup(profile, ['old-id'], group)
+
+  h.rest.calls.length = 0
+  h.rest.writes = []
+  h.rest.byProfile = {
+    [profile]: {
+      sessions: [
+        {
+          _lineage_root_id: 'old-id',
+          archived: false,
+          id: 'tip-1',
+          last_active: 8000,
+          message_count: 12,
+          preview: 'p',
+          source: 'desktop',
+          title: 'Job hunt thread'
+        }
+      ]
+    }
+  }
+
+  const page = await __internals.listProfileSessions(profile)
+  const drawn = __internals.sessionGroupBlocks(page, __internals.$sessionGroups.get(), profile, [])
+
+  check(
+    'a member the page cannot serve is asked for BY ID',
+    h.rest.writes.some(
+      entry => entry.path === '/resolve' && entry.method === 'POST' && (entry.body?.ids || []).includes('old-id')
+    ),
+    JSON.stringify(h.rest.writes)
+  )
+  check(
+    '…and the profile it belongs to rides with the question',
+    h.rest.writes.some(entry => entry.path === '/resolve' && entry.body?.profile === profile),
+    JSON.stringify(h.rest.writes)
+  )
+  check(
+    'a compacted member is drawn through its lineage (root id, live tip)',
+    drawn.some(block => block.id === group && block.sessions.some(row => String(row.id) === 'tip-1')),
+    JSON.stringify(drawn.map(b => [b.id, b.sessions.map(s => s.id)]))
+  )
+  check(
+    '…and the page itself never had to contain it',
+    !page.some(row => String(row.id) === 'old-id'),
+    JSON.stringify(page.map(row => row.id))
+  )
+
+  h.responses['session.list'] = realList
+  h.rest.byProfile = {}
+  __internals.$sessionGroups.set({})
+}
+
 const failedNow = results.filter(r => !r.ok)
 
 console.log(`\n${results.length - failedNow.length}/${results.length} passed`)
