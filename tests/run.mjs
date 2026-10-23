@@ -1439,24 +1439,33 @@ check(
 }
 
 {
-  // ONE DOOR: a row that IS live still renames through the backend, because
-  // `session.title` cannot take a stored id and "try the RPC first" is how this
-  // bug came back twice. The runtime id must not appear on the wire at all.
+  // TWO AUTHORITIES. The store is the durable title; the RUNNING session object is
+  // what core's auto-titler consults. A live row therefore needs both writes, or
+  // the first turn of a young chat overwrites the name the user just typed —
+  // Pedro, 2026-10-17: "I can't successfully rename a session until it's given me
+  // some sort of response." The stored id still goes only to the backend.
   const before = h.requests.length
 
   h.rest.byProfile = { zulu: { ok: true, session_key: 'sess-zulu-9', title: 'Better name' } }
   h.rest.writes = []
+  h.requests.length = 0
 
   const renamed = await __internals.renameSession({ id: 'sess-zulu-9', resolved_id: 'runtime-9' }, 'zulu', 'Better name')
+  const told = h.requests.find(entry => entry.method === 'session.title')
 
   check(
-    'a LIVE row renames through the SAME backend door — no RPC, no runtime id on the wire',
+    'a LIVE row renames through the backend AND tells the running session',
     renamed === true &&
-      h.requests.length === before &&
       h.rest.writes?.[0]?.body?.session_id === 'sess-zulu-9' &&
-      !JSON.stringify(h.rest.writes).includes('runtime-9'),
-    JSON.stringify(h.rest.writes)
+      told?.params?.session_id === 'runtime-9' &&
+      told?.params?.title === 'Better name',
+    JSON.stringify({ requests: h.requests.map(r => r.method), writes: h.rest.writes })
   )
+  check(
+    '…and the STORED id is never the one the RPC is given (it 4001s every one)',
+    told && told.params.session_id !== 'sess-zulu-9' && !JSON.stringify(h.rest.writes).includes('runtime-9')
+  )
+  h.requests.length = before === 0 ? 0 : h.requests.length
 }
 
 {
@@ -1488,6 +1497,13 @@ check(
 }
 
 {
+  // Neither door knows the session: the store has no row and the gateway refuses
+  // the id too. The backend's sentence is the honest one — it names the session.
+  const realTitle = h.responses['session.title']
+
+  h.responses['session.title'] = () => {
+    throw new Error('4001 session not found')
+  }
   h.rest.byProfile = { zulu: { detail: 'no session sess-gone in zulu', error: 'session_not_found' } }
 
   let said = ''
@@ -1498,10 +1514,37 @@ check(
     said = String(error.message || error)
   }
 
+  h.responses['session.title'] = realTitle
+
   check(
     'a backend 404 becomes the backend’s own sentence, so the toast names the session',
     said.includes('no session sess-gone in zulu'),
     said
+  )
+}
+
+{
+  // A chat that exists ONLY as a live session: nothing has written a row yet, so
+  // the stored door answers "no such session" and the gateway is the only door
+  // there is. This is the "until it has answered me" case.
+  h.rest.byProfile = { zulu: { detail: 'no session draft-1 in zulu', error: 'session_not_found' } }
+  h.rest.writes = []
+  h.requests.length = 0
+  h.responses['session.title'] = () => ({ title: 'ok' })
+
+  const renamed = await __internals.renameSession({ id: 'draft-1', resolved_id: 'runtime-draft-1' }, 'zulu', 'First chat')
+
+  check(
+    'a chat with no stored row renames through the gateway alone',
+    renamed === true &&
+      h.requests.some(
+        entry => entry.method === 'session.title' && entry.params?.session_id === 'runtime-draft-1' && entry.params?.title === 'First chat'
+      ),
+    JSON.stringify({ requests: h.requests.map(e => e.method), writes: h.rest.writes })
+  )
+  check(
+    '…and it does not then claim a stored row it never wrote',
+    (h.rest.writes || []).filter(entry => entry.path === '/title').length === 1
   )
 }
 

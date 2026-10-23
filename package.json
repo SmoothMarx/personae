@@ -1,6 +1,6 @@
 {
   "name": "hermes-plugin-personae",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "private": true,
   "description": "Personae - a Hermes Desktop plugin that merges your bot roster with each profile's live sessions in one tab.",
   "type": "module",

@@ -3899,24 +3899,68 @@ async function renameSession(session, profile, title) {
     throw new Error('Renaming needs the Personae backend, and it is not mounted in this build.')
   }
 
-  let answer
+  // Two AUTHORITIES, not two guesses. The store is the durable title; the
+  // running session object is what core's auto-titler consults — so a rename
+  // that writes only the store is silently UNDONE by the first turn of a young
+  // chat, which is exactly what "I can't rename it until it has answered me"
+  // looks like from the outside (Pedro, 2026-10-17).
+  //
+  // The id decides the door, and each id shape has exactly one legitimate door:
+  //   stored id → the pane's backend (works for a session that is not running)
+  //   live id   → `session.title` (the only thing core will accept for a RUNNING
+  //               session; it 4001s every stored id, which is why the stored door
+  //               is not a fallback for it but the primary for the other shape)
+  const liveId = String(session?.resolved_id || session?.openId || '').trim()
+  let answer = null
+  let said = ''
 
   try {
     answer = await rest('/title', { body: { profile, session_id: storedId, title: name }, method: 'POST' })
   } catch (error) {
-    const said = String(error?.message || error || '')
+    said = String(error?.message || error || '')
+  }
 
-    // 403/404 with no detail is the ROUTE missing, not the session: an older
-    // backend half predates /title.
+  const stored = Boolean(answer) && !answer.error
+  const missing = answer?.error === 'session_not_found' || (!answer && /\b40[34]\b/.test(said))
+
+  // A chat created in this window can exist ONLY as a live session: nothing has
+  // written a row yet, so the stored door answers "no such session" and the
+  // gateway is the only door there is.
+  if (missing) {
+    // The store has no such row, so the id we are holding cannot be a STORED id:
+    // it is the gateway's own id for a chat that has not been written yet. Try
+    // the gateway with it — this is the "until it has answered me" case — and
+    // only then admit that neither door knows it.
+    const candidate = liveId || storedId
+
+    try {
+      await host.request('session.title', { session_id: candidate, title: name })
+
+      return true
+    } catch (error) {
+      const why = String(error?.message || error || '')
+
+      throw new Error(String(answer?.detail || why || `Could not rename this session (${storedId || 'no id'}).`))
+    }
+  }
+
+  if (!stored) {
     throw new Error(
       /\b40[34]\b/.test(said)
         ? `Rename failed — the Personae backend half is older than the plugin (restart it): ${said}`
-        : `Rename failed: ${said || 'the backend did not answer'}`
+        : `Rename failed: ${said || answer?.detail || 'the backend did not answer.'}`
     )
   }
 
-  if (!answer || answer.error) {
-    throw new Error(String(answer?.detail || 'Could not rename this session.'))
+  // The store took it. If this session is RUNNING, tell it too: its own title is
+  // what auto-titling will overwrite on the next turn. Best effort by design —
+  // the durable write already succeeded, and a non-running row has no live id.
+  if (liveId) {
+    try {
+      await host.request('session.title', { session_id: liveId, title: name })
+    } catch {
+      // A live id that the gateway no longer holds is not a rename failure.
+    }
   }
 
   return true
