@@ -7736,6 +7736,108 @@ h.rest.byProfile = {}
   host.state.focusedStoredSessionId.set(null)
 }
 
+// ── 2026-10-17: a filed session has to APPEAR, from either drill-down ───────
+// "when I assign them to a group, they don't show up" + "when I finish renaming
+// the group, it should populate with the selected session that started it".
+// The box draws members out of the profile's session page — so a member the page
+// cannot serve (an ARCHIVED row: session.list never returns those) or a page the
+// roster has not refetched yet made a group that claimed a session it did not
+// draw.
+{
+  const realList = h.responses['session.list']
+  const profile = 'filer'
+  const live = [
+    { id: 'f-live', resolved_id: 'r-f-live', title: 'Live one', preview: 'p', last_activity_at: 5000, source: 'desktop' },
+    { id: 'f-old', resolved_id: 'r-f-old', title: 'Older live one', preview: 'q', last_activity_at: 4000, source: 'desktop' }
+  ]
+  const archivedRow = {
+    archived: true,
+    id: 'f-arch',
+    last_activity_at: 1000,
+    preview: 'z',
+    source: 'desktop',
+    title: 'Archived one'
+  }
+
+  const blocksFor = async () => {
+    const rows = await __internals.listProfileSessions(profile)
+
+    return __internals.sessionGroupBlocks(rows, __internals.$sessionGroups.get(), profile, [])
+  }
+  const inGroup = (blocks, id) => blocks.flatMap(entry => entry.sessions).some(row => String(row.id) === id)
+
+  // 1. "View all": the row IS in the live page.
+  h.responses['session.list'] = () => ({ sessions: live })
+  h.rest.byProfile = { [profile]: { sessions: [] } }
+  __internals.$listView.set({ kind: 'all', profile })
+  __internals.$expanded.set({})
+
+  const made = __internals.createGroupHere(profile, ['f-old'])
+
+  check(
+    'a group made from "View all" files the session it was made on',
+    Boolean(made?.id) && __internals.$sessionGroups.get()[profile]?.members?.['f-old'] === made.id,
+    JSON.stringify({ made, store: __internals.$sessionGroups.get()[profile] })
+  )
+  check(
+    '…and the pane lands on the screen that draws it (row expanded, drill-down closed)',
+    __internals.$listView.get() === null && __internals.$expanded.get()[profile] === true,
+    JSON.stringify({ expanded: __internals.$expanded.get(), view: __internals.$listView.get() })
+  )
+
+  let blocks = await blocksFor()
+
+  check('…so the box already holds it', inGroup(blocks, 'f-old'), JSON.stringify(blocks.map(b => [b.id, b.sessions.map(s => s.id)])))
+
+  // 2. Finishing the rename must not lose the member.
+  __internals.renameSessionGroup(profile, made.id, 'Trip planning')
+  blocks = await blocksFor()
+
+  check(
+    'finishing the rename keeps the starting session in the box',
+    inGroup(blocks, 'f-old') &&
+      blocks.some(entry => entry.id === made.id && entry.name === 'Trip planning'),
+    JSON.stringify(blocks.map(b => [b.name, b.sessions.map(s => s.id)]))
+  )
+
+  // 3. "View archived": the row is NOT in session.list at all — the archive is
+  //    the only place it exists.
+  h.responses['session.list'] = () => ({ sessions: live })
+  h.rest.byProfile = { [profile]: { sessions: [archivedRow] } }
+  __internals.$listView.set({ kind: 'archived', profile })
+
+  const arch = __internals.createGroupHere(profile, ['f-arch'])
+
+  blocks = await blocksFor()
+
+  check(
+    'a group made from "View archived" draws its archived member',
+    Boolean(arch?.id) && inGroup(blocks, 'f-arch'),
+    JSON.stringify(blocks.map(b => [b.id, b.sessions.map(s => s.id)]))
+  )
+  check(
+    '…and the merged row still SAYS it is archived',
+    blocks.some(entry => entry.sessions.some(row => row.id === 'f-arch' && row.archived === true)),
+    JSON.stringify(blocks.flatMap(b => b.sessions).map(s => [s.id, s.archived]))
+  )
+
+  // 4. Assignment is the same promise as creation.
+  __internals.moveSessionsToGroup(profile, ['f-arch'], arch.id)
+  blocks = await blocksFor()
+
+  check(
+    'assigning an archived session to a group shows it there',
+    inGroup(blocks, 'f-arch'),
+    JSON.stringify(blocks.map(b => [b.id, b.sessions.map(s => s.id)]))
+  )
+
+  h.responses['session.list'] = realList
+  h.rest.byProfile = {}
+  __internals.$listView.set(null)
+  __internals.$expanded.set({})
+  __internals.$sessionGroups.set({})
+}
+
 const failedNow = results.filter(r => !r.ok)
 
 console.log(`\n${results.length - failedNow.length}/${results.length} passed`)

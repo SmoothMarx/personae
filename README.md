@@ -203,6 +203,13 @@ moves to that profile first and the tab strip follows — that profile's visible
 | A session under the profile the app is **already on** | The session opens; the strip is left alone |
 | A session under **another** profile | The app moves to that profile, the strip swaps to it, and its list (≤10, minus the row you clicked) docks as tabs |
 
+A group holds whatever you file into it, including a session the live list cannot serve: an
+**archived** one (filed from *View Archived*) is drawn inside the group with its archived
+chip, because the box would otherwise claim a member it never showed. Creating a group from
+a drill-down files the row it was made on, renames it in place, and returns you to the
+roster with that profile expanded — the surface where the group, and the session in it, are
+actually drawn.
+
 The order is the point: the move lands *before* anything docks, because core files
 session tabs into per-profile buckets and a tab is filed into the bucket that is visible
 when it is created. **Open all in tabs** (right-click a profile) docks the same list

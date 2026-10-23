@@ -1363,11 +1363,23 @@ function nextSectionName() {
  *  try to create a new session group by right-clicking a session that is in the
  *  'view all' it doesn't work." (It did not, for a duller reason: the row menu
  *  was never given the verb — see SessionListView.) */
+/** The roster's page is fetched per profile and keyed by the OPEN set, so a
+ *  membership write has to invalidate it: otherwise "assigned to a group but it
+ *  does not show up" is exactly right until the next poll (Pedro, 2026-10-17). */
+function refreshGroupedSessionLists() {
+  void queryClient?.invalidateQueries?.({ queryKey: ['personae', 'sessions'] })
+}
+
 function createGroupHere(profile, sessionIds, options) {
   const made = createGroupNow(profile, sessionIds, options)
 
   if (made) {
+    // Land where the group is DRAWN: a group box only renders inside an
+    // expanded profile row, so coming back from a drill-down with the row shut
+    // would make a successful group look like a no-op.
+    $expanded.set({ ...$expanded.get(), [String(profile)]: true })
     $listView.set(null)
+    refreshGroupedSessionLists()
   }
 
   return made
@@ -1540,6 +1552,9 @@ function moveSessionsToGroup(profile, sessionIds, groupId) {
     collapsed: current.collapsed.filter(id => id !== known),
     members
   })
+  // Filing changes what the roster must draw, and the row may only exist in the
+  // archive (see listProfileSessions) — refresh now instead of at the next poll.
+  refreshGroupedSessionLists()
   // Only a REAL release, and only from a group: filing one in is not news, and
   // a session that was already ungrouped has not gone anywhere.
   noteReleased(profile, freed)
@@ -5067,6 +5082,26 @@ function nextSessionLimit({ count, ids, limit, wanted }) {
   return Math.min(SESSIONS_FILL_CAP, Math.max(limit + 1, limit * 6))
 }
 
+let archivedMemberCache = {}
+
+/** The archive page a group's members may need. Polls run every few seconds and
+ *  a 500-row archive read per poll per profile is 200 KB of JSON nobody changed
+ *  — so it is cached for one poll cycle's worth of staleness, not fetched fresh. */
+async function archivedMemberRows(profile) {
+  const key = String(profile)
+  const hit = archivedMemberCache[key]
+
+  if (hit && Date.now() - hit.at < 15000) {
+    return hit.rows
+  }
+
+  const rows = (await listArchivedSessions(key, SESSIONS_FILL_CAP)) || []
+
+  archivedMemberCache = { ...archivedMemberCache, [key]: { at: Date.now(), rows } }
+
+  return rows
+}
+
 /** `session.list` = most recent first, sub-agent/kanban sources already denied.
  *  The page is as small as it has always been unless something this profile
  *  filed or linked is missing from it, in which case it widens — a few requests
@@ -5105,6 +5140,25 @@ async function listProfileSessions(profile) {
     loaded = await page(limit)
   }
 
+  // A wanted member the live page cannot serve leaves a box that claims a
+  // session it cannot draw — and nothing tells the user why. Two shapes:
+  // `session.list` NEVER returns an archived session (so filing one from "View
+  // Archived" made an empty group), and it stops at the 500-row cap (so a very
+  // old one did the same). Ask the archive for exactly the missing ids; the row
+  // carries its archived chip, and the box draws what the store says it holds.
+  const have = rowIdSet(loaded.sessions)
+  const missing = wanted.map(String).filter(id => !have.has(id))
+
+  if (missing.length) {
+    const archived = await archivedMemberRows(profile)
+
+    for (const row of archived || []) {
+      if (missing.includes(String(row?.id))) {
+        loaded.sessions = [...loaded.sessions, { ...row, archived: true }]
+      }
+    }
+  }
+
   return loaded.sessions
 }
 
@@ -5138,7 +5192,7 @@ async function listHiddenSessions(profile) {
   return all.filter(session => hidden.has(String(session?.id || '')))
 }
 
-async function listArchivedSessions(profile) {
+async function listArchivedSessions(profile, limit = 60) {
   const rest = ctxRef?.rest
 
   if (typeof rest !== 'function') {
@@ -5148,7 +5202,7 @@ async function listArchivedSessions(profile) {
   let data
 
   try {
-    data = await rest(`/archived?profile=${encodeURIComponent(profile)}&limit=60`)
+    data = await rest(`/archived?profile=${encodeURIComponent(profile)}&limit=${Number(limit) || 60}`)
   } catch {
     // A REACHABLE archive that errored is not an empty archive: both this and
     // the throwing case must read as "cannot tell", or the view claims there is
