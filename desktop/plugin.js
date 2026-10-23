@@ -1355,6 +1355,24 @@ function nextSectionName() {
 /** Make the group FIRST, name it second: the field that follows is a RENAME —
  *  it opens on a group that already exists, so a lost keystroke can no longer
  *  lose the group. Returns `{id, name}`. */
+/** Make a group and hand the user back to the screen that draws it.
+ *
+ *  Groups are drawn on the roster, and so is the rename field that opens on a
+ *  new one — so creating a group from a drill-down has to CLOSE the drill-down,
+ *  or the group is made somewhere the user cannot see. Pedro, 2026-10-17: "if I
+ *  try to create a new session group by right-clicking a session that is in the
+ *  'view all' it doesn't work." (It did not, for a duller reason: the row menu
+ *  was never given the verb — see SessionListView.) */
+function createGroupHere(profile, sessionIds, options) {
+  const made = createGroupNow(profile, sessionIds, options)
+
+  if (made) {
+    $listView.set(null)
+  }
+
+  return made
+}
+
 function createGroupNow(profile, sessionIds, options) {
   const apropos = options?.apropos === true
   const name = options?.name || nextGroupName(profile, apropos)
@@ -9909,6 +9927,9 @@ function SessionListView({
   nowMs,
   onArchiveUpTo,
   onBack,
+  onCreateAproposGroup,
+  onMoveGroup,
+  onNewGroup,
   onRenameCancel,
   onRenameSession,
   onRenameSubmit,
@@ -9930,6 +9951,11 @@ function SessionListView({
   const needle = String(useValue($listView)?.query || '').trim().toLowerCase()
   const hiddenState = useValue($hiddenSessions)
   const hiddenIds = new Set((hiddenState[String(profile)] || []).map(String))
+  // Which group each drawn row belongs to. Without this the row cannot say what
+  // it is filed under, and "Move to group" has nothing to list — the menu was
+  // drawn on this screen before it could act on it.
+  const groupState = useValue($sessionGroups)
+  const groupSlice = profileSessionGroups(groupState, profile)
   // One filter box for every kind: these pages run to hundreds of rows, and the
   // drill-down is where a user looks for something they can already name.
   const [filter, setFilter] = useState('')
@@ -10039,6 +10065,14 @@ function SessionListView({
         jsx(
           SessionRow,
           {
+            // Group facts, from the SAME store the roster reads. `group` is the
+            // box the row sits in; `aproposGroup` is what draws the diamond.
+            aproposGroup: groupSlice.groups.some(
+              entry =>
+                entry.apropos === true && entry.id === groupSlice.members[String(session.id)]
+            ),
+            group: groupSlice.members[String(session.id)] || null,
+            groups: groupSlice.groups,
             editing: Boolean(
               editingSession &&
                 editingSession.profile === profile &&
@@ -10048,6 +10082,23 @@ function SessionListView({
             // The bulk-archive cut travels with the row in here too: this list
             // is where the old sessions the user wants gone actually live.
             onArchiveUpTo,
+            // The Group menu's three verbs. The Apropos one takes the TICK SET
+            // when there is one (the right-click rule has already made the row
+            // real), exactly like the roster's.
+            onCreateAproposGroup: () =>
+              onCreateAproposGroup(
+                ticks.length
+                  ? ticks
+                  : [
+                      {
+                        profile,
+                        session_id: String(session.id),
+                        title: String(session.title || session.preview || session.id)
+                      }
+                    ]
+              ),
+            onMoveGroup: payload => onMoveGroup(profile, payload, selectedKeys),
+            onNewGroup: () => onNewGroup(profile, [session.id]),
             onRename: onRenameSession,
             onRenameCancel,
             // The SESSION, not its id: renaming needs the live id too (see renameSession).
@@ -10880,6 +10931,35 @@ function MessengerPane() {
       kind: view.kind,
       nowMs,
       onArchiveUpTo: openArchiveUpTo,
+      // The drill-down draws real SessionRows, and a SessionRow's Group menu
+      // calls three handlers. None of them were passed here, so the verbs threw
+      // on `undefined` and the menu item did nothing — one screen's menu must be
+      // the same menu, not the same labels.
+      onCreateAproposGroup: entries => {
+        const list = entries?.length ? entries : []
+
+        return aproposCreateGroup(list).then(made => {
+          if (made.length) {
+            setRenamingGroup({ id: made[0].groupId, name: made[0].name })
+            $listView.set(null)
+          }
+
+          return made
+        })
+      },
+      onMoveGroup: (name, payload, keys) =>
+        moveSessionsToGroup(
+          name,
+          sessionGroupMoveTargets({ profile: name, selectedKeys: keys, sessionId: payload?.sessionId }),
+          payload?.groupId ?? null
+        ),
+      onNewGroup: (name, sessionIds) => {
+        const made = createGroupHere(name, sessionIds)
+
+        if (made) {
+          setRenamingGroup(made)
+        }
+      },
       onBack: () => $listView.set(null),
       onRenameCancel: () => setEditingSession(null),
       onRenameSession: (session, name) => setEditingSession({ id: session.id, profile: name }),
@@ -11688,6 +11768,7 @@ export const __internals = {
   SectionHeading,
   SessionGroupHeading,
   SessionRow,
+  createGroupHere,
   createSessionGroup,
   deleteSessionGroup,
   GroupColorRow,

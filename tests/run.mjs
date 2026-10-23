@@ -7531,6 +7531,51 @@ check(
   )
 }
 
+{
+  // Pedro, 2026-10-17: "if I try to create a new session group by right-clicking
+  // a session that is in the 'view all' it doesn't work." The drill-down draws
+  // real SessionRows, and a row's Group menu calls three handlers — the pane
+  // passed none of them, so every verb in that submenu threw on `undefined`.
+  const src = readFileSync(new URL('./plugin.js', import.meta.url), 'utf8')
+  const view = src.slice(src.indexOf('function SessionListView({'), src.indexOf('/** Read a picked file as a data URL'))
+  const at = src.indexOf('if (view) {')
+  const call = src.slice(at, src.indexOf('let body', at))
+
+  check(
+    'the drill-down receives the group verbs its rows call',
+    ['onNewGroup:', 'onMoveGroup:', 'onCreateAproposGroup:'].every(key => call.includes(key)),
+    'the pane returns a SessionListView without the verbs its own rows invoke'
+  )
+  check(
+    'and hands them to every row, with the group facts the menu reads',
+    [
+      'onNewGroup: () => onNewGroup(profile, [session.id])',
+      'onMoveGroup: payload => onMoveGroup(profile, payload, selectedKeys)',
+      'groups: groupSlice.groups',
+      'group: groupSlice.members[String(session.id)]'
+    ].every(key => view.includes(key)),
+    'a row in the drill-down cannot file itself'
+  )
+
+  // Behaviour, not wiring: a group made from here FILES the row and hands the
+  // pane back to the roster — which is where the group, and the rename field
+  // that opens on it, are drawn.
+  __internals.$sessionGroups.set({})
+  __internals.$listView.set({ kind: 'all', profile: 'zulu' })
+
+  const made = __internals.createGroupHere('zulu', ['sess-zulu-list-1'])
+
+  check(
+    'a group created from a drill-down files the session and returns to the roster',
+    Boolean(made && made.id) &&
+      __internals.$sessionGroups.get().zulu?.members?.['sess-zulu-list-1'] === made.id &&
+      __internals.$listView.get() === null,
+    JSON.stringify({ made, store: __internals.$sessionGroups.get(), view: __internals.$listView.get() })
+  )
+
+  __internals.$sessionGroups.set({})
+}
+
 // ── D5: silence is not an answer ──────────────────────────────────────────
 
 __internals.$listView.set(null)
