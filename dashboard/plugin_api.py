@@ -36,6 +36,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 from pathlib import Path
@@ -75,7 +77,7 @@ async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "plugin": "personae",
-        "version": "0.7.0",
+        "version": "0.8.0",
         "readOnly": False,
         "resolve": True,
         "state": True,
@@ -221,6 +223,125 @@ async def set_title(request: Request) -> JSONResponse:
             db.close()
         except Exception:
             pass
+
+
+TEXT_PREVIEW_LIMIT = 256 * 1024
+
+
+def _inside_home(path: str) -> tuple:
+    """`(resolved, error)` for a caller-supplied path.
+
+    Resolving first is the whole guard: `/home/you/link → /etc` resolves outside
+    the root, so a symlink cannot walk out of it either.
+    """
+    root = Path.home().resolve()
+
+    try:
+        # A relative path is read as home-relative: the pane always sends absolute
+        # paths, and a caller typing `Projects` should mean `~/Projects`, not the
+        # backend process's working directory.
+        given = Path(path).expanduser() if path else root
+        target = (given if given.is_absolute() else root / given).resolve()
+    except (OSError, RuntimeError):
+        return None, "bad_path"
+
+    if target != root and root not in target.parents:
+        return None, "outside_root"
+
+    return target, None
+
+
+@router.get("/file")
+async def file_text(path: str = "", max_bytes: int = Query(TEXT_PREVIEW_LIMIT, ge=1, le=2 * 1024 * 1024)) -> Dict[str, Any]:
+    """A text preview of one file — read-only, capped, and binary-honest.
+
+    Capped because a 400 MB log is not a preview; binary-honest because handing a
+    PNG's first bytes to a text control renders mojibake that looks like a bug in
+    the pane rather than a property of the file.
+    """
+    target, error = _inside_home(path)
+
+    if error:
+        return {"binary": False, "error": error, "path": str(path), "text": ""}
+
+    if not target.is_file():
+        return {"binary": False, "error": "not_a_file", "path": str(target), "text": ""}
+
+    try:
+        size = target.stat().st_size
+        with target.open("rb") as handle:
+            raw = handle.read(max_bytes)
+    except OSError as exc:
+        return {"binary": False, "error": "unreadable", "detail": f"{type(exc).__name__}: {exc}", "path": str(target), "text": ""}
+
+    binary = b"\x00" in raw[:8192]
+    text = "" if binary else raw.decode("utf-8", "replace")
+
+    return {
+        "binary": binary,
+        "error": None,
+        "lines": 0 if binary else text.count("\n") + 1,
+        "path": str(target),
+        "size": size,
+        "text": text,
+        "truncated": size > len(raw),
+    }
+
+
+@router.post("/open")
+async def open_file(request: Request) -> JSONResponse:
+    """Ask the BACKEND to open a path in its editor or file manager.
+
+    Best effort by design, and honest about it: these paths are on the machine the
+    sessions run on, which may be headless. `PERSONAE_EDITOR` (shell words, the
+    path is appended) is the escape hatch; `xdg-open`/`open` follow. If nothing can
+    run, the answer says why instead of pretending something happened.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+
+    target_name = str(body.get("target") or "editor")
+    target, error = _inside_home(str(body.get("path") or ""))
+
+    if error:
+        return JSONResponse({"error": error, "ok": False}, status_code=403 if error == "outside_root" else 400)
+
+    if not target.exists():
+        return JSONResponse({"error": "missing", "ok": False, "path": str(target)}, status_code=404)
+
+    editor = os.environ.get("PERSONAE_EDITOR") or ""
+
+    if target_name == "editor" and editor:
+        command = [*shlex.split(editor), str(target)]
+    elif target_name == "editor":
+        command = ["xdg-open", str(target)] if sys.platform.startswith("linux") else ["open", str(target)]
+    else:
+        folder = str(target if target.is_dir() else target.parent)
+        command = ["xdg-open", folder] if sys.platform.startswith("linux") else ["open", folder]
+
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and not editor:
+        return JSONResponse(
+            {
+                "detail": "the backend has no desktop session (no DISPLAY) — set PERSONAE_EDITOR to an editor command, or use Copy path",
+                "error": "no_opener",
+                "ok": False,
+            }
+        )
+
+    try:
+        subprocess.Popen(  # noqa: S603 - the command is ours; the path is resolved inside home
+            command,
+            close_fds=True,
+            start_new_session=True,
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"detail": f"{type(exc).__name__}: {exc}", "error": "spawn_failed", "ok": False})
+
+    return JSONResponse({"command": command, "ok": True})
 
 
 @router.get("/files")

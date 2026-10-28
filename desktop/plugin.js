@@ -10746,6 +10746,37 @@ function fileSizeLabel(bytes) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
+/** A text preview of one file, capped and binary-honest on the backend side. */
+async function readFilePreview(path) {
+  const rest = ctxRef?.rest
+
+  if (typeof rest !== 'function') {
+    return { binary: false, error: 'no_backend', text: '' }
+  }
+
+  try {
+    return (await rest(`/file?path=${encodeURIComponent(String(path || ''))}`)) || { error: 'no_answer', text: '' }
+  } catch (error) {
+    return { binary: false, error: String(error?.message || error || 'unreachable'), text: '' }
+  }
+}
+
+/** Open on the BACKEND — the machine the paths live on, which may be headless.
+ *  The route answers `ok:false` with a reason instead of pretending. */
+async function openOnBackend(path, target) {
+  const rest = ctxRef?.rest
+
+  if (typeof rest !== 'function') {
+    return { error: 'no_backend', ok: false }
+  }
+
+  try {
+    return (await rest('/open', { body: { path, target }, method: 'POST' })) || { error: 'no_answer', ok: false }
+  } catch (error) {
+    return { error: String(error?.message || error || 'unreachable'), ok: false }
+  }
+}
+
 /** One directory. `path` empty means "the backend's home", so the tab can open
  *  before it knows where anything is. */
 async function listDirectory(path) {
@@ -10765,7 +10796,7 @@ async function listDirectory(path) {
 /** The rows of ONE expanded folder. Recursion in the tree is recursion in the
  *  component: every level owns its own query, which is what keeps a deep tree to
  *  the folders the user actually opened. */
-function FileDirectory({ depth, expired, onToggle, path, t }) {
+function FileDirectory({ depth, expired, onOpen, onToggle, path, t }) {
   const listed = useQuery({
     queryKey: ['personae', 'files', String(path || '')],
     queryFn: () => listDirectory(path),
@@ -10794,37 +10825,56 @@ function FileDirectory({ depth, expired, onToggle, path, t }) {
     })
   }
 
-  return jsx(FileList, { depth, expired, onToggle, parent: String(data.path || path || ''), rows, t })
+  return jsx(FileList, { depth, expired, onOpen, onToggle, parent: String(data.path || path || ''), rows, t })
 }
 
 /** The rows of one folder. Split from the query so the ROOT can use the pane's own
  *  read (it needs `home`/`parent` from the same answer) and every subfolder can
  *  own a query without the two disagreeing about what a row looks like. */
-function FileList({ depth, expired: open, onToggle, parent, rows, t }) {
+function FileList({ depth, expired: open, onOpen, onToggle, parent, rows, t }) {
   return jsxs('div', {
     className: 'flex flex-col',
     children: rows.map(entry =>
       jsx(
         FileRow,
-        { depth, entry, expired: open, onToggle, parent, t },
+        { depth, entry, expired: open, onOpen, onToggle, parent, t },
         `${parent}/${entry.name}`
       )
     )
   })
 }
 
-function FileRow({ depth, entry, expired, onToggle, parent, t }) {
+function FileRow({ depth, entry, expired, onOpen, onToggle, parent, t }) {
   const full = joinFilePath(parent, entry.name)
   const open = (expired || []).includes(full)
   const dim = String(entry.name || '').startsWith('.')
+  const says = async (answer, okKey) => {
+    if (answer?.ok) {
+      return
+    }
 
-  return jsxs('div', {
+    host.notifyError?.(new Error(String(answer?.detail || answer?.error || '')), t('filesOpenFailed'))
+  }
+  const acts = {
+    copy: async () => {
+      const done = await copyText(full)
+
+      if (!done) {
+        host.notifyError?.(new Error('clipboard refused'), t('filesCopyFailed'))
+      }
+    },
+    editor: async () => says(await openOnBackend(full, 'editor')),
+    folder: async () => says(await openOnBackend(full, 'folder')),
+    preview: () => onOpen(full, entry)
+  }
+
+  const body = jsxs('div', {
     className: 'flex flex-col',
     children: [
       jsxs('button', {
         'data-files-row': entry.dir ? 'dir' : 'file',
         className: 'flex w-full min-w-0 items-center gap-1.5 py-[3px] pr-2 text-left text-[0.75rem] hover:bg-(--chrome-action-hover)',
-        onClick: entry.dir ? () => onToggle(full) : undefined,
+        onClick: entry.dir ? () => onToggle(full) : () => acts.preview(),
         style: { paddingLeft: `${12 + depth * 12}px` },
         title: full,
         type: 'button',
@@ -10846,8 +10896,113 @@ function FileRow({ depth, entry, expired, onToggle, parent, t }) {
         ]
       }),
       open
-        ? jsx(FileDirectory, { depth: depth + 1, expired, onToggle, path: full, t }, `dir-${full}`)
+        ? jsx(FileDirectory, { depth: depth + 1, expired, onOpen, onToggle, path: full, t }, `dir-${full}`)
         : null
+    ]
+  })
+
+  // Right-click carries the verbs the click does not: the click previews (the
+  // thing you want 95% of the time), everything else is here.
+  return jsx(ContextMenu, {
+    children: [
+      jsx(ContextMenuTrigger, { asChild: true, children: body }, 'trigger'),
+      jsx(
+        ContextMenuContent,
+        {
+          children: [
+            entry.dir
+              ? null
+              : jsx(
+                  ContextMenuItem,
+                  { onSelect: acts.preview, children: menuGlyph('open-preview', t('filesPreview')) },
+                  'preview'
+                ),
+            jsx(ContextMenuItem, { onSelect: acts.editor, children: menuGlyph('go-to-file', t('filesOpenEditor')) }, 'editor'),
+            jsx(ContextMenuItem, { onSelect: acts.folder, children: menuGlyph('folder', t('filesShowFolder')) }, 'folder'),
+            jsx(ContextMenuSeparator, {}, 'sep'),
+            jsx(ContextMenuItem, { onSelect: acts.copy, children: menuGlyph('copy', t('filesCopyPath')) }, 'copy')
+          ]
+        },
+        'items'
+      )
+    ]
+  })
+}
+
+/** One file, read-only, as text. Its own component because a preview owns its
+ *  own read — and because the pane's tree must not carry a query for a file the
+ *  user is not looking at. */
+function FilePreview({ name, onBack, path, t }) {
+  const shown = useQuery({
+    queryKey: ['personae', 'file', String(path || '')],
+    queryFn: () => readFilePreview(String(path || '')),
+    retry: false,
+    staleTime: 15000
+  })
+  const fileData = shown.data || {}
+  const text = String(fileData.text || '')
+
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col',
+    children: [
+      jsxs('div', {
+        className: 'flex min-w-0 items-center gap-2 px-3 pt-3 pb-2',
+        children: [
+          jsx('button', {
+            'data-files-back': '',
+            className: 'shrink-0 rounded px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
+            onClick: onBack,
+            type: 'button',
+            children: t('filesBack')
+          }),
+          jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.8125rem] font-medium', title: path, children: name }),
+          jsx('span', {
+            className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+            children: fileSizeLabel(fileData.size)
+          })
+        ]
+      }),
+      jsx('div', {
+        'data-files-preview-path': path,
+        className: 'truncate border-b border-(--ui-stroke-secondary) px-3 pb-2 text-[0.625rem] text-(--ui-text-tertiary)',
+        title: path,
+        children: path
+      }),
+      jsxs('div', {
+        className: 'min-h-0 flex-1 overflow-auto',
+        children: [
+          shown.isPending
+            ? jsx('div', {
+                'data-files-pending': '',
+                className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: t('filesLoading')
+              })
+            : fileData.error
+              ? jsx('div', {
+                  'data-files-note': fileData.error,
+                  className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                  children: fileData.error === 'outside_root' ? t('filesOutside') : t('filesUnavailable')
+                })
+              : fileData.binary
+                ? jsx('div', {
+                    'data-files-note': 'binary',
+                    className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                    children: t('filesBinary')
+                  })
+                : jsx('pre', {
+                    'data-files-preview': '',
+                    className: 'm-0 whitespace-pre p-3 text-[0.6875rem] leading-5 text-(--ui-text-primary)',
+                    children: text
+                  }),
+          fileData.truncated
+            ? jsx('div', {
+                'data-files-note': 'truncated',
+                className: 'px-3 pb-3 text-[0.625rem] text-(--ui-text-quaternary)',
+                children: t('filesTruncated')
+              })
+            : null
+        ]
+      })
     ]
   })
 }
@@ -10858,6 +11013,10 @@ function FilesPane() {
   // the files are on, not of the window drawing them.
   const [root, setRoot] = useState('')
   const [expired, setExpired] = useState([])
+  // The file being previewed. A preview REPLACES the tree in this pane rather
+  // than opening a tab: it is a look, not a place, and Back has to be the way
+  // out of it.
+  const [preview, setPreview] = useState(null)
   const top = useQuery({
     // The SAME key shape a subfolder uses: the root is just the first directory,
     // and two spellings of one read would keep two caches.
@@ -10876,6 +11035,10 @@ function FilesPane() {
   const go = target => {
     setExpired([])
     setRoot(target)
+  }
+
+  if (preview) {
+    return jsx(FilePreview, { name: preview.name, onBack: () => setPreview(null), path: preview.path, t })
   }
 
   const header = jsxs('div', {
@@ -10946,7 +11109,19 @@ function FilesPane() {
                 className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
                 children: data.error === 'outside_root' ? t('filesOutside') : t('filesUnavailable')
               })
-            : jsx(FileList, { depth: 0, expired, onToggle: toggle, parent: at, rows: sortFileEntries(data.entries), t }, `root-${at}`)
+            : jsx(
+            FileList,
+            {
+              depth: 0,
+              expired,
+              onOpen: (path, entry) => setPreview({ name: String(entry?.name || path), path }),
+              onToggle: toggle,
+              parent: at,
+              rows: sortFileEntries(data.entries),
+              t
+            },
+            `root-${at}`
+          )
       })
     ]
   })
@@ -11811,10 +11986,19 @@ export default {
         empty: 'No profiles',
         emptyHint: 'Nothing came back from profiles.list.',
         files: 'Files',
+        filesBack: 'Back',
+        filesBinary: 'Binary file — nothing to preview',
+        filesCopyFailed: 'Could not copy the path',
+        filesCopyPath: 'Copy path',
         filesEmpty: 'This folder is empty',
+        filesOpenEditor: 'Open in editor',
+        filesOpenFailed: 'Could not open on the backend',
+        filesPreview: 'Preview',
         filesLoading: 'Loading…',
         filesOutside: 'Outside the folder this tab may show',
         filesRefresh: 'Refresh',
+        filesShowFolder: 'Show in file manager',
+        filesTruncated: 'Preview truncated — the file is larger than 256 KB',
         filesUnavailable: 'Cannot read this folder — the Personae backend may be older than the plugin (restart it)',
         filesUp: 'Up',
         filtered: 'Nothing matches',
@@ -12044,6 +12228,9 @@ export default {
  *  API: the app reads `default` and nothing else. */
 export const __internals = {
   fileBreadcrumb,
+  filePreview: FilePreview,
+  openOnBackend,
+  readFilePreview,
   fileSizeLabel,
   FilesPane,
   joinFilePath,

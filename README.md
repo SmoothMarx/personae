@@ -155,6 +155,12 @@ machine drawing the window. Read-only, deliberately:
 - Folders first, then names, case-insensitively; files carry a human size; dotfiles are drawn
   dimmed rather than hidden, because half of what matters on a dev box starts with a dot.
 - Breadcrumb and **Up** walk the tree; **Refresh** re-reads the open folders.
+- **Click a file to preview it** — read-only text, capped at 256 KB, binary files named as
+  such instead of decoded into mojibake, and **Back** to the tree.
+- **Right-click** carries the rest: *Preview*, *Open in editor*, *Show in file manager*,
+  *Copy path*. The two "open" verbs act on the **backend** — the machine the paths live on —
+  so a headless backend answers honestly ("no desktop session — set `PERSONAE_EDITOR`")
+  rather than looking like a dead menu item.
 
 ## 🎨 Colour
 
