@@ -186,8 +186,9 @@ plugin.register(ctx)
 
 check('plugin id is the folder name', plugin.id === 'personae', `got ${plugin.id}`)
 check(
-  'two contributions: the roster pane and the Scheduled jobs tile',
-  contributions.length === 2 && contributions.every(c => c.area === 'panes'),
+  'three contributions: the roster pane, Scheduled jobs and Files',
+  contributions.length === 3 && contributions.every(c => c.area === 'panes'),
+  contributions.map(c => c.id).join(', '),
   contributions.map(c => c.id).join(', ')
 )
 
@@ -7956,6 +7957,91 @@ h.rest.byProfile = {}
   h.responses['session.list'] = realList
   h.rest.byProfile = {}
   __internals.$sessionGroups.set({})
+}
+
+// ── Files: a folder tree beside Scheduled jobs (2026-10-17) ─────────────────
+{
+  const filesPane = contributions.find(entry => entry.id === 'files') || {}
+
+  check(
+    '"Files" docks where Scheduled jobs does, collapsed, so the two are tabs',
+    filesPane.data?.placement === 'main' &&
+      filesPane.data?.dock?.pane === 'workspace' &&
+      filesPane.data?.dock?.pos === 'right' &&
+      filesPane.data?.defaultCollapsed === true,
+    JSON.stringify(filesPane.data)
+  )
+  check('its tab says Files', filesPane.title === 'Files', filesPane.title)
+
+  check(
+    'a tree lists folders before files, case-insensitively',
+    JSON.stringify(
+      __internals
+        .sortFileEntries([{ name: 'b.txt' }, { name: 'Zeta', dir: true }, { name: 'alpha', dir: true }, { name: 'A.txt' }])
+        .map(entry => entry.name)
+    ) === JSON.stringify(['alpha', 'Zeta', 'A.txt', 'b.txt']),
+    JSON.stringify(__internals.sortFileEntries([{ name: 'b.txt' }, { name: 'Zeta', dir: true }]))
+  )
+  check(
+    'the breadcrumb starts at the backend home and walks down, never inventing a level',
+    JSON.stringify(__internals.fileBreadcrumb('/home/you/Projects/app', '/home/you').map(c => c.name)) ===
+      JSON.stringify(['you', 'Projects', 'app']),
+    JSON.stringify(__internals.fileBreadcrumb('/home/you/Projects/app', '/home/you'))
+  )
+  check(
+    'a file size is human, not a byte count',
+    __internals.fileSizeLabel(999) === '999 B' &&
+      __internals.fileSizeLabel(2048) === '2 KB' &&
+      __internals.fileSizeLabel(5 * 1024 * 1024) === '5.0 MB',
+    [999, 2048, 5 * 1024 * 1024].map(__internals.fileSizeLabel).join(' / ')
+  )
+
+  h.queryResults['personae|files|'] = {
+    data: {
+      count: 3,
+      entries: [
+        { dir: true, name: 'Projects', size: 4096 },
+        { dir: false, name: 'notes.md', size: 1024 },
+        { dir: false, name: 'a.txt', size: 12 }
+      ],
+      home: '/home/you',
+      parent: '',
+      path: '/home/you'
+    },
+    isPending: false
+  }
+
+  const html = renderToStaticMarkup(filesPane.render())
+
+  check(
+    'the tree draws the folder it was given, folders first, with sizes on files',
+    html.includes('data-files-row="dir"') &&
+      html.includes('Projects') &&
+      html.indexOf('Projects') < html.indexOf('notes.md') &&
+      html.includes('1 KB'),
+    html.slice(0, 400)
+  )
+  check(
+    'and the path bar names the folder being listed',
+    html.includes('data-files-path="/home/you"'),
+    html.slice(0, 300)
+  )
+
+  // A refusal has to be VISIBLE: an empty tree would read as an empty folder.
+  h.queryResults['personae|files|'] = {
+    data: { entries: [], error: 'outside_root', home: '/home/you', path: '/etc' },
+    isPending: false
+  }
+
+  const refused = renderToStaticMarkup(filesPane.render())
+
+  check(
+    'a folder outside the allowed root SAYS so instead of looking empty',
+    refused.includes('data-files-note="outside_root"'),
+    refused.slice(0, 300)
+  )
+
+  delete h.queryResults['personae|files|']
 }
 
 const failedNow = results.filter(r => !r.ok)

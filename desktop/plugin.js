@@ -10690,6 +10690,268 @@ function EditProfileDialog({ onClose, open, queryClient, row }) {
   })
 }
 
+/** ── Files ─────────────────────────────────────────────────────────────────
+ *  A read-only folder tree, docked beside Scheduled jobs. The listing comes from
+ *  the pane's own backend (`/files`), because the files that matter are on the
+ *  BACKEND's disk — the window may be on another machine entirely — and because a
+ *  route we own can refuse to leave the home directory. Nothing here writes. */
+
+/** Directories first, then names, case-insensitively: the order a tree is read
+ *  in. Pure, so the harness can pin it without a filesystem. */
+function sortFileEntries(entries) {
+  return [...(Array.isArray(entries) ? entries : [])].sort((a, b) => {
+    const left = a?.dir === true
+    const right = b?.dir === true
+
+    if (left !== right) {
+      return left ? -1 : 1
+    }
+
+    return String(a?.name || '').localeCompare(String(b?.name || ''), undefined, { sensitivity: 'base' })
+  })
+}
+
+/** `/home/you/Projects/app` → [{name:'you', path:'/home/you'}, …, {name:'app', …}]. */
+function fileBreadcrumb(path, home) {
+  const root = String(home || '')
+  const full = String(path || root)
+  const under = Boolean(root) && (full === root || full.startsWith(`${root}/`))
+  const parts = under ? [{ name: root === '/' ? '/' : root.split('/').filter(Boolean).pop() || root, path: root }] : []
+  const rest = under ? full.slice(root.length) : full
+  let walked = under ? root : ''
+
+  for (const bit of rest.split('/').filter(Boolean)) {
+    walked = `${String(walked || '').replace(/\/$/, '')}/${bit}`
+    parts.push({ name: bit, path: walked })
+  }
+
+  return parts
+}
+
+function joinFilePath(base, name) {
+  return `${String(base || '').replace(/\/$/, '')}/${String(name || '')}`
+}
+
+function fileSizeLabel(bytes) {
+  const size = Number(bytes) || 0
+
+  if (size < 1024) {
+    return `${size} B`
+  }
+
+  if (size < 1024 * 1024) {
+    return `${Math.round(size / 1024)} KB`
+  }
+
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/** One directory. `path` empty means "the backend's home", so the tab can open
+ *  before it knows where anything is. */
+async function listDirectory(path) {
+  const rest = ctxRef?.rest
+
+  if (typeof rest !== 'function') {
+    return { entries: [], error: 'no_backend' }
+  }
+
+  try {
+    return (await rest(`/files?path=${encodeURIComponent(String(path || ''))}`)) || { entries: [] }
+  } catch (error) {
+    return { entries: [], error: String(error?.message || error || 'unreachable') }
+  }
+}
+
+/** The rows of ONE expanded folder. Recursion in the tree is recursion in the
+ *  component: every level owns its own query, which is what keeps a deep tree to
+ *  the folders the user actually opened. */
+function FileDirectory({ depth, expired, onToggle, path, t }) {
+  const listed = useQuery({
+    queryKey: ['personae', 'files', String(path || '')],
+    queryFn: () => listDirectory(path),
+    retry: false,
+    staleTime: 15000
+  })
+  const data = listed.data || {}
+  const rows = sortFileEntries(data.entries)
+  const broken = data.error ? data.error : null
+
+  if (listed.isPending) {
+    return jsx('div', {
+      'data-files-pending': '',
+      className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+      style: { paddingLeft: `${12 + depth * 12}px` },
+      children: t('filesLoading')
+    })
+  }
+
+  if (broken || !rows.length) {
+    return jsx('div', {
+      'data-files-note': broken || 'empty',
+      className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+      style: { paddingLeft: `${12 + depth * 12}px` },
+      children: broken === 'outside_root' ? t('filesOutside') : broken ? t('filesUnavailable') : t('filesEmpty')
+    })
+  }
+
+  return jsx(FileList, { depth, expired, onToggle, parent: String(data.path || path || ''), rows, t })
+}
+
+/** The rows of one folder. Split from the query so the ROOT can use the pane's own
+ *  read (it needs `home`/`parent` from the same answer) and every subfolder can
+ *  own a query without the two disagreeing about what a row looks like. */
+function FileList({ depth, expired: open, onToggle, parent, rows, t }) {
+  return jsxs('div', {
+    className: 'flex flex-col',
+    children: rows.map(entry =>
+      jsx(
+        FileRow,
+        { depth, entry, expired: open, onToggle, parent, t },
+        `${parent}/${entry.name}`
+      )
+    )
+  })
+}
+
+function FileRow({ depth, entry, expired, onToggle, parent, t }) {
+  const full = joinFilePath(parent, entry.name)
+  const open = (expired || []).includes(full)
+  const dim = String(entry.name || '').startsWith('.')
+
+  return jsxs('div', {
+    className: 'flex flex-col',
+    children: [
+      jsxs('button', {
+        'data-files-row': entry.dir ? 'dir' : 'file',
+        className: 'flex w-full min-w-0 items-center gap-1.5 py-[3px] pr-2 text-left text-[0.75rem] hover:bg-(--chrome-action-hover)',
+        onClick: entry.dir ? () => onToggle(full) : undefined,
+        style: { paddingLeft: `${12 + depth * 12}px` },
+        title: full,
+        type: 'button',
+        children: [
+          jsx('span', {
+            className: 'w-3 shrink-0 text-(--ui-text-tertiary)',
+            children: entry.dir ? (open ? '\u25be' : '\u25b8') : ''
+          }),
+          jsx('span', {
+            className: dim ? 'truncate text-(--ui-text-tertiary)' : 'truncate text-(--ui-text-primary)',
+            children: entry.name
+          }),
+          entry.dir
+            ? null
+            : jsx('span', {
+                className: 'ml-auto shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                children: fileSizeLabel(entry.size)
+              })
+        ]
+      }),
+      open
+        ? jsx(FileDirectory, { depth: depth + 1, expired, onToggle, path: full, t }, `dir-${full}`)
+        : null
+    ]
+  })
+}
+
+function FilesPane() {
+  const t = usePluginI18n(ID)
+  // '' asks the backend for its home: the tab's root is a property of the MACHINE
+  // the files are on, not of the window drawing them.
+  const [root, setRoot] = useState('')
+  const [expired, setExpired] = useState([])
+  const top = useQuery({
+    // The SAME key shape a subfolder uses: the root is just the first directory,
+    // and two spellings of one read would keep two caches.
+    queryKey: ['personae', 'files', String(root || '')],
+    queryFn: () => listDirectory(root),
+    retry: false,
+    staleTime: 15000
+  })
+  const data = top.data || {}
+  const home = String(data.home || '')
+  const at = String(data.path || home || '')
+  const crumbs = fileBreadcrumb(at, home)
+  const parent = String(data.parent || '')
+  const toggle = target =>
+    setExpired(open => (open.includes(target) ? open.filter(entry => entry !== target) : [...open, target]))
+  const go = target => {
+    setExpired([])
+    setRoot(target)
+  }
+
+  const header = jsxs('div', {
+    className: 'flex min-w-0 items-center gap-2 px-3 pt-3 pb-2',
+    children: [
+      jsx('span', { className: 'grid size-6 shrink-0 place-items-center text-(--ui-text-tertiary)', children: menuGlyph('folder', '') }),
+      jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.8125rem] font-medium', children: t('files') }),
+      parent
+        ? jsx('button', {
+            'data-files-up': '',
+            className: 'shrink-0 rounded px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
+            onClick: () => go(parent),
+            title: parent,
+            type: 'button',
+            children: t('filesUp')
+          })
+        : null,
+      jsx('button', {
+        'data-files-refresh': '',
+        className: 'shrink-0 rounded px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
+        onClick: () => queryClient.invalidateQueries({ queryKey: ['personae', 'files'] }),
+        type: 'button',
+        children: t('filesRefresh')
+      })
+    ]
+  })
+
+  const crumbbar = jsx('div', {
+    'data-files-path': at,
+    className: 'flex flex-wrap items-center gap-1 border-b border-(--ui-stroke-secondary) px-3 pb-2 text-[0.625rem] text-(--ui-text-tertiary)',
+    children: crumbs.map((crumb, index) =>
+      jsxs(
+        'span',
+        {
+          className: 'flex min-w-0 items-center gap-1',
+          children: [
+            index ? jsx('span', { children: '/' }) : null,
+            jsx('button', {
+              className: 'max-w-sm truncate hover:underline',
+              onClick: () => go(crumb.path),
+              title: crumb.path,
+              type: 'button',
+              children: crumb.name
+            })
+          ]
+        },
+        `crumb-${crumb.path}`
+      )
+    )
+  })
+
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col',
+    children: [
+      header,
+      crumbbar,
+      jsx('div', {
+        className: 'min-h-0 flex-1 overflow-auto py-1',
+        children: top.isPending
+          ? jsx('div', {
+              'data-files-pending': '',
+              className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+              children: t('filesLoading')
+            })
+          : data.error
+            ? jsx('div', {
+                'data-files-note': data.error,
+                className: 'px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: data.error === 'outside_root' ? t('filesOutside') : t('filesUnavailable')
+              })
+            : jsx(FileList, { depth: 0, expired, onToggle: toggle, parent: at, rows: sortFileEntries(data.entries), t }, `root-${at}`)
+      })
+    ]
+  })
+}
+
 function MessengerPane() {
   const t = usePluginI18n(ID)
   const currentProfile = useValue(host.state.profile)
@@ -11548,6 +11810,13 @@ export default {
         cancelGroup: 'Cancel new group',
         empty: 'No profiles',
         emptyHint: 'Nothing came back from profiles.list.',
+        files: 'Files',
+        filesEmpty: 'This folder is empty',
+        filesLoading: 'Loading…',
+        filesOutside: 'Outside the folder this tab may show',
+        filesRefresh: 'Refresh',
+        filesUnavailable: 'Cannot read this folder — the Personae backend may be older than the plugin (restart it)',
+        filesUp: 'Up',
         filtered: 'Nothing matches',
         filteredHint: 'Loosen the search or the filters.',
         filters: 'Filter profiles',
@@ -11720,9 +11989,27 @@ export default {
         render: () => jsx(RoutinesPane, {})
       })
 
+    // Files — a THIRD pane, docked to the same right edge as Scheduled jobs, so
+    // the right zone shows the two as tabs beside each other. Read-only: it makes
+    // no writes and has no verb that could.
+    const registerFiles = () =>
+      ctx.register({
+        id: 'files',
+        area: 'panes',
+        title: 'Files',
+        data: {
+          defaultCollapsed: true,
+          dock: { pane: 'workspace', pos: 'right', enforce: true },
+          placement: 'main',
+          width: '260px'
+        },
+        render: () => jsx(FilesPane, {})
+      })
+
     if (typeof host.paneVisibility === 'function') {
       const $visible = host.paneVisibility(`${ID}:pane`)
       let disposeRoutines = null
+      let disposeFiles = null
 
       const syncRoutines = visible => {
         if (visible && !disposeRoutines) {
@@ -11730,6 +12017,13 @@ export default {
         } else if (!visible && disposeRoutines) {
           disposeRoutines()
           disposeRoutines = null
+        }
+
+        if (visible && !disposeFiles) {
+          disposeFiles = registerFiles()
+        } else if (!visible && disposeFiles) {
+          disposeFiles()
+          disposeFiles = null
         }
       }
 
@@ -11740,6 +12034,7 @@ export default {
       syncRoutines(typeof $visible?.get === 'function' ? Boolean($visible.get()) : false)
     } else {
       registerRoutines()
+      registerFiles()
     }
   }
 }
@@ -11748,6 +12043,11 @@ export default {
  *  filtering and grouping without a DOM to type into. Not part of the plugin
  *  API: the app reads `default` and nothing else. */
 export const __internals = {
+  fileBreadcrumb,
+  fileSizeLabel,
+  FilesPane,
+  joinFilePath,
+  sortFileEntries,
   migrateLegacyStorage,
   applyPref,
   createSync,

@@ -141,6 +141,21 @@ what it knows.*
 
 ---
 
+## 📁 Files
+
+A second tile beside **Scheduled jobs** on the right edge, showing the **folder tree of the
+backend's disk** — the machine the sessions actually run on, which is not necessarily the
+machine drawing the window. Read-only, deliberately:
+
+- One request per folder, made when you open it, so a deep tree costs a small read per level
+  instead of one enormous walk; `/files` has no write counterpart at all.
+- Rooted at the backend user's home and **refusing anything that escapes it** (`resolve()`,
+  so a symlink cannot walk out either). A refusal says so — an empty tree would read as an
+  empty folder.
+- Folders first, then names, case-insensitively; files carry a human size; dotfiles are drawn
+  dimmed rather than hidden, because half of what matters on a dev box starts with a dot.
+- Breadcrumb and **Up** walk the tree; **Refresh** re-reads the open folders.
+
 ## 🎨 Colour
 
 Give a profile a colour and it tints the profile row **and** every session under it.

@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
+from pathlib import Path
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,7 +75,7 @@ async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "plugin": "personae",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "readOnly": False,
         "resolve": True,
         "state": True,
@@ -219,6 +221,66 @@ async def set_title(request: Request) -> JSONResponse:
             db.close()
         except Exception:
             pass
+
+
+@router.get("/files")
+async def files(path: str = "", limit: int = Query(500, ge=1, le=2000)) -> Dict[str, Any]:
+    """One directory of the BACKEND's filesystem, read-only — the Files tab's tree.
+
+    Deliberately not recursive: the pane expands a folder when the user clicks it,
+    so a deep tree costs one small read per level instead of one enormous walk.
+    Rooted at the backend user's home and refusing anything that escapes it —
+    ``resolve()`` is what makes a symlink unable to walk out. There is no write
+    counterpart to this route at all.
+    """
+    root = Path.home().resolve()
+
+    try:
+        target = (Path(path).expanduser() if path else root).resolve()
+    except (OSError, RuntimeError):
+        return {"entries": [], "error": "bad_path", "path": str(path)}
+
+    if target != root and root not in target.parents:
+        return {
+            "entries": [],
+            "error": "outside_root",
+            "detail": f"{target} is outside {root}",
+            "path": str(target),
+        }
+
+    if not target.is_dir():
+        return {"entries": [], "error": "not_a_directory", "path": str(target)}
+
+    entries: List[Dict[str, Any]] = []
+    try:
+        with os.scandir(target) as listing:
+            for entry in listing:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                    entries.append(
+                        {
+                            "dir": entry.is_dir(follow_symlinks=False),
+                            "mtime": info.st_mtime,
+                            "name": entry.name,
+                            "size": info.st_size,
+                            "symlink": entry.is_symlink(),
+                        }
+                    )
+                except OSError:  # a racing delete must not hide the rest of the folder
+                    continue
+    except OSError as exc:
+        return {"entries": [], "error": "unreadable", "detail": f"{type(exc).__name__}: {exc}", "path": str(target)}
+
+    # Directories first, then names — the order a folder tree is read in.
+    entries.sort(key=lambda row: (not row["dir"], str(row["name"]).lower()))
+
+    return {
+        "count": len(entries),
+        "entries": entries[:limit],
+        "home": str(root),
+        "parent": str(target.parent) if target != root else "",
+        "path": str(target),
+    }
 
 
 @router.post("/resolve")
