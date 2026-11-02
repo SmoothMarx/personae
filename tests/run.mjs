@@ -3261,6 +3261,120 @@ const doneBar = renderToStaticMarkup(
 check('the bar shows the last batch\'s receipt instead of a drifting toast', doneBar.includes('2 closed · 1 failed'), doneBar)
 check('a live selection enables the verbs', !/disabled/.test(doneBar))
 
+// ── Apropos: the SET, not the row that happened to be right-clicked ────────
+// Pedro, 2026-11-02: "I selected two conversations, and from there
+// right-clicked to start a new apropos session, but it doesn't seem to have
+// referenced the two sessions properly." It had not: the child's seeded digest
+// carried ONE `[APROPOS-PIN parent=…]`, so it could never consult the second
+// session — and the follow-up question about both of them got nothing. Two
+// separate holes, both proven here: the ROSTER handed the verb a single row
+// while the drill-down handed it the ticks, and the row menu offered a
+// single-session verb in the middle of a multi-selection.
+const APROPOS_ROWS = [
+  { id: 'z1', title: 'Flux migration' },
+  { id: 'z2', title: 'Retro' }
+]
+
+check(
+  'a roster row with ticks hands the Apropos verb the WHOLE set, not itself',
+  (() => {
+    const entries = __internals.aproposEntriesFor({
+      profile: 'zulu',
+      sessions: APROPOS_ROWS,
+      selectedKeys: ['zulu|z1', 'zulu|z2'],
+      session: APROPOS_ROWS[0]
+    })
+
+    return entries.length === 2 && entries.map(entry => entry.session_id).join(',') === 'z1,z2'
+  })()
+)
+check(
+  '…and with nothing ticked it acts on the row it was opened on',
+  (() => {
+    const entries = __internals.aproposEntriesFor({
+      profile: 'zulu',
+      sessions: APROPOS_ROWS,
+      selectedKeys: [],
+      session: APROPOS_ROWS[1]
+    })
+
+    return entries.length === 1 && entries[0].session_id === 'z2' && entries[0].profile === 'zulu'
+  })()
+)
+
+// The menu is component state, so render the row on its own: select mode cannot
+// be clicked into from an SSR harness, but the props that decide the verb can.
+const aproposRowMenu = ({ tickCount, selected, selecting }) =>
+  renderToStaticMarkup(
+    jsx(__internals.SessionRow, {
+      aproposGroup: false,
+      dragging: false,
+      dropSide: null,
+      dropTarget: false,
+      editing: false,
+      group: null,
+      groups: [],
+      nowMs: 1,
+      onArchiveUpTo: () => {},
+      onCreateAproposGroup: () => {},
+      onDragStart: () => {},
+      onMoveGroup: () => {},
+      onNewGroup: () => {},
+      onRename: () => {},
+      onRenameCancel: () => {},
+      onRenameSubmit: () => {},
+      onRightClickSelect: () => {},
+      onSelect: () => {},
+      onToggleSelect: () => {},
+      profile: 'zulu',
+      profileSessions: APROPOS_ROWS,
+      selected,
+      selecting,
+      session: APROPOS_ROWS[0],
+      tickCount
+    })
+  )
+
+const multiRowMenu = aproposRowMenu({ tickCount: 2, selected: true, selecting: true })
+
+check(
+  'a menu opened over a multi-selection offers the SELECTION verb',
+  multiRowMenu.includes('From these 2 sessions'),
+  multiRowMenu.slice(multiRowMenu.indexOf('Apropos (On that topic'), multiRowMenu.indexOf('Apropos (On that topic') + 600)
+)
+check(
+  '…and never the single-session one, which could only consult this row',
+  !multiRowMenu.includes('From this session')
+)
+const loneRowMenu = aproposRowMenu({ tickCount: 0, selected: false, selecting: false })
+
+check(
+  'with nothing ticked both original weights are unchanged',
+  loneRowMenu.includes('From this session') &&
+    loneRowMenu.includes('Create group') &&
+    !loneRowMenu.includes('From these')
+)
+
+// And what the child will actually be ABLE to consult: the group header names
+// every member, one read link each — the digest is the contract, not the call.
+const twoMemberDigest = __internals.buildAproposGroupDigest({
+  label: 'Apropos: Flux migration',
+  members: [
+    { storedId: 'z1', title: 'Flux migration' },
+    { storedId: 'z2', title: 'Retro' }
+  ],
+  profile: 'zulu'
+})
+
+check(
+  'a two-member child carries BOTH ids and one read link each',
+  twoMemberDigest.includes('members=2') &&
+    twoMemberDigest.includes('(session z1)') &&
+    twoMemberDigest.includes('(session z2)') &&
+    (twoMemberDigest.match(/Read: session_search/g) || []).length === 2,
+  twoMemberDigest
+)
+
 // ── session groups: filing one profile's own sessions by topic/project ─────
 // (Pedro, 2026-10-09.) The state layer is pure and the pane reads it through an
 // atom, so all of this runs with no DOM at all.

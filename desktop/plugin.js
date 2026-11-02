@@ -3829,6 +3829,28 @@ function selectedSessions(rows, keys) {
   return out
 }
 
+/** The entries an Apropos verb acts on from a SESSION ROW's own menu: the
+ *  profile's tick set when the user has one, else the row it was opened on.
+ *
+ *  Two call sites disagreeing here was the bug (Pedro, 2026-11-02): the roster
+ *  passed one row while the "View all" drill-down passed `ticks`, so the same
+ *  menu item meant two different things depending on the screen — and the
+ *  selection verb built its group out of a single session. One function, so the
+ *  menu's label (which counts `selectedSessions` too) cannot promise a set this
+ *  cannot deliver. Pure, so the harness pins it without a pointer. */
+function aproposEntriesFor({ profile, sessions, selectedKeys, session }) {
+  const scope = String(profile || '')
+  const ticks = selectedSessions([{ name: scope, sessions }], selectedKeys || [])
+
+  if (ticks.length) {
+    return ticks
+  }
+
+  const storedId = String(session?.id || '')
+
+  return storedId ? [{ profile: scope, session_id: storedId, title: sessionLabel(session) }] : []
+}
+
 /** Right-clicking an item makes IT the selection — unless it is already part of
  *  one, in which case the set is left alone so a multi-item verb (Move to group,
  *  Apropos → Create group) still sees every tick. A replace, never an
@@ -5716,6 +5738,10 @@ function SessionRow({
   selected,
   selecting,
   session,
+  // How many rows the current selection holds. A menu offered while rows are
+  // TICKED must act on the tick set or not be offered at all — so this counts
+  // them and the Apropos submenu switches verbs above one.
+  tickCount,
   // Is this row inside an Apropos group? The mark on its name depends on it.
   aproposGroup
 }) {
@@ -5723,6 +5749,14 @@ function SessionRow({
   const storedId = String(session?.id || '')
   const openId = String(session?.resolved_id || storedId)
   const title = sessionLabel(session)
+  // A menu opened on a TICKED row, mid-selection, must not offer a verb that can
+  // only consult that row: `aproposSession` pins ONE parent id, so choosing it
+  // with two rows ticked silently dropped the second (Pedro, 2026-11-02 — the
+  // child it made carried a single `[APROPOS-PIN parent=…]` and could not answer
+  // a question about both). Above one tick the submenu collapses to the
+  // selection verb, which builds a GROUP digest naming every member.
+  const ticked = Math.max(0, Number(tickCount) || 0)
+  const selectionApropos = Boolean(selecting) && Boolean(selected) && ticked > 1
   const color = colors?.[profile]?.[storedId] || null
   // Apropos chips: the child points at its parent, the parent counts its
   // children. Read here (a hook) so only a rendered row subscribes.
@@ -6201,26 +6235,42 @@ function SessionRow({
                 jsx(
                   ContextMenuSubContent,
                   {
-                    children: [
-                      // 4.1 the classic single-session refresher: a child that
-                      // can consult THIS transcript, with no group and no bloat.
-                      jsx(
-                        ContextMenuItem,
-                        { onSelect: () => aproposSession(storedId, profile, title), children: menuGlyph('comment-discussion', 'From this session') },
-                        'apropos-session'
-                      ),
-                      // 4.2 the group flavour: ALWAYS a group, even for one
-                      // session (Pedro, 2026-10-10: "if a single session is
-                      // selected, a new apropos group is created with the selected
-                      // session, inside. if multiple are selected, all are put
-                      // inside the apropos group"). It acts on the TICK SET,
-                      // which the right-click rule has already made real.
-                      jsx(
-                        ContextMenuItem,
-                        { onSelect: () => onCreateAproposGroup(), children: menuGlyph('new-folder', 'Create group') },
-                        'apropos-group'
-                      )
-                    ]
+                    children: selectionApropos
+                      ? [
+                          // ONE verb while rows are ticked: the SET is the noun.
+                          // The count is in the label so the receipt matches the
+                          // digest it seeds, and "From this session" is GONE —
+                          // a verb that can only consult one row has no business
+                          // in a menu opened over three.
+                          jsx(
+                            ContextMenuItem,
+                            {
+                              onSelect: () => onCreateAproposGroup(),
+                              children: menuGlyph('comment-discussion', `From these ${ticked} sessions`)
+                            },
+                            'apropos-selection'
+                          )
+                        ]
+                      : [
+                          // 4.1 the classic single-session refresher: a child that
+                          // can consult THIS transcript, with no group and no bloat.
+                          jsx(
+                            ContextMenuItem,
+                            { onSelect: () => aproposSession(storedId, profile, title), children: menuGlyph('comment-discussion', 'From this session') },
+                            'apropos-session'
+                          ),
+                          // 4.2 the group flavour: ALWAYS a group, even for one
+                          // session (Pedro, 2026-10-10: "if a single session is
+                          // selected, a new apropos group is created with the selected
+                          // session, inside. if multiple are selected, all are put
+                          // inside the apropos group"). It acts on the TICK SET,
+                          // which the right-click rule has already made real.
+                          jsx(
+                            ContextMenuItem,
+                            { onSelect: () => onCreateAproposGroup(), children: menuGlyph('new-folder', 'Create group') },
+                            'apropos-group'
+                          )
+                        ]
                   },
                   'apropos-body'
                 )
@@ -6652,6 +6702,13 @@ function ProfileRow({
   const age = ageLabel(row.lastActiveMs, nowMs)
   const subtitle = row.preview || (row.messages ? '' : 'no sessions yet')
   const shown = (hits || []).slice(0, SESSIONS_PER_ROW)
+  // The Apropos verbs in this row's menu act on the TICK SET when there is one
+  // (the right-click rule has already made the ticked row real). Resolved HERE,
+  // once per profile, so the menu's label and the set it acts on cannot disagree
+  // — and so this roster passes the ticks to `aproposCreateGroup` exactly like
+  // the "View all" drill-down does, instead of one row (Pedro, 2026-11-02: two
+  // sessions ticked, the child it made consulted only the row he right-clicked).
+  const tickedHere = selectedSessions([{ name: row.name, sessions }], selectedKeys || [])
   // While a query is live the MATCHES are this row's list, expanded or not.
   // That ordering is the whole fix for "I searched for a keyword and it didn't
   // pop up the session I was expecting" (Pedro, 2026-10-16): the profile's own
@@ -7074,12 +7131,16 @@ function ProfileRow({
                       // profile's full list and confirms the count before
                       // anything moves.
                       onArchiveUpTo,
+                      // Apropos acts on the ticks this profile holds, or on this
+                      // row when nothing is ticked — the same shape the drill-down
+                      // uses (see SessionListView). One row here was the bug: the
+                      // menu above offers the SELECTION verb, and it would have
+                      // built its group from a single session.
                       onCreateAproposGroup: () =>
-                        onCreateAproposGroup({
-                          profile: row.name,
-                          session_id: String(session.id),
-                          title: String(session.title || session.preview || session.id)
-                        }),
+                        onCreateAproposGroup(
+                          aproposEntriesFor({ profile: row.name, sessions, selectedKeys, session })
+                        ),
+                      tickCount: tickedHere.length,
                       onNewGroup: () => onNewGroup([session.id]),
                       onSelect: () => onSelect(row.name, session.id),
                       onToggleSelect: () => onToggleSelect(sessionKey(row.name, session.id)),
@@ -10350,6 +10411,9 @@ function SessionListView({
                       }
                     ]
               ),
+            // What the menu needs to know to offer the SELECTION verb instead of
+            // the single-session one: the set it would act on.
+            tickCount: ticks.length,
             onMoveGroup: payload => onMoveGroup(profile, payload, selectedKeys),
             onNewGroup: () => onNewGroup(profile, [session.id]),
             onRename: onRenameSession,
@@ -11954,6 +12018,8 @@ export const __internals = {
   closeSession,
   runOverSessions,
   selectedSessions,
+  aproposEntriesFor,
+  buildAproposGroupDigest,
   sessionKey,
   SelectBar,
   toggleSelected,
