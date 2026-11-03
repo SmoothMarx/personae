@@ -643,6 +643,16 @@ const $searchQuery = atom('')
 const $searchHealth = atom({ failed: [], unavailable: false })
 let searchTimer = null
 
+/** The pending "Archive all up to this point" cut: `{anchorIds, entries,
+ *  profile}`, or null. Transient like `$listView` — a reload never resumes a
+ *  half-confirmed bulk verb.
+ *
+ *  It is an ATOM rather than a `useState` for one reason: the confirmation is
+ *  drawn UNDER the row it was opened on (Pedro, 2026-11-03), so the row that
+ *  hosts it is a different component from the one that opens it — and the
+ *  harness has to be able to arm a cut to prove where the bar lands. */
+const $archiveCut = atom(null)
+
 /** Debounce the sweep, not the box. Below the minimum needle the query is
  *  cleared at once (no timer left armed to fire a stale search later). Pure
  *  except for the two atoms and the one timer — the harness pins both halves. */
@@ -3281,6 +3291,47 @@ function sessionsUpTo(sessions, targetId) {
 
     return when !== null && when < at
   })
+}
+
+/** Every id a row can be addressed by — the stored one, the live one and the
+ *  lineage it survived compactions through (see rowIdentities). A cut is
+ *  remembered by the row the user POINTED AT, and that row may be drawn again
+ *  after a refetch with a different tip id; matching on `id` alone would make
+ *  the confirmation jump back to the top of the list the moment that happened. */
+function cutAnchorIds(session) {
+  const ids = rowIdentities(session)
+
+  if (session?.resolved_id) {
+    ids.add(String(session.resolved_id))
+  }
+
+  return ids
+}
+
+/** Does the pending cut belong UNDER this row?
+ *
+ *  Two conditions and no heuristics: same profile, and one id in common. The
+ *  ids are compared through the lineage because the drawn row and the clicked
+ *  row need not be the same object or the same tip id (see cutAnchorIds). Pure,
+ *  so the harness pins the placement rule instead of scraping for it. */
+function isCutAnchor(cut, profile, session) {
+  if (!cut) {
+    return false
+  }
+
+  if (String(cut.profile ?? '') !== String(profile ?? '')) {
+    return false
+  }
+
+  const anchor = Array.isArray(cut.anchorIds) ? cut.anchorIds : []
+
+  if (!anchor.length) {
+    return false
+  }
+
+  const ids = cutAnchorIds(session)
+
+  return anchor.some(id => ids.has(String(id)))
 }
 
 /** Split into section blocks. With no sections at all this is one anonymous
@@ -6640,6 +6691,8 @@ function SessionGroupHeading({
 
 /** One roster row, shaped like a Bots row. */
 function ProfileRow({
+  cut,
+  cutBar,
   editingSession,
   expanded,
   row,
@@ -6746,6 +6799,14 @@ function ProfileRow({
     expanded && !searching
       ? sessionGroupBlocks(visible, groupState, row.name, releasedState[String(row.name)] || [])
       : [{ collapsed: false, id: null, name: '', sessions: visible }]
+  // "Archive all up to this point" is confirmed UNDER the row it was opened on
+  // (Pedro, 2026-11-03). `cutAnchored` asks whether this profile will actually
+  // DRAW that row: a collapsed group or a hidden session draws nothing, and a
+  // confirmation that vanished with its row would be a bulk verb the user can
+  // no longer cancel — so it falls back to just under this profile's own row.
+  const cutHere = Boolean(cut && String(cut.profile ?? '') === String(row.name))
+  const drawnSessions = groupBlocks.flatMap(block => (block.collapsed ? [] : block.sessions))
+  const cutAnchored = cutHere && drawnSessions.some(session => isCutAnchor(cut, row.name, session))
   // The colour this profile's rows are filled with — his pick in the editor, and
   // NOTHING unless he picked one (see fillOf: "fill is opt-in").
   const fill = fillOf(row)
@@ -7030,6 +7091,10 @@ function ProfileRow({
           })
         ]
       }),
+      // The cut's row is drawn above, so the bar rides with it; this is the
+      // fallback for when it is NOT (collapsed group, hidden, filtered out):
+      // the question stays under the profile it will act on.
+      cutHere && !cutAnchored ? cutBar : null,
       ...groupBlocks.flatMap(block => {
         const parts = [
           block.id
@@ -7090,12 +7155,12 @@ function ProfileRow({
             : null,
           block.collapsed
             ? null
-            : block.sessions.map(session =>
+            : block.sessions.map(session => {
                 // The user's own colour for THIS session outranks the
                 // profile fill and the group tint (Pedro, 2026-10-10: the
                 // fill "is overridden ... also by session colors"). Wrapped,
                 // not painted on the row, for the hover reason above.
-                sessionColorBox(
+                const drawn = sessionColorBox(
                   sessionColor(row.name, session.id),
                   jsx(
                     SessionRow,
@@ -7158,7 +7223,19 @@ function ProfileRow({
                   ),
                   `sess-${row.name}-${session.id}`
                 )
-              )
+
+                // The confirmation goes UNDER the row it was opened on, inside
+                // whatever box that row sits in (Pedro, 2026-11-03).
+                if (!isCutAnchor(cut, row.name, session)) {
+                  return drawn
+                }
+
+                return jsxs(
+                  'div',
+                  { className: 'grid min-w-0 grid-cols-1', children: [drawn, cutBar] },
+                  `cut-${row.name}-${session.id}`
+                )
+              })
         ].filter(Boolean)
 
         return sessionGroupShell(
@@ -10236,6 +10313,8 @@ function listMatch(session, needle) {
  *  user to multiselect"), and a filter of its own, because this is where the
  *  hundreds of old sessions actually live. */
 function SessionListView({
+  cut,
+  cutBar,
   editingSession,
   kind,
   nowMs,
@@ -10353,6 +10432,12 @@ function SessionListView({
     setStatus('')
   }
 
+  // A cut whose row this list no longer draws (the local filter hid it, the page
+  // moved) still has to be answerable: it falls back to the top of ITS list
+  // rather than disappearing along with the row it was opened on.
+  const cutHere = Boolean(cut && String(cut.profile ?? '') === String(profile))
+  const cutAnchored = cutHere && sessions.some(session => isCutAnchor(cut, profile, session))
+
   let body
 
   if (listed.isPending) {
@@ -10375,8 +10460,8 @@ function SessionListView({
   } else {
     body = jsx('div', {
       className: LIST_CLASS,
-      children: sessions.map(session =>
-        jsx(
+      children: sessions.map(session => {
+        const drawn = jsx(
           SessionRow,
           {
             // Group facts, from the SAME store the roster reads. `group` is the
@@ -10449,7 +10534,20 @@ function SessionListView({
           },
           `view-${profile}-${session.id}`
         )
-      )
+
+        // The confirmation sits UNDER the row it was opened on (Pedro,
+        // 2026-11-03). The cut is what carries the anchor, so a bar cannot
+        // attach itself to a neighbouring row.
+        if (!isCutAnchor(cut, profile, session)) {
+          return drawn
+        }
+
+        return jsxs(
+          'div',
+          { className: 'grid min-w-0 grid-cols-1', children: [drawn, cutBar] },
+          `cut-${profile}-${session.id}`
+        )
+      })
     })
   }
 
@@ -10582,6 +10680,7 @@ function SessionListView({
             'view-select-bar'
           )
         : null,
+      cutHere && !cutAnchored ? cutBar : null,
       body
     ]
   })
@@ -10894,10 +10993,12 @@ function MessengerPane() {
   const queryInput = useValue($searchInput)
   const query = useValue($searchQuery)
   const health = useValue($searchHealth)
-  // "Archive all up to this point" — the pending cut, confirmed in the bar
-  // above the list (never a modal: this pane asks in place, like the row's own
-  // delete strip).
-  const [archiveCut, setArchiveCut] = useState(null)
+  // "Archive all up to this point" — the pending cut. It is confirmed UNDER the
+  // session row it was opened on (Pedro, 2026-11-03: "the confirmation box
+  // should be under the selected session, not at the top of the list"), and
+  // never in a modal: this pane asks in place, like the row's own delete strip.
+  const archiveCut = useValue($archiveCut)
+  const setArchiveCut = next => $archiveCut.set(next)
   const [kind, setKind] = useState('all')
   const [activity, setActivity] = useState('all')
   const [profiles, setProfiles] = useState([])
@@ -11010,7 +11111,10 @@ function MessengerPane() {
 
     setSelectStatus('')
     setArmedDelete(false)
-    setArchiveCut({ entries, profile })
+    // The ANCHOR is the row the verb was picked on: the bar is drawn under it.
+    // Every id that row answers to is kept, so a refetch that renames the tip
+    // still finds it (see cutAnchorIds).
+    setArchiveCut({ anchorIds: [...cutAnchorIds(session)], entries, profile })
   }
   const runArchiveCut = async () => {
     const cut = archiveCut
@@ -11238,12 +11342,32 @@ function MessengerPane() {
     }
   }
   const filters = { activity, kind, profiles }
+  // ONE element, rendered wherever it belongs: under the row it was opened on.
+  // Both screens that offer the verb take this as a prop and place it (see
+  // isCutAnchor), so the bar cannot drift back to the top of the list — and a
+  // cut whose row is no longer drawn still surfaces, at the top of ITS profile.
+  const cutBar = archiveCut
+    ? jsx(
+        ArchiveCutBar,
+        {
+          busy: batching,
+          count: archiveCut.entries.length,
+          onCancel: () => setArchiveCut(null),
+          onRun: runArchiveCut,
+          profile: archiveCut.profile,
+          t
+        },
+        'archive-cut'
+      )
+    : null
 
   // P7 drill-down. Every hook above has already run unconditionally, so this
   // early return is safe: the pane body becomes one profile's session list
   // until the back button clears the view.
   if (view) {
     return jsx(SessionListView, {
+      cut: archiveCut,
+      cutBar,
       editingSession,
       kind: view.kind,
       nowMs,
@@ -11363,6 +11487,8 @@ function MessengerPane() {
                     jsx(
                       ProfileRow,
                       {
+                        cut: archiveCut,
+                        cutBar,
                         editingSession,
                         expanded: Boolean(expanded[row.name]),
                         hits: hits[row.name],
@@ -11643,19 +11769,10 @@ function MessengerPane() {
             children: `${t('searchNothing')} “${needle}”`
           })
         : null,
-      // The cut is confirmed HERE rather than in a dialog: this pane asks in
-      // place everywhere else (a row's delete strip), and the count is the whole
-      // point of the confirmation.
-      archiveCut
-        ? jsx(ArchiveCutBar, {
-            busy: batching,
-            count: archiveCut.entries.length,
-            onCancel: () => setArchiveCut(null),
-            onRun: runArchiveCut,
-            profile: archiveCut.profile,
-            t
-          })
-        : null,
+      // The cut used to be confirmed HERE (top of the list), which put the
+      // question a screenful away from the row it was about (Pedro,
+      // 2026-11-03). It is now placed by the row itself — see ProfileRow's
+      // `cut`/`cutBar` and SessionListView's.
       body
     ]
   })
@@ -11953,6 +12070,7 @@ export const __internals = {
   elementAt,
   $expanded,
   $listView,
+  $archiveCut,
   allSessionKeys,
   archiveSession,
   unarchiveSession,
@@ -12138,6 +12256,8 @@ export const __internals = {
   moreHitsTarget,
   ArchiveCutBar,
   sessionsUpTo,
+  cutAnchorIds,
+  isCutAnchor,
   anySessionId,
   scheduleSearch,
   $searchHealth,

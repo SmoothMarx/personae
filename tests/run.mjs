@@ -7796,6 +7796,118 @@ check(
   )
 }
 
+// ── WHERE the confirmation lands (Pedro, 2026-11-03) ───────────────────────
+// "the confirmation box should be under the selected session, not at the top of
+// the list". Asserted on the real pane render, not on a component in isolation:
+// the bar has to be in the tree directly after the row it was opened on, with
+// no other session row between them.
+
+__internals.$searchQuery.set('')
+__internals.$searchInput.set('')
+__internals.$searchHealth.set({ failed: [], unavailable: false })
+const RESTORE_ZULU = JSON.parse(JSON.stringify(h.queryResults['personae|sessions|zulu'] || null))
+const RESTORE_EXPANDED = __internals.$expanded.get()
+
+h.queryResults['personae|sessions|zulu'] = {
+  data: {
+    zulu: [
+      { id: 'cut-3', last_active: nowSec - 60, preview: 'newest', title: 'newest' },
+      { id: 'cut-2', last_active: nowSec - 600, preview: 'middle', title: 'middle' },
+      { id: 'cut-1', last_active: nowSec - 1200, preview: 'oldest', title: 'oldest' }
+    ]
+  },
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
+__internals.$expanded.set({ zulu: true })
+__internals.$archiveCut.set({ anchorIds: ['cut-2'], entries: [{}, {}], profile: 'zulu' })
+
+markup = render()
+
+const anchorAt = markup.indexOf('data-session="cut-2"')
+const cutAt = markup.indexOf('data-archive-cut="zulu:2"')
+const olderRowAt = markup.indexOf('data-session="cut-1"')
+
+check('the cut is confirmed UNDER the row it was opened on', anchorAt >= 0 && cutAt > anchorAt, `${anchorAt} / ${cutAt}`)
+check('…with no other session row drawn between the two', olderRowAt > cutAt, `${cutAt} / ${olderRowAt}`)
+check('…and the question still carries the count it will act on', markup.includes('Archive the 2 sessions older than this one?'))
+
+// The rule that decides placement, pinned on its own: lineage, profile, and the
+// neighbour it must NOT attach itself to.
+check(
+  'a cut follows its row through a compaction (lineage ids, not the raw tip)',
+  __internals.isCutAnchor(
+    { anchorIds: ['root-1'], profile: 'zulu' },
+    'zulu',
+    { _lineage_ids: ['tip-9', 'root-1'], _lineage_root_id: 'root-1', id: 'tip-9' }
+  )
+)
+check(
+  'a cut never attaches to a row in another profile',
+  !__internals.isCutAnchor({ anchorIds: ['cut-2'], profile: 'zulu' }, 'matt', { id: 'cut-2' })
+)
+check(
+  'a cut never attaches to the row next to it',
+  !__internals.isCutAnchor({ anchorIds: ['cut-2'], profile: 'zulu' }, 'zulu', { id: 'cut-1' })
+)
+check('no pending cut, no bar', !__internals.isCutAnchor(null, 'zulu', { id: 'cut-2' }))
+
+// The row can leave the screen (filter, collapse, another page). The question
+// must not leave WITH it — that would be a bulk verb nobody can cancel.
+__internals.$archiveCut.set({ anchorIds: ['gone-1'], entries: [{}], profile: 'zulu' })
+
+markup = render()
+
+check(
+  'a cut whose row is no longer drawn still draws its confirmation',
+  markup.includes('data-archive-cut="zulu:1"'),
+  markup.slice(0, 200)
+)
+check(
+  '…and it falls back under its own profile, not at the very top of the pane',
+  markup.indexOf('data-archive-cut') > markup.indexOf('data-profile="zulu"')
+)
+
+__internals.$archiveCut.set(null)
+__internals.$expanded.set(RESTORE_EXPANDED)
+if (RESTORE_ZULU) {
+  h.queryResults['personae|sessions|zulu'] = RESTORE_ZULU
+} else {
+  delete h.queryResults['personae|sessions|zulu']
+}
+
+// The drill-down is where the OLD sessions actually live, and it computed this
+// cut and then never drew the bar at all. Same rule there: under the row.
+h.queryResults['personae|view|all|zulu'] = {
+  data: [
+    { id: 'view-2', last_active: nowSec - 60, preview: 'newer', title: 'newer' },
+    { id: 'view-1', last_active: nowSec - 900, preview: 'older', title: 'older' }
+  ],
+  error: null,
+  isError: false,
+  isFetching: false,
+  isPending: false
+}
+__internals.$listView.set({ kind: 'all', profile: 'zulu' })
+__internals.$archiveCut.set({ anchorIds: ['view-1'], entries: [{}], profile: 'zulu' })
+
+markup = render()
+
+const viewRowAt = markup.indexOf('data-session="view-1"')
+const viewCutAt = markup.indexOf('data-archive-cut="zulu:1"')
+
+check(
+  'the drill-down confirms its cut too — under the row it was opened on',
+  viewRowAt >= 0 && viewCutAt > viewRowAt,
+  `${viewRowAt} / ${viewCutAt}`
+)
+
+__internals.$archiveCut.set(null)
+__internals.$listView.set(null)
+delete h.queryResults['personae|view|all|zulu']
+
 // ── and the drill-down lists the same hits the roster previewed ───────────
 
 h.rest.byProfile = { zulu: { results: [{ session_id: 'bh-1', snippet: 'a hit' }, { session_id: 'bh-2', snippet: 'another' }] } }
