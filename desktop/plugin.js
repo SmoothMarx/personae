@@ -6795,9 +6795,17 @@ function ProfileRow({
   // Only the EXPANDED list is grouped: a search-hit list is about the needle,
   // not about filing — and `sessionGroupBlocks` hands back a single anonymous
   // block when there are no groups, which is the flat list it has always been.
+  //
+  // ARCHIVED MEMBERS ARE NOT DRAWN HERE (Pedro, 2026-11-03: "once they become
+  // archived they will be removed from the group (or at least from showing in
+  // the main view)"). The membership is KEPT — it is what puts the row back in
+  // its box the moment it is unarchived — and the member is still fetched and
+  // still searchable; the roster simply stops drawing it. Gated on the flag,
+  // never on the store: filing and archiving stay two independent facts.
+  const filed = visible.filter(session => session?.archived !== true)
   const groupBlocks =
     expanded && !searching
-      ? sessionGroupBlocks(visible, groupState, row.name, releasedState[String(row.name)] || [])
+      ? sessionGroupBlocks(filed, groupState, row.name, releasedState[String(row.name)] || [])
       : [{ collapsed: false, id: null, name: '', sessions: visible }]
   // "Archive all up to this point" is confirmed UNDER the row it was opened on
   // (Pedro, 2026-11-03). `cutAnchored` asks whether this profile will actually

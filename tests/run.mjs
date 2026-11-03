@@ -8116,6 +8116,73 @@ h.rest.byProfile = {}
   __internals.$sessionGroups.set({})
 }
 
+// ── an archived member leaves the BOX, not the group (Pedro, 2026-11-03) ───
+// "once they become archived they will be removed from the group (or at least
+// from showing in the main view)". Chosen: hide, keep the filing. The DATA
+// layer still carries the member (the tests above pin that — it is what puts
+// the row back); the roster stops DRAWING it. Gated on the archived flag, so
+// unarchiving is the whole undo.
+{
+  const profile = 'zulu'
+  const RESTORE_GROUPS = __internals.$sessionGroups.get()
+  const RESTORE_EXPANDED_2 = __internals.$expanded.get()
+  const RESTORE_ZULU_2 = JSON.parse(JSON.stringify(h.queryResults['personae|sessions|zulu'] || null))
+
+  __internals.$sessionGroups.set({
+    [profile]: {
+      groups: [{ id: 'g-arch', name: 'Old stuff' }],
+      members: { 'm-arch': 'g-arch', 'm-live': 'g-arch' },
+      order: ['g-arch']
+    }
+  })
+  __internals.$expanded.set({ [profile]: true })
+
+  const draw = archived => {
+    h.queryResults['personae|sessions|zulu'] = {
+      data: {
+        zulu: [
+          { id: 'm-live', last_active: nowSec - 60, preview: 'live one', title: 'live one' },
+          { archived, id: 'm-arch', last_active: nowSec - 900, preview: 'archived one', title: 'archived one' }
+        ]
+      },
+      error: null,
+      isError: false,
+      isFetching: false,
+      isPending: false
+    }
+
+    return render()
+  }
+
+  markup = draw(true)
+
+  check(
+    'an archived member is NOT drawn in its group on the roster',
+    markup.includes('data-session="m-live"') && !markup.includes('data-session="m-arch"'),
+    markup.slice(markup.indexOf('data-session-group-box'), markup.indexOf('data-session-group-box') + 600)
+  )
+  check(
+    '…but the group it belongs to is still there — the filing was not destroyed',
+    markup.includes('data-session-group-box="g-arch"')
+  )
+
+  markup = draw(false)
+
+  check(
+    'unarchiving puts the row back in its box, with no re-filing',
+    markup.includes('data-session="m-arch"'),
+    markup.slice(markup.indexOf('data-session-group-box'), markup.indexOf('data-session-group-box') + 600)
+  )
+
+  __internals.$sessionGroups.set(RESTORE_GROUPS)
+  __internals.$expanded.set(RESTORE_EXPANDED_2)
+  if (RESTORE_ZULU_2) {
+    h.queryResults['personae|sessions|zulu'] = RESTORE_ZULU_2
+  } else {
+    delete h.queryResults['personae|sessions|zulu']
+  }
+}
+
 // ── 2026-10-17: a member the page cannot serve is RESOLVED, not filtered ────
 // `session.list` serves live rows inside its page and nothing else. Filing an
 // ARCHIVED session, one older than the page, or one whose id a compaction has
