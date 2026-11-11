@@ -7468,7 +7468,9 @@ const i18nT = (key, ...args) => {
   )
 }
 
-// ── the bulk cut: strictly older, same profile, never the clicked row ─────
+// ── the bulk cut: one MOMENT, across every profile, never the clicked row ──
+// Pedro, 2026-11-11: "when we use the options archive/hide up to this point it
+// refers to all sessions from all profiles."
 
 {
   const list = [
@@ -7479,18 +7481,48 @@ const i18nT = (key, ...args) => {
     { id: 'no-time' },
     { id: 'live-id', last_active: nowSec - 400, resolved_id: 'runtime-id' }
   ]
-  const cut = __internals.sessionsUpTo(list, 'cut')
+  const at = (nowSec - 100) * 1000
+  const cut = __internals.cutRowsByMoment(list, 'zulu', at)
 
   check('the cut takes STRICTLY older sessions', cut.map(s => s.id).join() === 'older-a,older-b,live-id', cut.map(s => s.id).join())
   check('the clicked session is never in its own cut', !cut.some(s => s.id === 'cut'))
   check('a session that cannot be placed in time is left alone', !cut.some(s => s.id === 'no-time'))
-  check('an unknown target cuts nothing', __internals.sessionsUpTo(list, 'nope').length === 0)
-  check('a target with no readable timestamp cuts nothing', __internals.sessionsUpTo(list, 'no-time').length === 0)
+  check('a moment of zero cuts nothing (never the whole list)', __internals.cutRowsByMoment(list, 'zulu', 0).length === 0)
   check(
-    'the target resolves by EITHER id a row answers to — stored or live',
-    __internals.sessionsUpTo(list, 'runtime-id').map(s => s.id).join() === 'older-b' &&
-      __internals.sessionsUpTo(list, 'live-id').map(s => s.id).join() === 'older-b',
-    `${__internals.sessionsUpTo(list, 'runtime-id').map(s => s.id).join()} / ${__internals.sessionsUpTo(list, 'live-id').map(s => s.id).join()}`
+    'every entry carries the PROFILE it came from, and the session_id shape the archive takes',
+    cut.every(row => row.profile === 'zulu' && row.session_id === String(row.id)),
+    JSON.stringify(cut[0])
+  )
+  check(
+    'the cut is a MOMENT: every profile it is run over contributes its own rows',
+    ['zulu', 'matt']
+      .flatMap(name => __internals.cutRowsByMoment(list, name, at))
+      .filter(row => row.id === 'older-a')
+      .map(row => row.profile)
+      .join(',') === 'zulu,matt'
+  )
+  check(
+    'the pane runs the cut over EVERY profile, not just the row’s own',
+    SRC.includes('const readEveryProfile =') &&
+      SRC.includes('lists.flatMap(([name, list]) => cutRowsByMoment(list, name, at))'),
+    'the archive cut is wired to one profile again'
+  )
+  check(
+    'the hide form is INCLUSIVE and reads CREATION time',
+    __internals
+      .cutRowsByMoment(
+        [
+          { id: 'same', started_at: 500 },
+          { id: 'older', started_at: 400, last_active: 9000 },
+          { id: 'newer', started_at: 600 }
+        ],
+        'zulu',
+        500 * 1000,
+        { field: 'started', inclusive: true }
+      )
+      .map(row => row.id)
+      .join() === 'same,older',
+    'inclusive/started cut is wrong'
   )
 }
 

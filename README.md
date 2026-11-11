@@ -189,7 +189,7 @@ offers the ones that make sense on the thing you clicked.
 | **Sort** | Manual, or by last activity |
 | **Copy id** | The exact profile or session id |
 | **Apropos (On that topic, beta)** | A new child session that knows this background |
-| **Archive all up to this point…** | Archive everything in that profile **older** than the session you clicked — the count is shown first, and nothing moves until you confirm |
+| **Archive all up to this point…** | Archive everything **older** than the session you clicked — in **every profile**, not just that row's own. The count is shown first, and nothing moves until you confirm |
 | **Unarchive** | Put an archived session back in the live list. It replaces **Archive** on an archived row (offering "archive" to something already archived is a no-op dressed as an action), and the bulk cut is not offered from inside the archive for the same reason |
 | **Delete** | Delete the session or the group — see below |
 

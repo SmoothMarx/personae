@@ -3250,48 +3250,6 @@ function anySessionId(session) {
   return String(session?.resolved_id || session?.id || '')
 }
 
-/** "Archive all up to this point" (Pedro, 2026-10-16): every session of ONE
- *  profile whose last activity is STRICTLY older than the clicked one's.
- *
- *  Pure, and deliberately NOT "the rows below this one on screen": the drawn
- *  list is capped at ten, sorted by whatever mode the user picked, and possibly
- *  filtered — while this verb is a statement about the profile's whole history.
- *  The caller therefore passes the FULL list (`session.list` at its ceiling),
- *  and the count it reports is the count it will act on.
- *
- *  A session with no readable timestamp is LEFT OUT: it cannot be placed in
- *  time, and archiving by guess is not something the user can undo one row at a
- *  time. The clicked session is never in the result — archiving it is what the
- *  ordinary Archive verb is for. */
-function sessionsUpTo(sessions, targetId) {
-  const list = Array.isArray(sessions) ? sessions : []
-  const wanted = String(targetId ?? '')
-  // A row answers to TWO ids — the durable stored one and, while it is live, a
-  // runtime one. Both must find the target and both must keep it out of its own
-  // cut, or the verb quietly does nothing depending on which id the caller had.
-  const isTarget = session => Boolean(wanted) && (anySessionId(session) === wanted || String(session?.id || '') === wanted)
-  const target = list.find(isTarget)
-
-  if (!wanted || !target) {
-    return []
-  }
-
-  const at = secondsToMs(target?.last_active || target?.started_at)
-
-  if (at === null) {
-    return []
-  }
-
-  return list.filter(session => {
-    if (isTarget(session)) {
-      return false
-    }
-
-    const when = secondsToMs(session?.last_active || session?.started_at)
-
-    return when !== null && when < at
-  })
-}
 
 /** Every id a row can be addressed by — the stored one, the live one and the
  *  lineage it survived compactions through (see rowIdentities). A cut is
@@ -5354,6 +5312,47 @@ async function resolvedMemberRows(profile, ids) {
   return rows
 }
 
+/** Every row from ANY profile on the far side of one moment.
+ *
+ *  "Up to this point" is a MOMENT, not a profile (Pedro, 2026-11-11: "when we use
+ *  the options archive/hide up to this point it refers to all sessions from all
+ *  profiles"). Each profile's own list goes through this one predicate, and every
+ *  entry keeps the profile it came from: the archive call is per session, and an
+ *  entry that lost its owner would act on the wrong store.
+ *
+ *  `field` names the moment — `activity` (the row's last activity, which is what
+ *  the archive cut has always used) or `started` (when the conversation began,
+ *  which is what "hide all up to this point" means). `inclusive` is for the hide
+ *  verb, which takes the anchor with it.
+ *
+ *  `session_id` is stamped because that is the shape `archiveSessionEntry` and
+ *  every batch verb take: a raw listing row carries `id` only, and the cut used
+ *  to hand those straight to `session.archive` with an empty `session_id` — a
+ *  bulk archive that failed every row and reported it as `N failed`.
+ */
+function cutRowsByMoment(rows, profile, momentMs, { field = 'activity', inclusive = false } = {}) {
+  const at = Number(momentMs) || 0
+
+  if (at <= 0) {
+    return []
+  }
+
+  return (Array.isArray(rows) ? rows : [])
+    .filter(row => {
+      const when =
+        field === 'started'
+          ? secondsToMs(row?.started_at) || 0
+          : secondsToMs(row?.last_active || row?.started_at) || 0
+
+      if (!when) {
+        return false
+      }
+
+      return inclusive ? when <= at : when < at
+    })
+    .map(row => ({ ...row, profile: String(profile), session_id: String(row?.id || '') }))
+}
+
 /** `session.list` = most recent first, sub-agent/kanban sources already denied.
  *  The page is as small as it has always been unless something this profile
  *  filed or linked is missing from it, in which case it widens — a few requests
@@ -7199,7 +7198,7 @@ function ProfileRow({
                       // (sessionId, groupId) was the arity bug that made moving a
                       // session into a group a silent no-op.
                       onMoveGroup,
-                      // The bulk-archive cut (see sessionsUpTo): the row supplies
+                      // The bulk-archive cut (see cutRowsByMoment): the row supplies
                       // the session it was picked on, the PANE reads the
                       // profile's full list and confirms the count before
                       // anything moves.
@@ -11100,11 +11099,35 @@ function MessengerPane() {
   // confirm the count before anything moves. The rows on screen are a capped,
   // sorted, possibly filtered page — a bulk verb that computed its set from them
   // would report one number and act on another.
+  /** Every profile's FULL list, in parallel. A profile whose store refuses
+   *  contributes nothing rather than taking the whole verb down with it. */
+  const readEveryProfile = () =>
+    Promise.all(
+      rows.map(async row => {
+        try {
+          return [row.name, await listAllSessions(row.name)]
+        } catch {
+          return [row.name, []]
+        }
+      })
+    )
   const openArchiveUpTo = async (session, profile) => {
+    // The CUT is a moment: everything, in EVERY profile, older than the row the
+    // verb was picked on. Reading only this profile's list is what made the verb
+    // quietly profile-scoped.
+    const at = secondsToMs(session?.last_active || session?.started_at)
     let entries = []
 
+    if (!at) {
+      setSelectStatus(t('nothingOlder'))
+
+      return
+    }
+
     try {
-      entries = sessionsUpTo(await listAllSessions(profile), sessionIdOf(session) || session?.id)
+      const lists = await readEveryProfile()
+
+      entries = lists.flatMap(([name, list]) => cutRowsByMoment(list, name, at))
     } catch (error) {
       host.notifyError?.(String(error?.message || error))
 
@@ -11139,6 +11162,10 @@ function MessengerPane() {
     setArchiveCut(null)
     setSelectStatus(failed ? `${done} ${t('archived')} · ${failed} ${t('failed')}` : `${done} ${t('archived')}`)
     await queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+    // The pages are per profile and keyed by the OPEN SET, so a cut that reached
+    // a profile the user is not looking at would leave that profile's rows on
+    // screen until something else moved its key.
+    await queryClient.invalidateQueries({ queryKey: ['personae', 'sessions'] })
     await queryClient.invalidateQueries({ queryKey: ['personae', 'view'] })
 
     return undefined
@@ -12263,7 +12290,7 @@ export const __internals = {
   listMatch,
   moreHitsTarget,
   ArchiveCutBar,
-  sessionsUpTo,
+  cutRowsByMoment,
   cutAnchorIds,
   isCutAnchor,
   anySessionId,
