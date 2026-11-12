@@ -495,6 +495,9 @@ function channelLabel(source) {
  *  ×1.53 — deliberately BIGGER than bot mode (Pedro's call, size eyeballed).
  *  One number drives the row, the skeleton and the fallback chip. */
 const AVATAR_SIZE = 52
+/** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
+ *  A pane silently running a stale build looks exactly like a broken feature. */
+const BUILD = '1.8.12'
 const AVATAR_RADIUS = '22%'
 /** The rail's list gutter, from `roster-pane-content.tsx`. */
 // `grid-cols-1` is load-bearing, not decoration: an implicit grid track is
@@ -3804,6 +3807,16 @@ async function newSession(profile) {
     return host.newChat(scope)
   }
 
+  const say = message => {
+    try {
+      host.notify?.({ kind: 'info', message: `Personae ${BUILD}: ${message}` })
+    } catch {
+      /* a toast is a courtesy, never the flow */
+    }
+  }
+
+  say(`new session for "${scope}" — creating`)
+
   try {
     const res = await host.request('session.create', {
       idempotency_key: `sessions-new-${scope}-${Date.now().toString(36)}`,
@@ -3815,8 +3828,12 @@ async function newSession(profile) {
     if (!storedId) {
       // A gateway that answered without a stored id cannot be opened by id: fall
       // back to the app's own draft rather than opening nothing at all.
+      say('gateway answered WITHOUT a stored id — falling back to a draft')
+
       return host.newChat(scope)
     }
+
+    say(`created ${storedId}`)
 
     // A bare create writes NO row, and a session with no row cannot be resumed or
     // listed later. `session.title` persists it (`_ensure_session_db_row`: an
@@ -3844,6 +3861,7 @@ async function newSession(profile) {
     // "Waking up <profile>" forever (Pedro, 2026-11-11).
     return await openSession(storedId, scope, 'tab', CHILDLESS_OPEN)
   } catch (error) {
+    say(`create FAILED — ${String(error?.message || error).slice(0, 160)}`)
     host.notifyError?.(String(error?.message || error))
 
     // Never a dead button.
@@ -5422,7 +5440,9 @@ async function resolvedMemberRows(profile, ids) {
   }
 
   if (!rows.length) {
-    const archived = (await listArchivedSessions(profile, SESSIONS_FILL_CAP)) || []
+    // The backend refuses above 200 (`Query(..., le=200)`): the fill cap answered
+    // a bare 422, which reads as an unreadable archive.
+    const archived = (await listArchivedSessions(profile, Math.min(SESSIONS_FILL_CAP, 200))) || []
 
     rows = archived
       .filter(row => ids.map(String).includes(String(row?.id)))
@@ -7996,7 +8016,7 @@ function Toolbar({ onBell, onFiles, onNewGroup, onSelect, rows, selecting, shown
               'span',
               {
                 className: 'min-w-0 shrink truncate text-[0.6875rem] text-(--ui-text-quaternary)',
-                children: `${shownCount}/${rows.length} ${t('profilesLabel')}`
+                children: `${shownCount}/${rows.length} ${t('profilesLabel')} · ${BUILD}`
               },
               'count'
             )
