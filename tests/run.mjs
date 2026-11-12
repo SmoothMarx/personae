@@ -6234,7 +6234,69 @@ if (process.env.DUMP_GROUPS) {
   check('…and the dialog is mounted in the pane', SRC7.includes("'edit-profile-dialog'"))
 
   // (4) Deleting a session deletes the LINE it belongs to (core orphans the rest).
-  check('the row delete goes through the chain', /const done = await deleteSessionChain\(/.test(SRC7))
+  // Pedro, 2026-11-12: "if the user selects multiple sessions, then the
+  // right-click menu options should apply to all selected."
+  check(
+    'a row menu acts on the whole tick set, and on one row only when it is not ticked',
+    (() => {
+      const ticks = [
+        { openId: 'o1', profile: 'a', session_id: 's1' },
+        { openId: 'o2', profile: 'b', session_id: 's2' }
+      ]
+      const own = { openId: 'o1', profile: 'a', session_id: 's1' }
+      const multi = __internals.menuTargets({
+        batchTicks: ticks,
+        entry: own,
+        selected: true,
+        selecting: true,
+        tickCount: 2
+      })
+      const stranger = __internals.menuTargets({
+        batchTicks: ticks,
+        entry: { openId: 'o9', profile: 'z', session_id: 's9' },
+        selected: false,
+        selecting: true,
+        tickCount: 2
+      })
+      const single = __internals.menuTargets({
+        batchTicks: [ticks[0]],
+        entry: own,
+        selected: true,
+        selecting: true,
+        tickCount: 1
+      })
+      const idle = __internals.menuTargets({ batchTicks: ticks, entry: own, selected: false, selecting: false, tickCount: 0 })
+
+      return (
+        multi.length === 2 &&
+        multi[1].session_id === 's2' &&
+        // A row that is NOT part of the selection acts on itself: the right-click
+        // has already replaced the selection by then.
+        stranger.length === 1 &&
+        stranger[0].session_id === 's9' &&
+        single.length === 1 &&
+        single[0].session_id === 's1' &&
+        idle.length === 1 &&
+        idle[0].session_id === 's1'
+      )
+    })(),
+    'the menu still acts on one session while rows are ticked'
+  )
+
+  check(
+    'the labels say how many, and the bulk verbs take the set',
+    SRC.includes("menuGlyph('browser', multi ? `In new tabs (${targets.length})` : 'In new tab')") &&
+      SRC.includes("multi ? `Archive ${targets.length}` : 'Archive'") &&
+      SRC.includes("multi ? `Copy ${targets.length} ids` : 'Copy id'") &&
+      SRC.includes('Delete these ${targets.length} sessions and their transcripts?')
+  )
+
+  // A menu over a SELECTION deletes the selection, so the row no longer names the
+  // one entry: it hands the resolved targets to the same chain walk.
+  check(
+    'the row delete goes through the chain',
+    /runOverSessions\(targets, deleteSessionChain\)/.test(SRC7)
+  )
   check('…which prefers the gateway lineage when the row carries one', SRC7.includes('row?.lineage_ids'))
   const before = new Set(['old-tip'])
   const rows = [
@@ -6289,7 +6351,11 @@ if (process.env.DUMP_GROUPS) {
   check('the empty hidden view names Personae', h.i18n.viewHiddenEmpty.includes('Personae'), h.i18n.viewHiddenEmpty)
   check(
     '…and the row menu hides from Personae, not from Messenger',
-    SRC8.includes("'Unhide in Personae' : 'Hide from Personae'")
+    SRC8.includes("'Unhide in Personae'") &&
+      SRC8.includes("'Hide from Personae'") &&
+      !SRC8.includes('Hide from Messenger') &&
+      // …and over a selection it hides EVERY ticked session.
+      SRC8.includes('setHiddenForTargets(targets, !hidden)')
   )
 
   // (2) fillOf — opt-in, and read out of the document the Bots editor writes, so
@@ -6583,7 +6649,7 @@ if (process.env.DUMP_GROUPS) {
   )
   check(
     '…while a window open stays un-flagged — it may never get a tile here',
-    SRC10.includes("openSession(openId, profile, 'window')")
+    SRC10.includes("openSession(entry.openId, entry.profile, 'window')")
   )
   check(
     '…which is what both create-then-open call sites actually pass',
@@ -7784,7 +7850,9 @@ check(
   check(
     'and hands them to every row, with the group facts the menu reads',
     [
-      'onNewGroup: () => onNewGroup(profile, [session.id])',
+      // A new group files the whole SELECTION of this profile, not just the row
+      // it was opened on (Pedro, 2026-11-12).
+      'onNewGroup: () => onNewGroup(profile, groupMemberIds(ticks, profile))',
       'onMoveGroup: payload => onMoveGroup(profile, payload, selectedKeys)',
       'groups: groupSlice.groups',
       'group: groupSlice.members[String(session.id)]'

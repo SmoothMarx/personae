@@ -497,7 +497,7 @@ function channelLabel(source) {
 const AVATAR_SIZE = 52
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane silently running a stale build looks exactly like a broken feature. */
-const BUILD = '1.8.14'
+const BUILD = '1.8.15'
 const AVATAR_RADIUS = '22%'
 /** The rail's list gutter, from `roster-pane-content.tsx`. */
 // `grid-cols-1` is load-bearing, not decoration: an implicit grid track is
@@ -3889,6 +3889,50 @@ function sessionKey(profile, storedId) {
   return `${String(profile)}|${String(storedId)}`
 }
 
+/** Which sessions a ROW menu acts on. Pure.
+ *
+ *  A menu opened while rows are ticked acts on the SET or it must not be offered
+ *  (Pedro, 2026-11-12: "if the user selects multiple sessions, then the
+ *  right-click menu options should apply to all selected"). The row clicked must
+ *  be one of the ticked ones — right-clicking a stranger replaces the selection,
+ *  so acting on the ticks there would be the same bug the other way round.
+ */
+function menuTargets({ batchTicks, entry, selected, selecting, tickCount }) {
+  const ticks = (Array.isArray(batchTicks) ? batchTicks : []).filter(entry => entry && entry.session_id)
+
+  if (!selecting || !selected || Number(tickCount) <= 1 || ticks.length <= 1) {
+    return [entry]
+  }
+
+  return ticks
+}
+
+/** The members a "New session group" would file: every TICKED session of the
+ *  clicked row's profile. A group lives in one profile, so a cross-profile
+ *  selection can only bring its own profile's share. */
+function groupMemberIds(targets, profile) {
+  const scope = String(profile || '')
+
+  return (targets || [])
+    .filter(entry => String(entry?.profile || '') === scope)
+    .map(entry => String(entry?.session_id || ''))
+    .filter(Boolean)
+}
+
+/** Hide/unhide a whole target set. `setSessionHidden` owns the store write (and
+ *  the persistence), so the batch walks it rather than growing a second path that
+ *  could disagree about an empty list. */
+function setHiddenForTargets(targets, hidden) {
+  for (const entry of targets || []) {
+    const scope = String(entry.profile || '')
+    const id = String(entry.session_id || '')
+
+    if (scope && id) {
+      setSessionHidden(scope, id, hidden)
+    }
+  }
+}
+
 /** One tick, as a fresh list (never mutates the caller's). */
 /** The whole tick transition in one place: tick (or untick) the key and report
  *  whether the set EMPTIED, which is what leaves select mode. Pedro,
@@ -5220,6 +5264,32 @@ async function copySessionId(storedId) {
   return ok
 }
 
+/** Copy N ids, one per line — the batch twin of copySessionId. Same clipboard
+ *  path (the SDK has none), same toast, and the count in the message so a bulk
+ *  paste can be checked at a glance. */
+async function copySessionIds(entries) {
+  const ids = (entries || []).map(entry => String(entry?.session_id || '')).filter(Boolean)
+  const text = ids.join('\n')
+
+  if (!text) {
+    return false
+  }
+
+  if (ids.length === 1) {
+    return copySessionId(ids[0])
+  }
+
+  const ok = await copyText(text)
+
+  host.notify({
+    kind: ok ? 'success' : 'error',
+    message: ok ? `${ids.length} session ids` : `Could not copy ${ids.length} ids`,
+    title: ok ? 'Session ids copied' : 'Copy failed'
+  })
+
+  return ok
+}
+
 /** One write path for both link kinds, so normalizeApropos is the only place
  *  that decides what a link may look like. */
 function writeApropos(profile, childId, entry) {
@@ -5833,14 +5903,20 @@ function moveItems(row, model, Item) {
 
 /** The color picker inside the session menu's Appearance submenu. Its own
  *  component so only an OPEN submenu reads the color map, not every row. */
-function ColorPicker({ profile, sessionId }) {
+function ColorPicker({ profile, sessionId, targets }) {
   const colors = useValue($sessionColors)
+  // One pick, applied to every session in the selection; the swatch grid then
+  // shows nothing selected, because the set no longer has one answer.
+  const many = (targets || []).length > 1
 
   return jsx(ColorSwatches, {
     clearLabel: 'Clear color',
-    onChange: color => setSessionColor(profile, sessionId, color),
+    onChange: color =>
+      many
+        ? targets.forEach(entry => setSessionColor(entry.profile, entry.session_id, color))
+        : setSessionColor(profile, sessionId, color),
     swatches: PROFILE_SWATCHES,
-    value: colors?.[profile]?.[sessionId] || null
+    value: many ? null : colors?.[profile]?.[sessionId] || null
   })
 }
 
@@ -5862,7 +5938,7 @@ function GroupColorPicker({ groupId, profile }) {
 /** The project list inside "Assign to project": the per-profile `projects.db`,
  *  which is the same registry the sidebar's project tree reads. Own component
  *  for the same reason as the picker — and the only place here that asks. */
-function ProjectPicker({ profile, sessionId }) {
+function ProjectPicker({ profile, sessionId, targets }) {
   const projects = useQuery({
     queryKey: [...PROJECTS_KEY, profile],
     queryFn: async () => {
@@ -5891,7 +5967,15 @@ function ProjectPicker({ profile, sessionId }) {
           onSelect: () => {
             const cwd = projectCwd(project)
 
-            return cwd ? moveSessionToProject(sessionId, cwd, profile) : undefined
+            if (!cwd) {
+              return undefined
+            }
+
+            const many = (targets || []).length > 1
+
+            return many
+              ? Promise.all(targets.map(entry => moveSessionToProject(entry.session_id, cwd, entry.profile)))
+              : moveSessionToProject(sessionId, cwd, profile)
           },
           children: project.name || project.slug || project.id
         },
@@ -6011,6 +6095,10 @@ function SessionRow({
   // TICKED must act on the tick set or not be offered at all — so this counts
   // them and the Apropos submenu switches verbs above one.
   tickCount,
+  // The RESOLVED tick set (profile · session_id · openId · title). A menu opened
+  // over a selection must act on the whole set, and the row cannot resolve other
+  // profiles' ticks by itself.
+  batchTicks,
   // Is this row inside an Apropos group? The mark on its name depends on it.
   aproposGroup
 }) {
@@ -6026,6 +6114,17 @@ function SessionRow({
   // selection verb, which builds a GROUP digest naming every member.
   const ticked = Math.max(0, Number(tickCount) || 0)
   const selectionApropos = Boolean(selecting) && Boolean(selected) && ticked > 1
+  // Every verb below rides this: the ticks when this row is one of them, else
+  // this row alone. `multi` is what hides the verbs that can only consult ONE
+  // transcript (rename, branch, export, "from this session") and what puts the
+  // count into the others' labels.
+  const ownEntry = { openId, profile: String(profile || ''), session_id: storedId, title }
+  const targets = menuTargets({ batchTicks, entry: ownEntry, selected, selecting, tickCount: ticked })
+  const multi = targets.length > 1
+  const idsText = targets
+    .map(entry => String(entry.session_id || ''))
+    .filter(Boolean)
+    .join('\n')
   const color = colors?.[profile]?.[storedId] || null
   // Apropos chips: the child points at its parent, the parent counts its
   // children. Read here (a hook) so only a rendered row subscribes.
@@ -6096,10 +6195,13 @@ function SessionRow({
         // `openId` matters: a live session may be registered under its runtime
         // id while the stored id is what `session.delete` refuses on. The row
         // knows both (Pedro, 2026-10-10: "Allow deletion of active session").
-        const done = await deleteSessionChain({ openId, profile, session_id: storedId })
+        // ONE chain delete per target: a live session may be registered under its
+        // runtime id while the stored id is what `session.delete` refuses on, and
+        // a compaction can put an ancestor back — the chain walk owns both.
+        const { done: removed, failed: refused } = await runOverSessions(targets, deleteSessionChain)
 
-        if (!done) {
-          failed = 'Delete failed'
+        if (!removed && refused) {
+          failed = refused === 1 ? 'Delete failed' : `${refused} could not be deleted`
         }
       } catch (error) {
         failed = String(error?.message || error || 'Delete failed')
@@ -6126,7 +6228,7 @@ function SessionRow({
       children: [
         jsx('span', {
           className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-tertiary)',
-          children: 'Delete this session and its transcripts?'
+          children: multi ? `Delete these ${targets.length} sessions and their transcripts?` : 'Delete this session and its transcripts?'
         }, 'ask'),
         jsxs('div', {
           className: 'flex items-center gap-0.5',
@@ -6381,12 +6483,22 @@ function SessionRow({
                     children: [
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => openSession(openId, profile, 'window'), children: menuGlyph('link-external', 'In new window') },
+                        {
+                          onSelect: () => targets.forEach(entry => openSession(entry.openId, entry.profile, 'window')),
+                          children: menuGlyph(
+                            'link-external',
+                            multi ? `In new windows (${targets.length})` : 'In new window'
+                          )
+                        },
                         'open-window'
                       ),
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => openSession(openId, profile, 'tab', INTENT_OPEN), children: menuGlyph('browser', 'In new tab') },
+                        {
+                          onSelect: () =>
+                            targets.forEach(entry => openSession(entry.openId, entry.profile, 'tab', INTENT_OPEN)),
+                          children: menuGlyph('browser', multi ? `In new tabs (${targets.length})` : 'In new tab')
+                        },
                         'open-tab'
                       )
                     ]
@@ -6409,27 +6521,48 @@ function SessionRow({
                     children: [
                       jsx(
                         ContextMenuItem,
-                        { onSelect: () => markSessionUnreadFinished(storedId, profile), children: menuGlyph('mail', 'Mark as unread') },
+                        {
+                          onSelect: () =>
+                            targets.forEach(entry => markSessionUnreadFinished(entry.session_id, entry.profile)),
+                          children: menuGlyph('mail', multi ? `Mark ${targets.length} as unread` : 'Mark as unread')
+                        },
                         'unread'
                       ),
-                      jsx(ContextMenuItem, { onSelect: () => onRename(session, profile), children: menuGlyph('edit', 'Rename…') }, 'rename'),
-                      jsx(ContextMenuItem, { onSelect: () => branchSession(storedId, profile), children: menuGlyph('repo-forked', 'Branch') }, 'branch'),
+                      // Renaming and branching consult ONE transcript: offered over
+                      // a selection they would silently act on the clicked row.
+                      multi
+                        ? null
+                        : jsx(ContextMenuItem, { onSelect: () => onRename(session, profile), children: menuGlyph('edit', 'Rename…') }, 'rename'),
+                      multi
+                        ? null
+                        : jsx(ContextMenuItem, { onSelect: () => branchSession(storedId, profile), children: menuGlyph('repo-forked', 'Branch') }, 'branch'),
                       // The stored id is the key every other door takes: the
                       // gateway RPCs, the REST API, and `session_search(session_id=…)`.
-                      jsx(ContextMenuItem, { onSelect: () => copySessionId(storedId), children: menuGlyph('copy', 'Copy id') }, 'copy-id'),
-                      jsx(
-                        ContextMenuItem,
-                        { onSelect: () => exportSession(storedId, profile, title), children: menuGlyph('cloud-download', 'Export…') },
-                        'export'
-                      ),
+                      jsx(ContextMenuItem, { onSelect: () => copySessionIds(targets), children: menuGlyph('copy', multi ? `Copy ${targets.length} ids` : 'Copy id') }, 'copy-id'),
+                      multi
+                        ? null
+                        : jsx(
+                            ContextMenuItem,
+                            { onSelect: () => exportSession(storedId, profile, title), children: menuGlyph('cloud-download', 'Export…') },
+                            'export'
+                          ),
                       // Hiding is the pane's own view filter, never a core
                       // mutation: the session keeps living in the Sessions tab, so
                       // this is the reversible half of Archive.
                       jsx(
                         ContextMenuItem,
                         {
-                          onSelect: () => setSessionHidden(profile, storedId, !hidden),
-                          children: menuGlyph(hidden ? 'eye' : 'eye-closed', hidden ? 'Unhide in Personae' : 'Hide from Personae')
+                          onSelect: () => setHiddenForTargets(targets, !hidden),
+                          children: menuGlyph(
+                            hidden ? 'eye' : 'eye-closed',
+                            hidden
+                              ? multi
+                                ? `Unhide ${targets.length} in Personae`
+                                : 'Unhide in Personae'
+                              : multi
+                                ? `Hide ${targets.length} from Personae`
+                                : 'Hide from Personae'
+                          )
                         },
                         'hide-session'
                       ),
@@ -6441,14 +6574,21 @@ function SessionRow({
                         ? jsx(
                             ContextMenuItem,
                             {
-                              onSelect: () => unarchiveSession(storedId, profile),
-                              children: menuGlyph('unarchive', 'Unarchive')
+                              onSelect: () =>
+                                targets.forEach(entry => unarchiveSession(entry.session_id, entry.profile)),
+                              children: menuGlyph('unarchive', multi ? `Unarchive ${targets.length}` : 'Unarchive')
                             },
                             'unarchive'
                           )
                         : jsx(
                             ContextMenuItem,
-                            { onSelect: () => archiveSession(storedId, profile), children: menuGlyph('archive', 'Archive') },
+                            {
+                              onSelect: () =>
+                                multi
+                                  ? runOverSessions(targets, archiveSessionEntry)
+                                  : archiveSession(storedId, profile),
+                              children: menuGlyph('archive', multi ? `Archive ${targets.length}` : 'Archive')
+                            },
                             'archive'
                           ),
                       // "Archive all up to this point" (Pedro, 2026-10-16): this
@@ -6617,7 +6757,7 @@ function SessionRow({
                 jsx(ContextMenuSubTrigger, { children: menuGlyph('symbol-color', 'Appearance') }, 'appearance'),
                 jsx(
                   ContextMenuSubContent,
-                  { children: jsx(ColorPicker, { profile, sessionId: storedId }) },
+                  { children: jsx(ColorPicker, { profile, sessionId: storedId, targets }) },
                   'appearance-body'
                 )
               ]
@@ -6632,7 +6772,7 @@ function SessionRow({
                 jsx(ContextMenuSubTrigger, { children: menuGlyph('project', 'Assign to project') }, 'project'),
                 jsx(
                   ContextMenuSubContent,
-                  { children: jsx(ProjectPicker, { profile, sessionId: storedId }) },
+                  { children: jsx(ProjectPicker, { profile, sessionId: storedId, targets }) },
                   'project-body'
                 )
               ]
@@ -7432,7 +7572,8 @@ function ProfileRow({
                           aproposEntriesFor({ profile: row.name, sessions, selectedKeys, session })
                         ),
                       tickCount: tickedHere.length,
-                      onNewGroup: () => onNewGroup([session.id]),
+                      batchTicks: tickedHere,
+                      onNewGroup: () => onNewGroup(groupMemberIds(tickedHere, row.name)),
                       onSelect: () => onSelect(row.name, session.id),
                       onToggleSelect: () => onToggleSelect(sessionKey(row.name, session.id)),
                       profile: row.name,
@@ -10725,8 +10866,9 @@ function SessionListView({
             // What the menu needs to know to offer the SELECTION verb instead of
             // the single-session one: the set it would act on.
             tickCount: ticks.length,
+            batchTicks: ticks,
             onMoveGroup: payload => onMoveGroup(profile, payload, selectedKeys),
-            onNewGroup: () => onNewGroup(profile, [session.id]),
+            onNewGroup: () => onNewGroup(profile, groupMemberIds(ticks, profile)),
             onRename: onRenameSession,
             onRenameCancel,
             // The SESSION, not its id: renaming needs the live id too (see renameSession).
@@ -12401,6 +12543,9 @@ export const __internals = {
   selectedSessions,
   aproposEntriesFor,
   buildAproposGroupDigest,
+  menuTargets,
+  setHiddenForTargets,
+  copySessionIds,
   sessionKey,
   SelectBar,
   toggleSelected,
