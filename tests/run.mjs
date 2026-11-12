@@ -8473,23 +8473,49 @@ h.rest.byProfile = {}
 // safe claim is "this pane opened that session".
 {
   check(
-    'the hero claims a session only if THIS pane opened it, recently, and it is on screen',
-    __internals.claimsChatEmpty({ sessionId: 's1', focusedId: 's1', openedAt: { s1: Date.now() }, now: Date.now() }) ===
-      true &&
+    // The slot asks with the LIVE id while the store is keyed by the id the pane
+    // OPENED with (stored), and the two are never equal — comparing them meant the
+    // hero could not draw for any session (Pedro, 2026-11-11: "the hero doesn't
+    // show up").
+    'the hero claims a session by its LIVE id, or by the stored id of the tile on screen',
+    __internals.claimsChatEmpty({
+      sessionId: 'live1',
+      activeId: 'live1',
+      focusedId: 'stored1',
+      openedAt: { stored1: Date.now() },
+      now: Date.now()
+    }) === true &&
+      // Recorded under the live id too, so a reminted stored id still claims.
       __internals.claimsChatEmpty({
-        sessionId: 's1',
-        focusedId: 'other',
-        openedAt: { s1: Date.now() },
+        sessionId: 'live1',
+        activeId: 'live9',
+        focusedId: 'stored9',
+        openedAt: { live1: Date.now() },
+        now: Date.now()
+      }) === true &&
+      // Another chat's tile must not borrow a stored claim.
+      __internals.claimsChatEmpty({
+        sessionId: 'live2',
+        activeId: 'live2',
+        focusedId: 'stored2',
+        openedAt: { stored1: Date.now() },
         now: Date.now()
       }) === false &&
-      __internals.claimsChatEmpty({ sessionId: 's1', focusedId: 's1', openedAt: {}, now: Date.now() }) === false &&
       __internals.claimsChatEmpty({
-        sessionId: 's1',
-        focusedId: 's1',
-        openedAt: { s1: Date.now() - 13 * 60 * 60 * 1000 },
+        sessionId: 'live1',
+        activeId: 'live1',
+        focusedId: 'stored1',
+        openedAt: {},
+        now: Date.now()
+      }) === false &&
+      __internals.claimsChatEmpty({
+        sessionId: 'live1',
+        activeId: 'live1',
+        focusedId: 'stored1',
+        openedAt: { stored1: Date.now() - 13 * 60 * 60 * 1000 },
         now: Date.now()
       }) === false,
-    'the claim rule is not exclusive'
+    'the claim rule stopped mapping live ids to stored ones'
   )
 
   check(

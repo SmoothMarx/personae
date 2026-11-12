@@ -497,7 +497,7 @@ function channelLabel(source) {
 const AVATAR_SIZE = 52
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane silently running a stale build looks exactly like a broken feature. */
-const BUILD = '1.8.12'
+const BUILD = '1.8.13'
 const AVATAR_RADIUS = '22%'
 /** The rail's list gutter, from `roster-pane-content.tsx`. */
 // `grid-cols-1` is load-bearing, not decoration: an implicit grid track is
@@ -3853,7 +3853,7 @@ async function newSession(profile) {
       }
     }
 
-    noteOpened(storedId)
+    noteOpened(storedId, res?.session_id)
 
     // CHILDLESS_OPEN, not INTENT_OPEN: the transcript holds ONE hidden row and
     // paints nothing, so `expectHistory: true` waits for a painted transcript that
@@ -3978,13 +3978,18 @@ function clickSelect(keys, key) {
  *  Declines everything it did not open: the slot mounts every contribution, and a
  *  hero drawn over someone else's chat is worse than a blank thread. */
 function ProfileChatEmpty({ sessionId }) {
+  const activeId = useValue(host.state.activeSessionId)
   const focusedId = useValue(host.state.focusedStoredSessionId)
-  const profile = useValue(host.state.focusedSessionProfile)
+  const focusedProfile = useValue(host.state.focusedSessionProfile)
+  // A session created seconds ago may not have a focused profile yet, and the
+  // roster row is the face: fall back to the profile being viewed.
+  const viewedProfile = useValue(host.state.profile)
+  const profile = String(focusedProfile || viewedProfile || '')
   const opened = useValue($opened)
   const roster = useQuery({ queryKey: ROSTER_KEY, queryFn: fetchRoster, staleTime: 5000 })
   const row = (roster.data || []).find(entry => entry.name === String(profile || ''))
 
-  if (!claimsChatEmpty({ sessionId, focusedId, openedAt: opened, now: Date.now() }) || !row) {
+  if (!claimsChatEmpty({ sessionId, activeId, focusedId, openedAt: opened, now: Date.now() }) || !row) {
     return null
   }
 
@@ -5688,14 +5693,17 @@ function normalizeOpened(raw) {
 }
 
 /** Record that this pane opened a session (see OPENED_KEY). */
-function noteOpened(storedId) {
+function noteOpened(storedId, liveId) {
   const id = String(storedId || '')
+  const live = String(liveId || '')
 
   if (!id) {
     return openedSessions
   }
 
-  const next = { ...openedSessions, [id]: Date.now() }
+  // BOTH ids: the slot asks with the live one (see claimsChatEmpty), the pane
+  // opens by the stored one.
+  const next = { ...openedSessions, [id]: Date.now(), ...(live ? { [live]: Date.now() } : {}) }
   const entries = Object.entries(next)
 
   if (entries.length > OPENED_MAX) {
@@ -5716,16 +5724,34 @@ function noteOpened(storedId) {
 /** Does THIS pane own the empty transcript on screen? All three facts are
  *  required: we opened that session, recently, and it is the one in front of the
  *  user. */
-function claimsChatEmpty({ sessionId, focusedId, openedAt, now, ttlMs = OPENED_TTL_MS }) {
-  const id = String(sessionId || '')
+function claimsChatEmpty({ sessionId, activeId, focusedId, openedAt, now, ttlMs = OPENED_TTL_MS }) {
+  // `sessionId` from the slot is the LIVE id (`ChatEmptyProps`: "the live session
+  // whose transcript is empty"), while the claim store is keyed by the id the pane
+  // opened with — the STORED one. Comparing them directly compares a runtime id to
+  // a stored id, which are never equal, so the hero could not draw (Pedro,
+  // 2026-11-11: "the hero doesn't show up").
+  const live = String(sessionId || '')
 
-  if (!id || (focusedId && String(focusedId) !== id)) {
+  if (!live) {
     return false
   }
 
-  const at = Number(openedAt?.[id]) || 0
+  const active = String(activeId || '')
+  const focused = String(focusedId || '')
+  const keys = [live]
 
-  return at > 0 && Number(now) - at < ttlMs
+  // The mapping live → stored is only true for the tile that is actually on
+  // screen, and only when the app says WHICH live id that is. An unknown active id
+  // must not license borrowing the focused chat's claim for any session.
+  if (focused && active && active === live) {
+    keys.push(focused)
+  }
+
+  return keys.some(key => {
+    const at = Number(openedAt?.[key]) || 0
+
+    return at > 0 && Number(now) - at < ttlMs
+  })
 }
 
 /** Profile picture: the profile's asset when it has one, else a deterministic
