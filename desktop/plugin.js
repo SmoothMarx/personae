@@ -3813,8 +3813,7 @@ async function newSession(profile) {
       idempotency_key: `sessions-new-${scope}-${Date.now().toString(36)}`,
       messages: [{ content: NEW_SESSION_SEED, display_kind: 'hidden', role: 'user' }],
       profile: scope,
-      source: 'desktop',
-      title: 'New session'
+      source: 'desktop'
     })
     const storedId = String(res?.stored_session_id || '')
 
@@ -3826,7 +3825,11 @@ async function newSession(profile) {
 
     noteOpened(storedId)
 
-    return await openSession(storedId, scope, 'tab', INTENT_OPEN)
+    // CHILDLESS_OPEN, not INTENT_OPEN: the transcript holds ONE hidden row and
+    // paints nothing, so `expectHistory: true` waits for a painted transcript that
+    // can never arrive and wedges the open for the whole hydration budget —
+    // "Waking up <profile>" forever (Pedro, 2026-11-11).
+    return await openSession(storedId, scope, 'tab', CHILDLESS_OPEN)
   } catch (error) {
     host.notifyError?.(String(error?.message || error))
 
