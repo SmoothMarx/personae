@@ -86,6 +86,7 @@
 
 import {
   Button,
+  CHAT_EMPTY_AREA,
   Codicon,
   Dialog,
   DialogContent,
@@ -119,6 +120,7 @@ import {
   Skeleton,
   Switch,
   Tip,
+  Wordmark,
   atom,
   cn,
   coarseElapsed,
@@ -602,6 +604,17 @@ const $sessionSort = atom({})
 const EXPANDED_KEY = 'messenger-expanded-v1'
 let expandedProfiles = {}
 const $expanded = atom({})
+/** Which empty transcripts THIS pane opened (`{stored id: opened-at ms}`).
+ *
+ *  `chat.empty` mounts EVERY registration and each answers for itself, and both
+ *  Personae and Perso live in this window — so "this pane opened that session" is
+ *  the only claim that cannot draw two heroes over one chat. */
+const OPENED_KEY = 'personae-opened-v1'
+const OPENED_MAX = 200
+/** A claim ages out: a session reopened from core's own sidebar is not ours. */
+const OPENED_TTL_MS = 12 * 60 * 60 * 1000
+let openedSessions = {}
+const $opened = atom({})
 
 /** Only OPEN profiles are stored: closed is the default, so a blob holding
  *  `false` for every profile the user ever tried would be noise that grows with
@@ -732,6 +745,8 @@ function loadPrefs() {
     applyPref(APROPOS_KEY, store?.get?.(APROPOS_KEY, {}))
     expandedProfiles = normalizeExpanded(store?.get?.(EXPANDED_KEY, {}))
     $expanded.set(expandedProfiles)
+    openedSessions = normalizeOpened(store?.get?.(OPENED_KEY, {}))
+    $opened.set(openedSessions)
   } catch {
     // No storage: prefs hold for this window only, which beats throwing.
   }
@@ -3674,6 +3689,9 @@ function openSessionInProfile(profile, sessions, openId) {
     return Promise.resolve()
   }
 
+  // This pane opened it — the claim the empty-chat hero is allowed to make.
+  noteOpened(id)
+
   if (String(host.state.profile.get() || '') === name) {
     // No move to make — but the SCOPE still has to be set. `keepAllProfilesScope:
     // false` also carries `showAllProfiles(false)`, which is what makes the strip
@@ -3870,6 +3888,46 @@ function clickSelect(keys, key) {
   const list = Array.isArray(keys) ? keys : []
 
   return list.includes(key) ? list : [key]
+}
+
+/** The empty transcript, contributed to the chat area: the profile's picture
+ *  over its name, the way Bot Mode introduces a bot chat (Pedro, 2026-11-11).
+ *
+ *  Declines everything it did not open: the slot mounts every contribution, and a
+ *  hero drawn over someone else's chat is worse than a blank thread. */
+function ProfileChatEmpty({ sessionId }) {
+  const focusedId = useValue(host.state.focusedStoredSessionId)
+  const profile = useValue(host.state.focusedSessionProfile)
+  const opened = useValue($opened)
+  const roster = useQuery({ queryKey: ROSTER_KEY, queryFn: fetchRoster, staleTime: 5000 })
+  const row = (roster.data || []).find(entry => entry.name === String(profile || ''))
+
+  if (!claimsChatEmpty({ sessionId, focusedId, openedAt: opened, now: Date.now() }) || !row) {
+    return null
+  }
+
+  return jsxs('div', {
+    'data-slot': 'profile_chat_empty',
+    className:
+      'pointer-events-none flex w-full min-w-0 flex-col items-center justify-center px-0.5 py-6 text-center text-muted-foreground sm:px-6 lg:px-8',
+    children: [
+      jsx(
+        'div',
+        {
+          className: 'flex justify-center',
+          // The name is the chat's title, so IT sits on the optical centre line
+          // and the face hangs above it.
+          style: { marginBottom: 12 },
+          children: jsx('div', {
+            className: 'overflow-hidden rounded-full',
+            children: jsx(Avatar, { row, size: 64 })
+          })
+        },
+        'face'
+      ),
+      jsx(Wordmark, { className: 'mb-1', text: row.label || row.name, width: 'calc(80% - 1rem)' }, 'wordmark')
+    ]
+  })
 }
 
 /** The roster rows WITH the session list the pane actually DRAWS.
@@ -5530,6 +5588,61 @@ function toggleExpanded(profile) {
 }
 
 // ── components ──────────────────────────────────────────────────────────────
+
+function normalizeOpened(raw) {
+  const out = {}
+
+  for (const [id, at] of Object.entries(raw && typeof raw === 'object' ? raw : {})) {
+    const when = Number(at)
+
+    if (id && Number.isFinite(when) && when > 0) {
+      out[String(id)] = when
+    }
+  }
+
+  return out
+}
+
+/** Record that this pane opened a session (see OPENED_KEY). */
+function noteOpened(storedId) {
+  const id = String(storedId || '')
+
+  if (!id) {
+    return openedSessions
+  }
+
+  const next = { ...openedSessions, [id]: Date.now() }
+  const entries = Object.entries(next)
+
+  if (entries.length > OPENED_MAX) {
+    entries.sort((a, b) => Number(a[1]) - Number(b[1]))
+
+    for (const [old] of entries.slice(0, entries.length - OPENED_MAX)) {
+      delete next[old]
+    }
+  }
+
+  openedSessions = next
+  $opened.set(next)
+  persist(OPENED_KEY, next)
+
+  return next
+}
+
+/** Does THIS pane own the empty transcript on screen? All three facts are
+ *  required: we opened that session, recently, and it is the one in front of the
+ *  user. */
+function claimsChatEmpty({ sessionId, focusedId, openedAt, now, ttlMs = OPENED_TTL_MS }) {
+  const id = String(sessionId || '')
+
+  if (!id || (focusedId && String(focusedId) !== id)) {
+    return false
+  }
+
+  const at = Number(openedAt?.[id]) || 0
+
+  return at > 0 && Number(now) - at < ttlMs
+}
 
 /** Profile picture: the profile's asset when it has one, else a deterministic
  *  colour chip carrying its initial (the app's own `profileColor` hue). */
@@ -12061,6 +12174,15 @@ export default {
         render: () => jsx(RoutinesPane, {})
       })
 
+    // The empty transcript of a session THIS pane opened: the profile's face and
+    // name, the way Bot Mode introduces a bot chat. Registered last: the panes are
+    // this plugin's own surface and come first in the registry.
+    ctx.register({
+      id: 'chat-empty',
+      area: CHAT_EMPTY_AREA,
+      data: { render: ({ sessionId }) => jsx(ProfileChatEmpty, { sessionId }) }
+    })
+
     if (typeof host.paneVisibility === 'function') {
       const $visible = host.paneVisibility(`${ID}:pane`)
       let disposeRoutines = null
@@ -12279,6 +12401,10 @@ export const __internals = {
   $sessionGroups,
   sessionColor,
   setSessionColor,
+  $opened,
+  claimsChatEmpty,
+  noteOpened,
+  ProfileChatEmpty,
   toggleExpanded,
   bodyHit,
   bodySearch,

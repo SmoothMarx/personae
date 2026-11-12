@@ -34,6 +34,7 @@ Right now, it is a plugin for the **Hermes Desktop** app.
 | 🌱 **Apropos** *(beta)* | A fresh session that already knows the background of the ones you picked |
 | 🗑️ **Honest deletes** | Deleting a group never deletes sessions; a chain goes only when you say so |
 | 🧩 **Bots-compatible** | Name, avatar and colour are the Bots tab's own store — change one, both change |
+| 🖼️ **Empty-chat hero** | A session you open here starts blank — the profile's picture and its name take the empty screen, the way Bot Mode introduces a bot chat |
 | 🖥️ **Screen** | Your profile's own desktop, live in the pane: Start, Stop, Install, and **Take over** to drive it — with a way back to the session it displaced |
 
 ---

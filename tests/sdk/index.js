@@ -251,6 +251,15 @@ export function Button({ children, className, onClick, size, variant, ...props }
   return jsx('button', { className, onClick, type: 'button', ...props, children })
 }
 
+/** `chat.empty` — the empty transcript's contribution area (core mounts every
+ *  registration and each answers for itself). */
+export const CHAT_EMPTY_AREA = 'chat.empty'
+
+/** Core's own lettering over the empty chat. */
+export function Wordmark({ className, text, width }) {
+  return jsx('span', { 'data-slot': 'wordmark', 'data-width': width, className, children: text })
+}
+
 export function Codicon({ className, name }) {
   return jsx('span', { className, 'data-codicon': name, 'data-slot': 'codicon' })
 }

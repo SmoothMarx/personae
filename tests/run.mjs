@@ -193,9 +193,11 @@ plugin.register(ctx)
 
 check('plugin id is the folder name', plugin.id === 'personae', `got ${plugin.id}`)
 check(
-  'two contributions: the roster pane and the Scheduled jobs tile',
-  contributions.length === 2 && contributions.every(c => c.area === 'panes'),
-  contributions.map(c => c.id).join(', ')
+  'three contributions: the roster pane, the Scheduled jobs tile, and the chat-empty hero',
+  contributions.length === 3 &&
+    contributions.filter(c => c.area === 'panes').length === 2 &&
+    contributions.some(c => c.area === 'chat.empty'),
+  contributions.map(c => `${c.id}:${c.area}`).join(', ')
 )
 
 const pane = contributions[0] || {}
@@ -8426,6 +8428,90 @@ h.rest.byProfile = {}
   host.closeSessionTile = realClose
   h.rest.byProfile = {}
   delete h.responses['session.archive']
+}
+
+
+// ── the empty-chat hero (Pedro, 2026-11-11) ─────────────────────────────────
+// "when you start a new session in bots, the main screen shows the bot's name
+// and their profile picture" → "yes, to both Perso and Personae". Every
+// registration on `chat.empty` is mounted and answers for itself, so the only
+// safe claim is "this pane opened that session".
+{
+  check(
+    'the hero claims a session only if THIS pane opened it, recently, and it is on screen',
+    __internals.claimsChatEmpty({ sessionId: 's1', focusedId: 's1', openedAt: { s1: Date.now() }, now: Date.now() }) ===
+      true &&
+      __internals.claimsChatEmpty({
+        sessionId: 's1',
+        focusedId: 'other',
+        openedAt: { s1: Date.now() },
+        now: Date.now()
+      }) === false &&
+      __internals.claimsChatEmpty({ sessionId: 's1', focusedId: 's1', openedAt: {}, now: Date.now() }) === false &&
+      __internals.claimsChatEmpty({
+        sessionId: 's1',
+        focusedId: 's1',
+        openedAt: { s1: Date.now() - 13 * 60 * 60 * 1000 },
+        now: Date.now()
+      }) === false,
+    'the claim rule is not exclusive'
+  )
+
+  check(
+    'opening a session from the pane is what earns the claim',
+    (() => {
+      __internals.$opened.set({})
+      __internals.noteOpened('claim-1')
+
+      return (
+        Boolean(__internals.$opened.get()['claim-1']) && h.storage['personae-opened-v1']?.['claim-1'] > 0
+      )
+    })(),
+    JSON.stringify(__internals.$opened.get())
+  )
+
+  check(
+    'the hero draws the profile’s picture over its name',
+    (() => {
+      const heroNow = Math.floor(Date.now() / 1000)
+      const savedRoster = h.queryResults['personae|roster']
+      const savedAvatar = h.queryResults['personae|avatar|zulu']
+
+      h.queryResults['personae|roster'] = {
+        data: [{ hasAvatar: true, label: 'Zulu', lastActiveMs: heroNow * 1000, name: 'zulu', sessionId: 'sz' }],
+        error: null,
+        isError: false,
+        isPending: false
+      }
+      h.queryResults['personae|avatar|zulu'] = {
+        data: { data: AVATAR_DATA_URL },
+        error: null,
+        isError: false,
+        isPending: false
+      }
+      host.state.focusedStoredSessionId.set('fresh-1')
+      host.state.focusedSessionProfile.set('zulu')
+      __internals.$opened.set({})
+      __internals.noteOpened('fresh-1')
+
+      const hero = renderToStaticMarkup(jsx(__internals.ProfileChatEmpty, { sessionId: 'fresh-1' }))
+      const stranger = renderToStaticMarkup(jsx(__internals.ProfileChatEmpty, { sessionId: 'never-opened' }))
+
+      __internals.$opened.set({})
+      host.state.focusedStoredSessionId.set(null)
+      host.state.focusedSessionProfile.set(null)
+      if (savedRoster) h.queryResults['personae|roster'] = savedRoster
+      if (savedAvatar) h.queryResults['personae|avatar|zulu'] = savedAvatar
+
+      return (
+        hero.includes('data-slot="profile_chat_empty"') &&
+        hero.includes(AVATAR_DATA_URL) &&
+        hero.includes('>Zulu<') &&
+        stranger === ''
+      )
+    })(),
+    'the hero did not draw, or drew a chat it does not own'
+  )
 }
 
 const failedNow = results.filter(r => !r.ok)
