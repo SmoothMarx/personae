@@ -1112,23 +1112,32 @@ check(
     const savedCreate = h.responses['session.create']
 
     h.newChats.length = 0
+    const savedTitle = h.responses['session.title']
+
     h.requests.length = 0
     h.opens.length = 0
     h.responses['session.create'] = () => ({ session_id: 'rt-new', stored_session_id: 'stored-new' })
+    h.responses['session.title'] = () => ({ pending: false, title: 'New session' })
 
     await __internals.newSession('zulu')
 
     const create = h.requests.find(entry => entry.method === 'session.create')
+    const rename = h.requests.find(entry => entry.method === 'session.title')
     const opened = h.opens.find(entry => entry.id === 'stored-new')
 
     if (savedCreate === undefined) delete h.responses['session.create']
     else h.responses['session.create'] = savedCreate
+    if (savedTitle === undefined) delete h.responses['session.title']
+    else h.responses['session.title'] = savedTitle
 
     return (
       Boolean(create) &&
       create.params.profile === 'zulu' &&
-      // ONE hidden seed row is what makes the gateway persist the session at all.
-      create.params.messages?.[0]?.display_kind === 'hidden' &&
+      // NO message: a hidden row is still a message group, and the empty state
+      // only draws when there are none. The TITLE is what persists the row.
+      !create.params.messages &&
+      rename?.params?.session_id === 'rt-new' &&
+      rename.params.title === 'New session' &&
       Boolean(opened) &&
       // The transcript is ONE hidden row and paints nothing, so the open must
       // wait on the RUNTIME, not on a painted transcript — "Waking up forever".
