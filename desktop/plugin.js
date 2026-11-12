@@ -497,7 +497,7 @@ function channelLabel(source) {
 const AVATAR_SIZE = 52
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane silently running a stale build looks exactly like a broken feature. */
-const BUILD = '1.8.13'
+const BUILD = '1.8.14'
 const AVATAR_RADIUS = '22%'
 /** The rail's list gutter, from `roster-pane-content.tsx`. */
 // `grid-cols-1` is load-bearing, not decoration: an implicit grid track is
@@ -3815,8 +3815,6 @@ async function newSession(profile) {
     }
   }
 
-  say(`new session for "${scope}" — creating`)
-
   try {
     const res = await host.request('session.create', {
       idempotency_key: `sessions-new-${scope}-${Date.now().toString(36)}`,
@@ -3832,8 +3830,6 @@ async function newSession(profile) {
 
       return host.newChat(scope)
     }
-
-    say(`created ${storedId}`)
 
     // A bare create writes NO row, and a session with no row cannot be resumed or
     // listed later. `session.title` persists it (`_ensure_session_db_row`: an
