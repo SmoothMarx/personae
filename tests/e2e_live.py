@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LIVE end-to-end for the Personae session flow.
 
-Pedro, 2026-10-17: "create a session, send a message, wait for the response, send
+The reviewer, 2026-10-17: "create a session, send a message, wait for the response, send
 a second message, then rename the session to something else, archive it, and
 finally search for it. Use bizzy-talk."
 

@@ -19,7 +19,12 @@ SELF="tests/portability.sh"
 PLACEHOLDER='you|user|hermes|alice|example|someone'
 
 PATTERNS=(
-  '(hq-windows|smoothmarx|omarchy)'                                    # private ssh aliases / accounts
+  # Host aliases are deliberately NOT a regex here: a pattern loose enough to
+  # catch `ssh <alias>` also catches prose ("scp to the Windows box"), and a
+  # pattern tight enough to be useful is a list of the author's own machines.
+  # `deploy.sh` requires HOST from the environment for exactly this reason —
+  # read it, and read the diff, instead of trusting a grep. The handle below IS
+  # checkable because it must never appear as a host.
   "C:[/\\\\]Users[/\\\\](?!(${PLACEHOLDER})[/\\\\])"                        # a real Windows profile
   "(/home|/Users)/(?!(${PLACEHOLDER})/)[A-Za-z0-9._-]+/"               # a real unix home
   '(^|[^0-9])(10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)'

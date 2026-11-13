@@ -1,5 +1,7 @@
 /**
- * Personae — P1c + P4 + P5: Bots-parity row, toolbar, groups.
+ * Perso — a FLAT, cross-profile session list in activity order, each row carrying
+ * the profile's picture. A copy of Personae (same store, same verbs) with the
+ * roster view replaced: no profile rows, no sections, no per-profile drill-down.
  *
  * The left-strip tab beside Sessions | Bots (P0/P1) paints one row per profile
  * — avatar, name, last-session preview, age — plus the Bots pane's chrome:
@@ -12,7 +14,7 @@
  *   row      RowButton + px-2 py-2.5, gap-2.5, items-center, rounded-md
  *   avatar   52px at 22% radius, display:block   (BotFace's 34px, scaled ×1.53)
  * Rows are deliberately taller than the Bots rail's — +25% on session rows via
- * inline padding — and the faces larger (Pedro, 2026-10-09: "make it bigger than
+ * inline padding — and the faces larger (The reviewer, 2026-10-09: "make it bigger than
  * bot mode", sizes eyeballed): every other dimension still matches, so the two
  * panes read as the same list at two densities.
  *   line 1   SidebarRowLead(SessionStatusDot) + name ……… age
@@ -30,7 +32,7 @@
  * 2. The PROFILE row's dot is an AGGREGATE of that profile's sessions, never
  *    the state of its latest one. `SessionStatusDot` handed a single id can
  *    only report that one session, so answering the newest blocked session
- *    silenced the row while a second session still waited. Pedro, 2026-10-10:
+ *    silenced the row while a second session still waited. The reviewer, 2026-10-10:
  *    "two sessions show orange because they need interaction … when the latest
  *    session has been resolved, the profile dot goes silent, but there's still
  *    another session awaiting interaction. is it possible for the statusdot to
@@ -74,7 +76,7 @@
  * this group (beta)", and the selection bar's "Apropos (beta)". The label is
  * the whole marker — the machinery is finished, but its edges are still being
  * pinned down (a child that never ran a turn, a lineage that renames itself on
- * compaction). Pedro, 2026-10-10: "flag the apropos feature as beta".
+ * compaction). The reviewer, 2026-10-10: "flag the apropos feature as beta".
  *
  * Save:  ~/.hermes/desktop-plugins/personae/plugin.js   (folder name == id)
  * Load:  the app's OWN home — run ./deploy.sh here, then let it hot-reload
@@ -85,8 +87,10 @@
  */
 
 import {
+  ackStoredSessionId,
   Button,
   CHAT_EMPTY_AREA,
+  Wordmark,
   Codicon,
   Dialog,
   DialogContent,
@@ -120,7 +124,6 @@ import {
   Skeleton,
   Switch,
   Tip,
-  Wordmark,
   atom,
   cn,
   coarseElapsed,
@@ -433,8 +436,8 @@ const META_KEY = 'personae'
 const LEGACY_META_KEY = 'messenger'
 // The Bots pane's own namespace, deliberately: same document, two panes.
 const BOTS_META_KEY = 'hermes-bots'
-const ROSTER_KEY = ['personae', 'roster']
-const SEARCH_KEY = ['personae', 'search']
+const ROSTER_KEY = [ID, 'roster']
+const SEARCH_KEY = [ID, 'search']
 /** Sections live HERE, not in `ui_meta.sectionId` — the Bots pane owns that
  *  field and two writers would race for it. Same idea, own drawer. */
 const SECTIONS_KEY = 'messenger-sections-v1'
@@ -447,13 +450,41 @@ const TOASTS_KEY = 'messenger-activity-toasts'
 const COLORS_KEY = 'messenger-session-colors-v1'
 const SESSION_ORDER_KEY = 'messenger-session-order-v1'
 /** The project list behind "Assign to project" (per-profile `projects.db`). */
-const PROJECTS_KEY = ['personae', 'projects']
-/** How many of a profile's sessions the roster lists before "View all". Pedro
+const PROJECTS_KEY = [ID, 'projects']
+/** How many of a profile's sessions the roster lists before "View all". the user
  *  halved this from 20 on 2026-10-09: a collapsed roster has to stay scannable.
  *  It is a display cap, never a filter: anything the pane has a REASON to draw
  *  (a group's member, a row it just released, a session nobody has positioned)
  *  is pinned past the line instead of being cut by it. */
 const SESSIONS_PER_PROFILE = 10
+/** Perso's own page: the flat list draws this many TOP-LEVEL items (a group box
+ *  is one item, so its members are never split), and "Show more" adds another
+ *  page. It is a display cap, never a filter — the fetch is wider than the page
+ *  (FLAT_FETCH per profile) so a global sort has something to sort. */
+/** Which empty transcripts THIS pane opened, so the chat-empty slot shows one
+ *  hero and not two. Every registration on `chat.empty` is mounted and answers
+ *  for itself; Perso and Personae both live in this window, so "I opened it" is
+ *  the only claim that cannot double-draw. */
+const OPENED_KEY = 'perso-opened-v1'
+const OPENED_MAX = 200
+/** A claim ages out: an old session reopened from core's own sidebar is not
+ *  this pane's to decorate. */
+const OPENED_TTL_MS = 12 * 60 * 60 * 1000
+/** Bounded: this is a view watermark, not history. Oldest entries go first. */
+const SEEN_KEY = 'perso-seen-v1'
+const SEEN_MAX = 400
+const FLAT_PAGE = 50
+const FLAT_FETCH = 60
+/** The picture on a session row. Small enough to repeat on every line, large
+ *  enough that a profile is recognisable from its avatar alone. */
+const AVATAR_ROW_SIZE = 17
+/** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
+ *  A pane that has been silently running a stale build looks exactly like a
+ *  broken feature, and that mistake has cost this file three rounds. */
+const BUILD = '2.0.0'
+/** The picture at the head of a single-profile group box. Smaller than a row's:
+ *  it labels a section, it is not the row you are scanning. */
+const AVATAR_HEAD_SIZE = 14
 /** Job-run sources, never conversations a human resumes. The backend's own
  *  listing deny-list (`INTERNAL_LISTING_SOURCES`) covers cron/webhook too since
  *  2026-10-09, so this is now belt-and-braces: it still holds if the pane is
@@ -492,12 +523,9 @@ function channelLabel(source) {
   return CHANNEL_LABELS[key] || key.replace(/[_-]+/g, ' ').replace(/\b[a-z]/g, char => char.toUpperCase())
 }
 /** Face size: the Bots rail's 34px (`bot-row.tsx` `BotFace size={34}`) scaled
- *  ×1.53 — deliberately BIGGER than bot mode (Pedro's call, size eyeballed).
+ *  ×1.53 — deliberately BIGGER than bot mode (the reviewer’s call, size eyeballed).
  *  One number drives the row, the skeleton and the fallback chip. */
 const AVATAR_SIZE = 52
-/** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
- *  A pane silently running a stale build looks exactly like a broken feature. */
-const BUILD = '1.8.15'
 const AVATAR_RADIUS = '22%'
 /** The rail's list gutter, from `roster-pane-content.tsx`. */
 // `grid-cols-1` is load-bearing, not decoration: an implicit grid track is
@@ -505,7 +533,7 @@ const AVATAR_RADIUS = '22%'
 // `white-space: nowrap`, so its min-content is its FULL text. A long session
 // title therefore set this pane's minimum width and gave the whole pane a
 // horizontal scrollbar, which carried the caret and the drag grip out of view
-// (Pedro, 2026-10-10). `minmax(0, 1fr)` (what grid-cols-1 compiles to) drops
+// (The reviewer, 2026-10-10). `minmax(0, 1fr)` (what grid-cols-1 compiles to) drops
 // that floor to zero, so the cell ellipsises and the chrome stays put.
 const LIST_CLASS = 'grid min-w-0 grid-cols-1 gap-0.5 px-1.5'
 const UNASSIGNED = 'section:unassigned'
@@ -575,11 +603,11 @@ const $sessionColors = atom({})
 
 /** Profile → session-id list, written by dragging a session's own grip. It is
  *  a LOCAL preference: it changes nothing in core, it just remembers the order
- *  the user dragged the list into (Pedro's item 4, "re-sorting sessions"). */
+ *  the user dragged the list into (the reviewer’s item 4, "re-sorting sessions"). */
 let sessionOrder = {}
 const $sessionOrder = atom({})
 
-/** Profile → session SORT MODE. Pedro, 2026-10-10: "allow sorting of sessions,
+/** Profile → session SORT MODE. The reviewer, 2026-10-10: "allow sorting of sessions,
  *  manually, by last activity and others. That can be an option when
  *  right-clicking on a profile". A session belongs to a profile, so the profile
  *  is where its order is chosen — the same noun/verb rule the menus follow.
@@ -599,7 +627,7 @@ const $sessionSort = atom({})
  *
  *  PERSISTED. This used to live in memory alone — the one view store the pane
  *  never handed to `ctxRef.storage` — so the user's expand/collapse work died
- *  with the module instance and the whole roster collapsed back. Pedro,
+ *  with the module instance and the whole roster collapsed back. the user,
  *  2026-10-10: "If I expand all profiles to expose their sessions, after a while
  *  they all collapse again. Allow them to remain in the user's chosen state
  *  indefinitely." A view the user shaped by hand is theirs; it outlives the
@@ -607,15 +635,22 @@ const $sessionSort = atom({})
 const EXPANDED_KEY = 'messenger-expanded-v1'
 let expandedProfiles = {}
 const $expanded = atom({})
-/** Which empty transcripts THIS pane opened (`{stored id: opened-at ms}`).
+
+/** WHICH ROWS HE HAS ACTUALLY READ: `{stored id: activity ms at the moment he
+ *  opened it}`.
  *
- *  `chat.empty` mounts EVERY registration and each answers for itself, and both
- *  Personae and Perso live in this window — so "this pane opened that session" is
- *  the only claim that cannot draw two heroes over one chat. */
-const OPENED_KEY = 'personae-opened-v1'
-const OPENED_MAX = 200
-/** A claim ages out: a session reopened from core's own sidebar is not ours. */
-const OPENED_TTL_MS = 12 * 60 * 60 * 1000
+ *  Core's own `unread` flag is a `last_read_at` watermark, and the app does not
+ *  keep it current for a session opened from a pane (the "Android" row sat under
+ *  Unread with `last_read_at` nineteen days old, the user 2026-11-11). The divider
+ *  asks one question — "has he opened this since its last activity?" — and the
+ *  pane is the one surface that KNOWS when a row was opened, so it keeps that
+ *  answer itself: a row is read once its activity is at or before the moment he
+ *  opened it, and a later turn makes it unread again, which is the real point.
+ */
+let seenSessions = {}
+const $seen = atom({})
+
+/** `{stored id: opened-at ms}` — see OPENED_KEY. */
 let openedSessions = {}
 const $opened = atom({})
 
@@ -638,7 +673,7 @@ function normalizeExpanded(value) {
 
 /** P7 list view: `null` is the roster; `{kind: 'all'|'archived', profile}` means
  *  the pane body is REPLACED by that profile's session list with a back button
- *  (Pedro's D-A). Deliberately transient, not persisted: a relaunch starts at
+ *  (the reviewer’s D-A). Deliberately transient, not persisted: a relaunch starts at
  *  the roster instead of stranding the user inside a drill-down. */
 const $listView = atom(null)
 
@@ -664,7 +699,7 @@ let searchTimer = null
  *  half-confirmed bulk verb.
  *
  *  It is an ATOM rather than a `useState` for one reason: the confirmation is
- *  drawn UNDER the row it was opened on (Pedro, 2026-11-03), so the row that
+ *  drawn UNDER the row it was opened on (The reviewer, 2026-11-03), so the row that
  *  hosts it is a different component from the one that opens it — and the
  *  harness has to be able to arm a cut to prove where the bar lands. */
 const $archiveCut = atom(null)
@@ -712,7 +747,7 @@ const $routineProfile = atom(null)
 // OFF — a flip to `true` re-enables the on-screen drag logger for a debugging
 // round. It must never ship on: the logger is a line of text ABOVE the list in a
 // flex column, so every click changed its length, changed its line count, and
-// reflowed the whole list under the pointer. Pedro, 2026-10-10: "the problem is
+// reflowed the whole list under the pointer. The reviewer, 2026-10-10: "the problem is
 // the logger 'drag session'. that changes with each click and moves the list".
 // Changing text belongs at the BOTTOM of a list, or nowhere.
 const DND_TRACE = false
@@ -748,7 +783,9 @@ function loadPrefs() {
     applyPref(APROPOS_KEY, store?.get?.(APROPOS_KEY, {}))
     expandedProfiles = normalizeExpanded(store?.get?.(EXPANDED_KEY, {}))
     $expanded.set(expandedProfiles)
-    openedSessions = normalizeOpened(store?.get?.(OPENED_KEY, {}))
+    seenSessions = normalizeSeen(store?.get?.(SEEN_KEY, {}))
+    $seen.set(seenSessions)
+    openedSessions = normalizeSeen(store?.get?.(OPENED_KEY, {}))
     $opened.set(openedSessions)
   } catch {
     // No storage: prefs hold for this window only, which beats throwing.
@@ -832,7 +869,7 @@ function normalizeSessionSort(raw) {
  *  parked at the end of a saved order longer than the page is cut off the page
  *  entirely — the profile drew ten old rows and the conversation the user had
  *  open was nowhere in the list, while "View all" (which applies no order at
- *  all) showed it first. Pedro, 2026-10-10: "the session called 'Plan Hermes
+ *  all) showed it first. The reviewer, 2026-10-10: "the session called 'Plan Hermes
  *  Desktop plugin with merged sessions' is not showing up in the main view
  *  (underneath the profile), but it is the first result when I click 'View all'".
  *  Every id the order names still wins; a new arrival just cannot be swallowed
@@ -863,7 +900,7 @@ function applySessionOrder(sessions, order) {
  * `profiles.list` payload carries `last_session` / `worker_session` and NO
  * `sessions` array (`tui_gateway/methods_profiles.py`), so `applySessionOrder`
  * was handed `undefined`, returned `[]`, and the write became an empty order —
- * the move did nothing at all while the preview drew perfectly. Pedro,
+ * the move did nothing at all while the preview drew perfectly. the user,
  * 2026-10-10: "it shows the preview, but it doesn't apply the move".
  */
 function nextSessionIds(displayed, order, dragged, onto, side) {
@@ -880,7 +917,7 @@ function setSessionOrder(profile, ids) {
   sessionOrder = { ...sessionOrder, [String(profile)]: (ids || []).map(String) }
   $sessionOrder.set(sessionOrder)
   persist(SESSION_ORDER_KEY, sessionOrder)
-  // A drag IS a choice of order (Pedro's DnD answer 2: "just add a \"manual
+  // A drag IS a choice of order (the reviewer’s DnD answer 2: "just add a \"manual
   // sorting\" to the list of options"). Without this the dragged order would sit
   // under a list still sorted by recency, and the row would snap back on the
   // next 5s poll.
@@ -943,7 +980,7 @@ function sortProfileSessions(sessions, mode, order) {
   return list
 }
 
-/** Both sides of an Apropos link in ONE list. Pedro, 2026-10-10: "don't hide or
+/** Both sides of an Apropos link in ONE list. The reviewer, 2026-10-10: "don't hide or
  *  make the parent session go away from the list, they should both be shown".
  *
  *  Core decides the visibility — a seeded child is only listable while its row
@@ -992,7 +1029,7 @@ function withAproposChildren(sessions, links, profile) {
 
 // ── session groups (inside one profile) ─────────────────────────────────────
 //
-// Pedro, 2026-10-09: "allow manual session grouping from within a profile, so
+// The reviewer, 2026-10-09: "allow manual session grouping from within a profile, so
 // the user can group different sessions that are about the same topic/project."
 // So: sessions stay one list per profile, but the user can file them under a
 // named heading. Shape — { [profile]: { collapsed:[id], groups:[{id,name}],
@@ -1001,7 +1038,7 @@ function withAproposChildren(sessions, links, profile) {
 // sessions back into the flat list instead of taking them with it.
 
 const SESSION_GROUPS_KEY = 'messenger-session-groups-v1'
-/** Sessions the user hid FROM THIS PANE. Pedro, 2026-10-10: "Allow hiding, but
+/** Sessions the user hid FROM THIS PANE. The reviewer, 2026-10-10: "Allow hiding, but
  *  hiding only hides it from view in the Messenger tab, not from Sessions."
  *  So this is a pane-local view filter and nothing else: no RPC, no archive, no
  *  write to core state. The Sessions tab (and every other picker) keeps showing
@@ -1151,7 +1188,7 @@ function profileSessionGroups(state, profile) {
  *  wantedSessionIds) and the flat list draws them past its inline cap (see
  *  sessionGroupBlocks), so an old session released from a group cannot fall
  *  below the fold and read as deleted. Window-lifetime only, nothing persisted:
- *  a reload is a fresh list. Pedro, 2026-10-10: "When deleting a group, apropos
+ *  a reload is a fresh list. The reviewer, 2026-10-10: "When deleting a group, apropos
  *  or not, sessions inside should not be deleted, just removed from the group."
  */
 const RELEASED_MAX = 50
@@ -1188,7 +1225,7 @@ function noteReleased(profile, ids) {
  *  drag), then everything unfiled in one anonymous block. With no groups at all
  *  this is one anonymous block — exactly the flat list it has always been, so
  *  a profile nobody has filed anything into renders identically to before. */
-function sessionGroupBlocks(sessions, state, profile, released) {
+function sessionGroupBlocks(sessions, state, profile, released, cap = SESSIONS_PER_PROFILE) {
   const slice = profileSessionGroups(state, profile)
   const list = Array.isArray(sessions) ? sessions : []
   const blocks = []
@@ -1224,8 +1261,11 @@ function sessionGroupBlocks(sessions, state, profile, released) {
   // Membership AND the released pin answer to a row's whole lineage: the id a
   // session had when it was filed (or released) need not be the id it has now.
   const plain = list.filter(session => !memberGroupFor(slice.members, session))
+  // `cap` is the caller's display cap: the roster's inline ten, or the flat
+  // Perso list's own page (which fetches wider and caps ONCE, globally).
+  const limit = Number.isFinite(cap) ? cap : Infinity
   const rest = plain.filter(
-    (session, index) => index < SESSIONS_PER_PROFILE || Boolean(storedKeyFor(pinned, session))
+    (session, index) => index < limit || Boolean(storedKeyFor(pinned, session))
   )
 
   if (rest.length || !blocks.length) {
@@ -1238,7 +1278,7 @@ function sessionGroupBlocks(sessions, state, profile, released) {
 /** A group renders as ONE outlined box — heading and items inside the same thin
  *  line, which is what makes it read as a unit instead of a run of rows. The
  *  anonymous block (no group) stays exactly the flat list it has always been.
- *  Pedro, 2026-10-10: "add a thin outer line around the group, that includes the
+ *  The reviewer, 2026-10-10: "add a thin outer line around the group, that includes the
  *  header, to serve as a separator ... color code the group ... that changes the
  *  background fill of the items".
  *
@@ -1298,7 +1338,7 @@ function sessionGroupShell(block, parts, dragging, profileFill) {
           'mt-0.5 mb-0.5 flex min-w-0 flex-col rounded-md border border-(--ui-stroke-secondary) p-0.5',
           dragging && 'opacity-60'
         ),
-        // The FILL is the whole box: header included, which is what Pedro asked
+        // The FILL is the whole box: header included, which is what the user asked
         // for on 2026-10-10 ("fill the header as well"). Painting the box also
         // keeps the rows' own `hover:bg-*` working — an inline background on the
         // ROWS would beat that class, and a class on the box cannot.
@@ -1321,7 +1361,7 @@ function sessionGroupShell(block, parts, dragging, profileFill) {
                   // Indented from the heading: the caret owns the far left of a
                   // group, so the items start to the RIGHT of it and the column
                   // tells the user where the group's rows stop and the flat
-                  // list resumes. Pedro, 2026-10-10: "make the group sessions
+                  // list resumes. The reviewer, 2026-10-10: "make the group sessions
                   // slightly offset to the right, so it's easier to discern
                   // where the group ends".
                   className: 'flex min-w-0 flex-col gap-0.5 rounded-sm pl-3',
@@ -1353,7 +1393,7 @@ function patchProfileGroups(profile, changes) {
 
 /** `Group #1`, `Apropos #2`, … — numbered past the highest name of its own
  *  shape, so deleting #2 and making another does not mint a second "Group #2".
- *  Pedro, 2026-10-10: "when the user selects 'New Group' or new Apropos Group,
+ *  The reviewer, 2026-10-10: "when the user selects 'New Group' or new Apropos Group,
  *  immediately create the group, with Group #1 or Apropos #1. The user will then
  *  rename it accordingly. Don't give them a text box to fill in before the group
  *  is created." */
@@ -1387,15 +1427,15 @@ function nextSectionName() {
  *
  *  Groups are drawn on the roster, and so is the rename field that opens on a
  *  new one — so creating a group from a drill-down has to CLOSE the drill-down,
- *  or the group is made somewhere the user cannot see. Pedro, 2026-10-17: "if I
+ *  or the group is made somewhere the user cannot see. The reviewer, 2026-10-17: "if I
  *  try to create a new session group by right-clicking a session that is in the
  *  'view all' it doesn't work." (It did not, for a duller reason: the row menu
  *  was never given the verb — see SessionListView.) */
 /** The roster's page is fetched per profile and keyed by the OPEN set, so a
  *  membership write has to invalidate it: otherwise "assigned to a group but it
- *  does not show up" is exactly right until the next poll (Pedro, 2026-10-17). */
+ *  does not show up" is exactly right until the next poll (The reviewer, 2026-10-17). */
 function refreshGroupedSessionLists() {
-  void queryClient?.invalidateQueries?.({ queryKey: ['personae', 'sessions'] })
+  void queryClient?.invalidateQueries?.({ queryKey: [ID, 'sessions'] })
 }
 
 function createGroupHere(profile, sessionIds, options) {
@@ -1442,7 +1482,7 @@ function createSessionGroup(profile, name, sessionIds, options) {
   // `apropos` is a MARK, not a second kind of group: an Apropos group IS a
   // normal session group (same box, same color, same drag, same filing) that
   // also carries a generated child, and the mark is what draws the diamond and
-  // what the heading's Apropos verb is offered on. Pedro, 2026-10-10.
+  // what the heading's Apropos verb is offered on. The reviewer, 2026-10-10.
   patchProfileGroups(key, {
     groups: [...current.groups, { apropos: options?.apropos === true, id, name: clean }],
     members,
@@ -1469,7 +1509,7 @@ function renameSessionGroup(profile, id, name) {
 /** Color-code a group. The palette is the app's own, and a value outside it
  *  CLEARS the color instead of reaching the stylesheet: this string is
  *  interpolated into `color-mix()`, and a plugin may not become a CSS-injection
- *  hole for its own store. Pedro, 2026-10-10: right-click the header, pick a
+ *  hole for its own store. The reviewer, 2026-10-10: right-click the header, pick a
  *  color, and it fills that group's items. */
 function setSessionGroupColor(profile, id, color) {
   const current = profileSessionGroups(sessionGroups, profile)
@@ -1486,7 +1526,7 @@ function setSessionGroupColor(profile, id, color) {
  *  That is why a group becomes one the moment a child is started from it:
  *  without this, "Apropos this group" produced a child while the group's own
  *  sessions stayed plain rows with no diamond and no part in the digest.
- *  Pedro, 2026-10-10: "When I click Apropos this group, the existing sessions
+ *  The reviewer, 2026-10-10: "When I click Apropos this group, the existing sessions
  *  don't get the diamond icon along with their functionality." */
 function markSessionGroupApropos(profile, id) {
   const current = profileSessionGroups(sessionGroups, profile)
@@ -1534,7 +1574,7 @@ function deleteSessionGroup(profile, id) {
  *  session id, so the handler never has to guess which session was clicked.
  *  It used to pass the group id ALONE, which landed in the session slot while
  *  `groupId` arrived undefined — the menu looked live and filed nothing at all.
- *  Pedro, 2026-10-10: "moving sessions to groups isn't working". */
+ *  The reviewer, 2026-10-10: "moving sessions to groups isn't working". */
 function sessionMoveTarget(storedId, groupId) {
   return { groupId: groupId == null ? null : String(groupId), sessionId: String(storedId) }
 }
@@ -1601,7 +1641,7 @@ function toggleSessionGroupCollapsed(profile, id) {
 /** Move a group one slot up or down. The dragging path and this one write the
  *  SAME `order` array, so the menu and the gesture cannot disagree — and the
  *  menu is the verb that cannot be a silent no-op when there is nothing to drop
- *  onto. Pedro, 2026-10-10: "I can't move/re-locate session groups." */
+ *  onto. The reviewer, 2026-10-10: "I can't move/re-locate session groups." */
 function moveSessionGroup(profile, id, delta) {
   const current = profileSessionGroups(sessionGroups, profile)
   const index = current.order.indexOf(String(id))
@@ -2389,7 +2429,7 @@ function dropAction(drag, target) {
     // the scope it lives in), and the unassigned block — which is the way OUT of
     // a group. Reading only the heading meant dropping a profile onto a member
     // row did nothing but re-order it, so a profile could be dragged neither into
-    // a group nor out of one. Pedro, 2026-10-10: "I'm having issues dragging
+    // a group nor out of one. The reviewer, 2026-10-10: "I'm having issues dragging
     // profiles in and out of groups".
     const dest = String(target.group || target.scope || '')
     const here = String(drag.section || '')
@@ -2427,7 +2467,7 @@ function dropAction(drag, target) {
     // The group the pointer is over — its heading strip OR its box, because the
     // thing the user sees is the BOX and its body is nearly all of it. Filing
     // read only `sessionGroup` (the 20px heading), so a session dropped on the
-    // group "did nothing". Pedro, 2026-10-10: "When dragging a session into a
+    // group "did nothing". The reviewer, 2026-10-10: "When dragging a session into a
     // group or an Apropos Group, nothing happens. If it goes inside a group, it
     // should go inside the group".
     //
@@ -2445,7 +2485,7 @@ function dropAction(drag, target) {
     // Off the group entirely: a grouped session dropped on the plain list LEAVES
     // its group. The anonymous block is the absence of a group — there is no box
     // attribute to read — so the ROW it lands on is what says "not in a group".
-    // Pedro, 2026-10-10: "moving a session out of a group should remove them from
+    // The reviewer, 2026-10-10: "moving a session out of a group should remove them from
     // the group and into the single sessions list."
     if (!onto && here && target.session && target.profile === drag.profile) {
       return { group: null, ids: [drag.id], kind: 'sessionFile', profile: drag.profile }
@@ -2484,7 +2524,7 @@ function elementAt(x, y) {
    *  Without that fallback the only target a session drag could find was the
    *  PROFILE container, so `dropAction` answered null and the gesture ended in
    *  nothing: the row could be picked up and never put down, while the profile
-   *  row lit up under the pointer. Pedro, 2026-10-10: "I can move profiles, but
+   *  row lit up under the pointer. The reviewer, 2026-10-10: "I can move profiles, but
    *  not sessions." A grabbed grip is exactly where the pointer is. */
   const rowFor = selector => {
     const direct = node?.closest?.(selector)
@@ -2524,7 +2564,7 @@ function elementAt(x, y) {
     // `dropAction` answered null and the gesture ended in nothing. Only the
     // sessionGroup branch reads this attribute, so filing and re-ordering
     // SESSIONS keep the resolution they had.
-    // Pedro, 2026-10-10: "I can't move/re-locate session groups."
+    // The reviewer, 2026-10-10: "I can't move/re-locate session groups."
     groupBox: read('[data-drop-group-box]', 'data-drop-group-box'),
     sessionGroup: read('[data-drop-session-group]', 'data-drop-session-group'),
     sessionSide: sideOf(sessionRow),
@@ -2667,7 +2707,7 @@ function botsMetaOf(profile) {
  *  Opt-in by construction, and that is the whole reason this is a helper: a
  *  profile with no pick must stay on the theme's neutral. `profileColor(name)`
  *  invents a hue from the name for EVERY named profile, so filling from that
- *  would turn the rail into per-profile confetti. Pedro, 2026-10-10: "yes, fill
+ *  would turn the rail into per-profile confetti. The reviewer, 2026-10-10: "yes, fill
  *  is opt-in". Accepts a roster profile or one of the pane's own rows. Pure. */
 function fillOf(source) {
   const raw = source?.botsMeta?.color ?? botsMetaOf(source).color
@@ -2787,7 +2827,7 @@ const ROLLUP_DOT = {
   // No `working` here, on purpose: the PROFILE aggregate never paints blue. A
   // session that is merely running is not news about the profile, and a row lit
   // blue for its own agent could never read as quiet. The per-SESSION dot still
-  // carries it — `dotStateFor` below is untouched (Pedro, 2026-10-11: "drop blue
+  // carries it — `dotStateFor` below is untouched (The reviewer, 2026-10-11: "drop blue
   // (from profile, keep in session statusdot)").
 }
 /** Ink for the COUNT badge, by state. An inline `var()` rather than a class: the
@@ -2829,6 +2869,26 @@ const dotListCache = new Map()
  *  fetchRoster's poll and read by every ProfileRow. Empty until the first poll
  *  lands, which is what makes the fallback dot the initial state. */
 const $profileDots = atom({})
+/** Per-SESSION state, from the same sweep that feeds the profile dots:
+ *  `{sessionId: 'needs-input' | 'working' | 'unread' | 'idle'}`.
+ *
+ *  The flat list groups its rows under Unread / Running / Read, and that answer
+ *  has to come from ONE place — the same `dotStateFor` the dots are painted
+ *  from, or the divider and the dot beside a row could disagree. */
+const $sessionStates = atom({})
+/** Diagnostic, and the only way to answer "does the sweep even SEE a running
+ *  session?" without the app in front of me: `{total, working}` from the same
+ *  `session.active_list` read the states are built from, painted in the toolbar
+ *  while a status report is being chased. Delete with the fix. */
+const $liveInfo = atom({ total: 0, working: 0 })
+/** `{storedId: ms}` of each session's LAST ACTIVITY, from the same per-profile
+ *  read the dots use. It exists because `session.list` — the RPC every row here
+ *  is drawn from — does not project `last_active` at all (`_session_row_summary`
+ *  sends id/title/preview/started_at/message_count/source and nothing else), so
+ *  every row fell back to `started_at` and showed its CREATION time (the user,
+ *  2026-11-12: "the time shown should be the time of last activity"). The sweep
+ *  already reads the rows that carry it; this publishes them. */
+const $lastActive = atom({})
 
 /** The dot ONE session shows, from the two sources a plugin can read. The
  *  priority is core's own (`$sessionDotStateById`): a session blocked on a
@@ -2854,15 +2914,58 @@ function liveStatusMap(rows) {
   const map = {}
 
   for (const row of rows || []) {
-    const key = String(row?.session_key || '')
     const status = String(row?.status || '')
 
-    if (key && status) {
-      map[key] = status
+    if (!status) {
+      continue
+    }
+
+    // `session.active_list` labels a live session `agent.session_id or
+    // session_key or <runtime sid>` (core's `_session_lookup_key`), so the ONE
+    // key it reports is whichever of those exists — the runtime id for a session
+    // this app resumed, the stored id for one it created. Filing each status
+    // under every id the row carries is what lets a stored-id row find it
+    // (The reviewer, 2026-11-12: nothing moved into Running while `live 3/39` said
+    // three sessions were working).
+    for (const key of [row?.session_key, row?.id]) {
+      const id = String(key || '')
+
+      if (id) {
+        map[id] = status
+      }
     }
   }
 
   return map
+}
+
+/** A row's live status, resolved through EVERY id it answers to: the stored id,
+ *  the runtime id `session.list` calls `resolved_id`, and its compression
+ *  lineage. Pure. */
+function liveStatusForRow(session, live) {
+  for (const key of rowIdentities(session || {})) {
+    const status = String(live?.[String(key || '')] || '')
+
+    if (status) {
+      return status
+    }
+  }
+
+  return ''
+}
+
+/** The state a rendered row should be drawn in — its own, or the one filed
+ *  under any alias of it. Pure. */
+function stateForRow(session, states) {
+  for (const key of rowIdentities(session || {})) {
+    const state = states?.[String(key || '')]
+
+    if (state) {
+      return state
+    }
+  }
+
+  return undefined
 }
 
 /** The whole roster's dots: `{profile: {state, count, counts}}`.
@@ -2974,7 +3077,53 @@ async function fetchRoster() {
       )
     ])
 
-    $profileDots.set(rosterRollups(Object.fromEntries(lists), liveStatusMap(live)))
+    const liveMap = liveStatusMap(live)
+
+
+    $profileDots.set(rosterRollups(Object.fromEntries(lists), liveMap))
+
+    // …and the same read, per session (see $sessionStates): a session's own
+    // state is what the list's dividers are made of. Only ids the sweep actually
+    // saw are published — a missing id reads 'idle', which is the neutral bucket.
+    const sessionStates = {}
+    const lastActive = {}
+
+    for (const profileRows of Object.values(Object.fromEntries(lists))) {
+      for (const session of profileRows || []) {
+        const id = String(session?.id || '')
+
+        if (id) {
+          // Filed under EVERY id the row answers to, so a rendered row finds it
+          // whichever id it happens to look up with (see stateForRow).
+          const state = dotStateFor(liveStatusForRow(session, liveMap), session?.unread === true)
+          const at = sessionActivityMs(session)
+
+          for (const key of rowIdentities(session)) {
+            const alias = String(key || '')
+
+            if (!alias) {
+              continue
+            }
+
+            sessionStates[alias] = state
+
+            if (at > 0) {
+              lastActive[alias] = at
+            }
+          }
+        }
+      }
+    }
+
+    lastActiveById = lastActive
+    $sessionStates.set(sessionStates)
+    $lastActive.set(lastActive)
+
+    const liveRows = Object.values(liveMap)
+    $liveInfo.set({
+      total: liveRows.length,
+      working: liveRows.filter(status => LIVE_WORKING.has(String(status || ''))).length
+    })
   } catch {
     // Belt-and-braces: nothing here may take the roster down with it.
   }
@@ -3268,6 +3417,48 @@ function anySessionId(session) {
   return String(session?.resolved_id || session?.id || '')
 }
 
+/** "Archive all up to this point" (The reviewer, 2026-10-16): every session of ONE
+ *  profile whose last activity is STRICTLY older than the clicked one's.
+ *
+ *  Pure, and deliberately NOT "the rows below this one on screen": the drawn
+ *  list is capped at ten, sorted by whatever mode the user picked, and possibly
+ *  filtered — while this verb is a statement about the profile's whole history.
+ *  The caller therefore passes the FULL list (`session.list` at its ceiling),
+ *  and the count it reports is the count it will act on.
+ *
+ *  A session with no readable timestamp is LEFT OUT: it cannot be placed in
+ *  time, and archiving by guess is not something the user can undo one row at a
+ *  time. The clicked session is never in the result — archiving it is what the
+ *  ordinary Archive verb is for. */
+function sessionsUpTo(sessions, targetId) {
+  const list = Array.isArray(sessions) ? sessions : []
+  const wanted = String(targetId ?? '')
+  // A row answers to TWO ids — the durable stored one and, while it is live, a
+  // runtime one. Both must find the target and both must keep it out of its own
+  // cut, or the verb quietly does nothing depending on which id the caller had.
+  const isTarget = session => Boolean(wanted) && (anySessionId(session) === wanted || String(session?.id || '') === wanted)
+  const target = list.find(isTarget)
+
+  if (!wanted || !target) {
+    return []
+  }
+
+  const at = secondsToMs(target?.last_active || target?.started_at)
+
+  if (at === null) {
+    return []
+  }
+
+  return list.filter(session => {
+    if (isTarget(session)) {
+      return false
+    }
+
+    const when = secondsToMs(session?.last_active || session?.started_at)
+
+    return when !== null && when < at
+  })
+}
 
 /** Every id a row can be addressed by — the stored one, the live one and the
  *  lineage it survived compactions through (see rowIdentities). A cut is
@@ -3498,7 +3689,7 @@ function sessionIdOf(session) {
  *  `host.openSession` takes a STORED id (`storedSessionId` in the SDK), and a
  *  tile resolves its caption through the loaded session list BY STORED ID. Open a
  *  tab with a runtime id and there is no row to name it, so the strip keeps
- *  core's placeholder — "New session", on most tabs (Pedro, 2026-10-17).
+ *  core's placeholder — "New session", on most tabs (The reviewer, 2026-10-17).
  *  `sessionIdOf` still prefers the live id where the RPC genuinely needs it. */
 function storedIdOf(session) {
   return String(session?.id || session?.resolved_id || '')
@@ -3527,7 +3718,7 @@ function profileIsActive(profile) {
  *  counts as TRUE) a plugin open dials the profile's backend and leaves
  *  `$activeGatewayProfile` where it is.
  *
- *  Why a DOCK needs it (Pedro, 2026-10-13: "some session names are showing up as
+ *  Why a DOCK needs it (The reviewer, 2026-10-13: "some session names are showing up as
  *  'new session' instead of their actual name"): core keeps session tabs in
  *  per-profile buckets and files a tile into whichever bucket is visible when it
  *  is CREATED, so tabs opened for a profile the app never moved to are filed
@@ -3571,7 +3762,7 @@ function dockSessions(profile, sessions, exceptOpenId = null, options = {}) {
   // it until that lands — the SDK awaits activation, so everything opened after
   // this files into the profile that is now visible); same-profile the move is a
   // no-op but the SCOPE still collapses, which is what removes every other
-  // profile's tabs from the strip (Pedro, 2026-10-17).
+  // profile's tabs from the strip (The reviewer, 2026-10-17).
   // A caller that ALREADY moved the app (`options.moved`) must not send a second
   // dialing open: the SDK rejects one ("superseded by a newer selection"), and the
   // scope is collapsed already by the move it made.
@@ -3618,7 +3809,7 @@ function openProfileSessions(row, sessions) {
   return (rest.length ? dockSessions(name, rest).then(openMain) : Promise.resolve(openMain())).then(settle)
 }
 
-/** Pedro, 2026-10-13: clicking a SESSION under another profile is a PROFILE
+/** The reviewer, 2026-10-13: clicking a SESSION under another profile is a PROFILE
  *  MOVE, not merely an open.
  *
  *  Core keeps its session tabs in per-profile buckets and swaps the visible set
@@ -3663,7 +3854,7 @@ function focusedStoredSession() {
  *  app: it restores that profile's own persisted tile set and brings up the
  *  conversation core had in front there. So the navigation to the clicked id
  *  races a restore that does not know about it, and the user lands on some
- *  other session of the right profile — Pedro, 2026-10-17: "every time I click a
+ *  other session of the right profile — The reviewer, 2026-10-17: "every time I click a
  *  session from a different profile it opens a random session from that
  *  profile; only the second click lands on the one I wanted".
  *
@@ -3692,14 +3883,11 @@ function openSessionInProfile(profile, sessions, openId) {
     return Promise.resolve()
   }
 
-  // This pane opened it — the claim the empty-chat hero is allowed to make.
-  noteOpened(id)
-
   if (String(host.state.profile.get() || '') === name) {
     // No move to make — but the SCOPE still has to be set. `keepAllProfilesScope:
     // false` also carries `showAllProfiles(false)`, which is what makes the strip
     // show THIS profile's tabs alone. Without it a click under the active profile
-    // leaves every other profile's tabs on the strip (Pedro, 2026-10-17: "when the
+    // leaves every other profile's tabs on the strip (The reviewer, 2026-10-17: "when the
     // user clicks on another profile, the existing ones vanish").
     return openSession(id, name, null, { expectHistory: true, keepAllProfilesScope: false })
   }
@@ -3723,7 +3911,7 @@ function openSessionInProfile(profile, sessions, openId) {
  *  opens in the same breath — the recipe Bots uses for the stored sessions it
  *  creates itself (`hermes-bots/canonical-chat.ts` `openStoredBotChat`). The
  *  first version of this pane omitted them, and the symptom was an endless
- *  spinner with no composer (Pedro, 2026-10-10: "it only shows the spinner, but
+ *  spinner with no composer (The reviewer, 2026-10-10: "it only shows the spinner, but
  *  i never get a chatbox to enter my prompt"):
  *
  *  - `awaitHydration: true` — without it the SDK returns as soon as it has
@@ -3791,7 +3979,7 @@ function openSession(storedId, profile, intent, options = {}) {
  *  Bot Mode's "+" opens a chat that ALREADY EXISTS, which is why its empty state
  *  can introduce the bot. `host.newChat` alone opens a DRAFT: no stored id, so the
  *  app never mounts the chat-empty slot and this pane's hero cannot appear
- *  (Pedro, 2026-11-11: "nothing happens when I create a new session using the +
+ *  (The reviewer, 2026-11-11: "nothing happens when I create a new session using the +
  *  button"). So the pane creates the session itself.
  *
  *  The session is created with NO message and then TITLED: a bare create returns
@@ -3809,7 +3997,7 @@ async function newSession(profile) {
 
   const say = message => {
     try {
-      host.notify?.({ kind: 'info', message: `Personae ${BUILD}: ${message}` })
+      host.notify?.({ kind: 'info', message: `Perso ${BUILD}: ${message}` })
     } catch {
       /* a toast is a courtesy, never the flow */
     }
@@ -3854,9 +4042,11 @@ async function newSession(profile) {
     // CHILDLESS_OPEN, not INTENT_OPEN: the transcript holds ONE hidden row and
     // paints nothing, so `expectHistory: true` waits for a painted transcript that
     // can never arrive and wedges the open for the whole hydration budget —
-    // "Waking up <profile>" forever (Pedro, 2026-11-11).
+    // "Waking up <profile>" forever (The reviewer, 2026-11-11).
     return await openSession(storedId, scope, 'tab', CHILDLESS_OPEN)
   } catch (error) {
+    // On screen, not just in a log: from the outside this looked like a dead
+    // button, and every guess about WHY cost a round trip.
     say(`create FAILED — ${String(error?.message || error).slice(0, 160)}`)
     host.notifyError?.(String(error?.message || error))
 
@@ -3872,7 +4062,7 @@ function archiveSession(storedId, profile) {
 
 /** The way back. `session.archive { archived: false }` is core's own unarchive —
  *  the same call the archive view uses — so a chat hidden from every live
- *  listing is one menu pick from returning (Pedro, 2026-10-16, after the bulk
+ *  listing is one menu pick from returning (The reviewer, 2026-10-16, after the bulk
  *  "Archive all up to this point" made a one-way door out of it). */
 function unarchiveSession(storedId, profile) {
   return host.request('session.archive', { archived: false, profile, session_id: String(storedId) })
@@ -3892,10 +4082,10 @@ function sessionKey(profile, storedId) {
 /** Which sessions a ROW menu acts on. Pure.
  *
  *  A menu opened while rows are ticked acts on the SET or it must not be offered
- *  (Pedro, 2026-11-12: "if the user selects multiple sessions, then the
+ *  (The reviewer, 2026-11-12: "if the user selects multiple sessions, then the
  *  right-click menu options should apply to all selected"). The row clicked must
  *  be one of the ticked ones — right-clicking a stranger replaces the selection,
- *  so acting on the ticks there would be the same bug the other way round.
+ *  so acting on the ticks there would be the same bug in the other direction.
  */
 function menuTargets({ batchTicks, entry, selected, selecting, tickCount }) {
   const ticks = (Array.isArray(batchTicks) ? batchTicks : []).filter(entry => entry && entry.session_id)
@@ -3909,7 +4099,8 @@ function menuTargets({ batchTicks, entry, selected, selecting, tickCount }) {
 
 /** The members a "New session group" would file: every TICKED session of the
  *  clicked row's profile. A group lives in one profile, so a cross-profile
- *  selection can only bring its own profile's share. */
+ *  selection can only bring its own profile's share — and the token bar's own
+ *  group verb already behaves that way. */
 function groupMemberIds(targets, profile) {
   const scope = String(profile || '')
 
@@ -3935,7 +4126,7 @@ function setHiddenForTargets(targets, hidden) {
 
 /** One tick, as a fresh list (never mutates the caller's). */
 /** The whole tick transition in one place: tick (or untick) the key and report
- *  whether the set EMPTIED, which is what leaves select mode. Pedro,
+ *  whether the set EMPTIED, which is what leaves select mode. the user,
  *  2026-10-10: "if the user unselects the last item and none are selected, stop
  *  the multiselect action." A mode with nothing ticked has nothing to act on,
  *  and its bar would only sit there reading "0 selected". */
@@ -3981,7 +4172,7 @@ function selectedSessions(rows, keys) {
 /** The entries an Apropos verb acts on from a SESSION ROW's own menu: the
  *  profile's tick set when the user has one, else the row it was opened on.
  *
- *  Two call sites disagreeing here was the bug (Pedro, 2026-11-02): the roster
+ *  Two call sites disagreeing here was the bug (The reviewer, 2026-11-02): the roster
  *  passed one row while the "View all" drill-down passed `ticks`, so the same
  *  menu item meant two different things depending on the screen — and the
  *  selection verb built its group out of a single session. One function, so the
@@ -4004,7 +4195,7 @@ function aproposEntriesFor({ profile, sessions, selectedKeys, session }) {
  *  one, in which case the set is left alone so a multi-item verb (Move to group,
  *  Apropos → Create group) still sees every tick. A replace, never an
  *  accumulate: the item the menu is about is the item the menu acts on.
- *  Pedro, 2026-10-10: "if the user right-clicks on an item, assume that is the
+ *  The reviewer, 2026-10-10: "if the user right-clicks on an item, assume that is the
  *  selected one when opening the right-click menu". */
 function clickSelect(keys, key) {
   const list = Array.isArray(keys) ? keys : []
@@ -4012,57 +4203,12 @@ function clickSelect(keys, key) {
   return list.includes(key) ? list : [key]
 }
 
-/** The empty transcript, contributed to the chat area: the profile's picture
- *  over its name, the way Bot Mode introduces a bot chat (Pedro, 2026-11-11).
- *
- *  Declines everything it did not open: the slot mounts every contribution, and a
- *  hero drawn over someone else's chat is worse than a blank thread. */
-function ProfileChatEmpty({ sessionId }) {
-  const activeId = useValue(host.state.activeSessionId)
-  const focusedId = useValue(host.state.focusedStoredSessionId)
-  const focusedProfile = useValue(host.state.focusedSessionProfile)
-  // A session created seconds ago may not have a focused profile yet, and the
-  // roster row is the face: fall back to the profile being viewed.
-  const viewedProfile = useValue(host.state.profile)
-  const profile = String(focusedProfile || viewedProfile || '')
-  const opened = useValue($opened)
-  const roster = useQuery({ queryKey: ROSTER_KEY, queryFn: fetchRoster, staleTime: 5000 })
-  const row = (roster.data || []).find(entry => entry.name === String(profile || ''))
-
-  if (!claimsChatEmpty({ sessionId, activeId, focusedId, openedAt: opened, now: Date.now() }) || !row) {
-    return null
-  }
-
-  return jsxs('div', {
-    'data-slot': 'profile_chat_empty',
-    className:
-      'pointer-events-none flex w-full min-w-0 flex-col items-center justify-center px-0.5 py-6 text-center text-muted-foreground sm:px-6 lg:px-8',
-    children: [
-      jsx(
-        'div',
-        {
-          className: 'flex justify-center',
-          // The name is the chat's title, so IT sits on the optical centre line
-          // and the face hangs above it.
-          style: { marginBottom: 12 },
-          children: jsx('div', {
-            className: 'overflow-hidden rounded-full',
-            children: jsx(Avatar, { row, size: 64 })
-          })
-        },
-        'face'
-      ),
-      jsx(Wordmark, { className: 'mb-1', text: row.label || row.name, width: 'calc(80% - 1rem)' }, 'wordmark')
-    ]
-  })
-}
-
 /** The roster rows WITH the session list the pane actually DRAWS.
  *  `profiles.list` carries no `sessions` array — only `last_session` /
  *  `worker_session` (see the note above nextSessionIds) — so a batch resolved
  *  against the raw roster found nothing: `selectedSessions` → [], "Select all"
  *  → [], the bar stuck at "0 selected", and all five verbs `disabled` because
- *  `none = count === 0`. Pedro, 2026-10-10: "the buttons on top (Select All,
+ *  `none = count === 0`. The reviewer, 2026-10-10: "the buttons on top (Select All,
  *  Clear, Close, Archive, Delete) don't work… The numbering (0 selected) also
  *  does not work." The batch must resolve against exactly what is on screen. */
 function rowsWithSessions(rows, byProfile) {
@@ -4094,7 +4240,7 @@ function archiveSessionEntry(entry) {
 
   return archiveSession(storedId, entry.profile).then(answer => {
     // The tab has to go with the row: a tile outlives its session, so without
-    // this the strip keeps offering a chat no list shows any more (Pedro,
+    // this the strip keeps offering a chat no list shows any more (the user,
     // 2026-10-17). Feature-detected — an older desktop simply keeps the tile.
     if (answer !== false && storedId) {
       host.closeSessionTile?.(storedId)
@@ -4157,14 +4303,14 @@ async function renameSession(session, profile, title) {
   const rest = ctxRef?.rest
 
   if (typeof rest !== 'function') {
-    throw new Error('Renaming needs the Personae backend, and it is not mounted in this build.')
+    throw new Error('Renaming needs the Perso backend, and it is not mounted in this build.')
   }
 
   // Two AUTHORITIES, not two guesses. The store is the durable title; the
   // running session object is what core's auto-titler consults — so a rename
   // that writes only the store is silently UNDONE by the first turn of a young
   // chat, which is exactly what "I can't rename it until it has answered me"
-  // looks like from the outside (Pedro, 2026-10-17).
+  // looks like from the outside (The reviewer, 2026-10-17).
   //
   // The id decides the door, and each id shape has exactly one legitimate door:
   //   stored id → the pane's backend (works for a session that is not running)
@@ -4186,12 +4332,12 @@ async function renameSession(session, profile, title) {
   // A 403/404 with NO answer body is the ROUTE, not the session: an older backend
   // half predates /title. Falling through to the RPC in that state produced the
   // gateway's own "Session not found" for a session that exists — the exact
-  // message Pedro kept seeing (2026-10-17).
+  // message the user kept seeing (2026-10-17).
   const routeMissing = !answer && /\b40[34]\b/.test(said)
 
   if (routeMissing) {
     throw new Error(
-      `Rename failed — the Personae backend half does not serve /title yet (restart it): ${said || 'no answer'}`
+      `Rename failed — the Perso backend half does not serve /title yet (restart it): ${said || 'no answer'}`
     )
   }
 
@@ -4228,7 +4374,7 @@ async function renameSession(session, profile, title) {
   if (!stored) {
     throw new Error(
       /\b40[34]\b/.test(said)
-        ? `Rename failed — the Personae backend half is older than the plugin (restart it): ${said}`
+        ? `Rename failed — the Perso backend half is older than the plugin (restart it): ${said}`
         : `Rename failed: ${said || answer?.detail || 'the backend did not answer.'}`
     )
   }
@@ -4246,7 +4392,7 @@ async function renameSession(session, profile, title) {
 
   // The strip names a tab from its session ROW, and the app only re-reads rows
   // when its own list churns — which never happens for a write made over this
-  // backend. Patching the row is what makes a rename reach the tab (Pedro,
+  // backend. Patching the row is what makes a rename reach the tab (the user,
   // 2026-10-17). Feature-detected: an older desktop simply keeps the old caption.
   host.retitleSessionTile?.(storedId, name)
 
@@ -4270,7 +4416,7 @@ async function branchSession(storedId, profile) {
 
 // ── Apropos (On that Topic) ─────────────────────────────────────────────────
 //
-// Pedro, 2026-10-09: "It's an option that shows up when the user right-clicks on
+// The reviewer, 2026-10-09: "It's an option that shows up when the user right-clicks on
 // a session. What it does is it starts a new session, with that previous session
 // as a reference… similar to branch, but instead of including the whole session
 // from that point on, it just uses it as a topic refresher, and can be consulted
@@ -4296,7 +4442,7 @@ async function branchSession(storedId, profile) {
 // tool call), the pin line names its own preservation rule for whatever
 // summarizer rewrites this row, and the prose that used to ride along (opening
 // ask, last 3 turns) is gone — it was paraphrased anyway, and the freed space
-// buys the redundancy. Pedro, 2026-10-10: "I don't think the recent turns or
+// buys the redundancy. The reviewer, 2026-10-10: "I don't think the recent turns or
 // opening ask parts are important. We can delete them and use the space to
 // create rules to prevent compaction."
 //
@@ -4394,6 +4540,10 @@ function rowIdentities(row) {
   }
 
   push(row?.id)
+  // `session.list` projects the RUNTIME id here, and `session.active_list`
+  // reports a live session by exactly that id — so a row's own runtime id has to
+  // be one of its aliases or the Running divider can never fill.
+  push(row?.resolved_id)
   push(row?._lineage_root_id)
 
   if (Array.isArray(row?._lineage_ids)) {
@@ -4597,13 +4747,13 @@ function buildAproposGroupDigest({ label, members, profile }) {
  *  children it already started. The group's box holds both — a child is filed
  *  into the group that named it — so "New child session" would otherwise build
  *  its digest out of the previous child's own transcript instead of the
- *  sessions the user filed there. Pedro, 2026-10-10: "any existing sessions
+ *  sessions the user filed there. The reviewer, 2026-10-10: "any existing sessions
  *  that are dragged into the group, should automatically be considered parent
  *  sessions (so to be used as reference)." */
 /** What the header's child verb does, from the group it acts on: CONVERT a plain
  *  group into an Apropos one (marking only — a child here would be a child the
  *  user never asked for), or start a child on a group that already is one, which
- *  is the one place a header click IS an explicit request for a child. Pedro,
+ *  is the one place a header click IS an explicit request for a child. the user,
  *  2026-10-10: "when choosing 'apropos this group', it should not create a child
  *  session automatically. That only happens when the user selects a specific
  *  session (or multiple sessions) and choose apropos directly." */
@@ -4636,7 +4786,7 @@ function aproposGroupCount(links, profile, groupId) {
 
 
 /** The ONE place a group-started child's title comes from, at creation and at
- *  rename alike. Pedro, 2026-10-10: "When renaming, allow the user to overwrite
+ *  rename alike. The reviewer, 2026-10-10: "When renaming, allow the user to overwrite
  *  the 'Apropos Group:' section as well" — the prefix is as much the user's text
  *  as the name is, so a rename rewrites it too, and a group the user renames to
  *  "Apropos group: X" ends up with exactly the title it asks for. */
@@ -4788,7 +4938,7 @@ async function aproposGroupSession(profile, groupId, label, sessions) {
  *  session keeps the stored id as its key but lives under a runtime id — so
  *  closing only the stored id popped nothing, the session stayed live, and the
  *  delete answered 4023 on a row the user could see and click.
- *  Pedro, 2026-10-10: "Allow deletion of active session, just like I can in
+ *  The reviewer, 2026-10-10: "Allow deletion of active session, just like I can in
  *  sessions." Pure, so the ordering is pinned by the harness. */
 function sessionCloseCandidates({ live, openId, storedId }) {
   const ids = [openId, storedId]
@@ -4859,7 +5009,7 @@ const DELETE_SWEEP_MAX = 200
  *  children instead of cascading (only delegate children cascade). So core
  *  deleting the row the pane shows leaves the ancestors in the store — they
  *  count as tips again immediately, and the conversation reappears in the list
- *  (Pedro, 2026-10-10: "I've deleted some sessions through the Sessions pane,
+ *  (The reviewer, 2026-10-10: "I've deleted some sessions through the Sessions pane,
  *  but they're still showing up on the Messenger pane"). Deleting a chat has to
  *  mean the whole line.
  *
@@ -5004,13 +5154,13 @@ async function deleteSessionEntry(entry) {
   return true
 }
 
-/** Pedro, 2026-10-10: "when a user selects multiple sessions and clicks apropos,
+/** The reviewer, 2026-10-10: "when a user selects multiple sessions and clicks apropos,
  *  create an apropos group using the selected sessions". A tick set can span
  *  profiles and a group digest is scoped to ONE profile, so the selection splits
  *  by profile — normally one group. A single tick is the plain single-session
  *  Apropos: with one member, "a GROUP of earlier conversations" would be a lie,
  *  and that is exactly the bloat the group path exists to avoid. */
-/** "Create group" (Pedro's 4.2): ALWAYS a group, even for one session — the
+/** "Create group" (the reviewer’s 4.2): ALWAYS a group, even for one session — the
  *  single-session flavour of the verb is 4.1 ("From this session"). Returns the
  *  groups it made so the caller can drop the user straight into the rename. */
 async function aproposCreateGroup(entries) {
@@ -5075,7 +5225,7 @@ async function aproposSelection(entries) {
     if (list.length === 1) {
       await aproposSession(list[0].id, profile, list[0].title)
     } else {
-      // Pedro, 2026-10-10: "when a user selects multiple sessions and clicks
+      // The reviewer, 2026-10-10: "when a user selects multiple sessions and clicks
       // Apropos, create a new apropos group, just like a normal session group,
       // but with a diamond icon next to the name in the header. The child
       // session created should show up inside the group, with a little return
@@ -5185,7 +5335,7 @@ async function copyText(text) {
  *  child the page does not carry, so a stale record is a row the user cannot
  *  get rid of — the delete either fails (core: 4007, no such session) or
  *  succeeds and the row is drawn again from the link on the next render.
- *  Pedro, 2026-10-10: "I cannot seem to delete some child sessions". */
+ *  The reviewer, 2026-10-10: "I cannot seem to delete some child sessions". */
 function forgetApropos(profile, childId) {
   const scope = String(profile || '')
   const child = String(childId || '')
@@ -5355,7 +5505,7 @@ async function aproposSession(storedId, profile, title) {
     // gives the child an auto title derived from the parent ("<parent> #2").
     // That is not what Apropos is — the child copies NOTHING and re-reads the
     // source itself — and it left the parent's own row looking like it had been
-    // renamed or duplicated. Pedro, 2026-10-10: "When creating Apropos sessions,
+    // renamed or duplicated. The reviewer, 2026-10-10: "When creating Apropos sessions,
     // do not change anything about the parent session, inside or outside the
     // group. It should remain visible, with the original name."
     const res = await host.request('session.create', {
@@ -5453,7 +5603,7 @@ function wantedSessionIds(profile) {
  *  Why this exists: `session.list` is most-recent-first and the pane asked for
  *  `SESSIONS_PER_PROFILE`, so a session filed into a group could fall out of the
  *  page and VANISH from the box that claims it — the heading counted one while
- *  the box held two, and deleting anything newer brought it back. Pedro,
+ *  the box held two, and deleting anything newer brought it back. the user,
  *  2026-10-10: "it had two sessions inside, but only one was showing. Only after
  *  I deleted the first one, did the second one show up." */
 function nextSessionLimit({ count, ids, limit, wanted }) {
@@ -5511,8 +5661,9 @@ async function resolvedMemberRows(profile, ids) {
   }
 
   if (!rows.length) {
-    // The backend refuses above 200 (`Query(..., le=200)`): the fill cap answered
-    // a bare 422, which reads as an unreadable archive.
+    // The backend refuses above 200 (`Query(..., le=200)`), and asking for the
+    // fill cap answered a bare 422 — an archive that is reachable but refuses the
+    // question must not read as an empty one.
     const archived = (await listArchivedSessions(profile, Math.min(SESSIONS_FILL_CAP, 200))) || []
 
     rows = archived
@@ -5525,52 +5676,11 @@ async function resolvedMemberRows(profile, ids) {
   return rows
 }
 
-/** Every row from ANY profile on the far side of one moment.
- *
- *  "Up to this point" is a MOMENT, not a profile (Pedro, 2026-11-11: "when we use
- *  the options archive/hide up to this point it refers to all sessions from all
- *  profiles"). Each profile's own list goes through this one predicate, and every
- *  entry keeps the profile it came from: the archive call is per session, and an
- *  entry that lost its owner would act on the wrong store.
- *
- *  `field` names the moment — `activity` (the row's last activity, which is what
- *  the archive cut has always used) or `started` (when the conversation began,
- *  which is what "hide all up to this point" means). `inclusive` is for the hide
- *  verb, which takes the anchor with it.
- *
- *  `session_id` is stamped because that is the shape `archiveSessionEntry` and
- *  every batch verb take: a raw listing row carries `id` only, and the cut used
- *  to hand those straight to `session.archive` with an empty `session_id` — a
- *  bulk archive that failed every row and reported it as `N failed`.
- */
-function cutRowsByMoment(rows, profile, momentMs, { field = 'activity', inclusive = false } = {}) {
-  const at = Number(momentMs) || 0
-
-  if (at <= 0) {
-    return []
-  }
-
-  return (Array.isArray(rows) ? rows : [])
-    .filter(row => {
-      const when =
-        field === 'started'
-          ? secondsToMs(row?.started_at) || 0
-          : secondsToMs(row?.last_active || row?.started_at) || 0
-
-      if (!when) {
-        return false
-      }
-
-      return inclusive ? when <= at : when < at
-    })
-    .map(row => ({ ...row, profile: String(profile), session_id: String(row?.id || '') }))
-}
-
 /** `session.list` = most recent first, sub-agent/kanban sources already denied.
  *  The page is as small as it has always been unless something this profile
  *  filed or linked is missing from it, in which case it widens — a few requests
  *  at most, and none at all for a profile with no groups and no links. */
-async function listProfileSessions(profile) {
+async function listProfileSessions(profile, pageSize = SESSIONS_PER_PROFILE) {
   const wanted = wantedSessionIds(profile)
   const page = async limit => {
     const res = await host.request('session.list', { limit, profile })
@@ -5584,7 +5694,7 @@ async function listProfileSessions(profile) {
     }
   }
 
-  let limit = SESSIONS_PER_PROFILE
+  let limit = Math.max(SESSIONS_PER_PROFILE, Number(pageSize) || SESSIONS_PER_PROFILE)
   let loaded = await page(limit)
 
   // 10 → 60 → 360 → 500, and only while something known is still missing.
@@ -5708,12 +5818,12 @@ async function listSearchHits(profile, needle) {
  *  having vanished. */
 const $loadFailures = atom([])
 
-async function refreshSessions(names) {
+async function refreshSessions(names, pageSize = SESSIONS_PER_PROFILE) {
   const failed = []
   const pairs = await Promise.all(
     names.map(async name => {
       try {
-        return [name, await listProfileSessions(name)]
+        return [name, await listProfileSessions(name, pageSize)]
       } catch {
         // A profile whose backend is down draws no sessions rather than an
         // error — but silently drawing nothing reads as data loss, so the pane
@@ -5744,82 +5854,6 @@ function toggleExpanded(profile) {
 
 // ── components ──────────────────────────────────────────────────────────────
 
-function normalizeOpened(raw) {
-  const out = {}
-
-  for (const [id, at] of Object.entries(raw && typeof raw === 'object' ? raw : {})) {
-    const when = Number(at)
-
-    if (id && Number.isFinite(when) && when > 0) {
-      out[String(id)] = when
-    }
-  }
-
-  return out
-}
-
-/** Record that this pane opened a session (see OPENED_KEY). */
-function noteOpened(storedId, liveId) {
-  const id = String(storedId || '')
-  const live = String(liveId || '')
-
-  if (!id) {
-    return openedSessions
-  }
-
-  // BOTH ids: the slot asks with the live one (see claimsChatEmpty), the pane
-  // opens by the stored one.
-  const next = { ...openedSessions, [id]: Date.now(), ...(live ? { [live]: Date.now() } : {}) }
-  const entries = Object.entries(next)
-
-  if (entries.length > OPENED_MAX) {
-    entries.sort((a, b) => Number(a[1]) - Number(b[1]))
-
-    for (const [old] of entries.slice(0, entries.length - OPENED_MAX)) {
-      delete next[old]
-    }
-  }
-
-  openedSessions = next
-  $opened.set(next)
-  persist(OPENED_KEY, next)
-
-  return next
-}
-
-/** Does THIS pane own the empty transcript on screen? All three facts are
- *  required: we opened that session, recently, and it is the one in front of the
- *  user. */
-function claimsChatEmpty({ sessionId, activeId, focusedId, openedAt, now, ttlMs = OPENED_TTL_MS }) {
-  // `sessionId` from the slot is the LIVE id (`ChatEmptyProps`: "the live session
-  // whose transcript is empty"), while the claim store is keyed by the id the pane
-  // opened with — the STORED one. Comparing them directly compares a runtime id to
-  // a stored id, which are never equal, so the hero could not draw (Pedro,
-  // 2026-11-11: "the hero doesn't show up").
-  const live = String(sessionId || '')
-
-  if (!live) {
-    return false
-  }
-
-  const active = String(activeId || '')
-  const focused = String(focusedId || '')
-  const keys = [live]
-
-  // The mapping live → stored is only true for the tile that is actually on
-  // screen, and only when the app says WHICH live id that is. An unknown active id
-  // must not license borrowing the focused chat's claim for any session.
-  if (focused && active && active === live) {
-    keys.push(focused)
-  }
-
-  return keys.some(key => {
-    const at = Number(openedAt?.[key]) || 0
-
-    return at > 0 && Number(now) - at < ttlMs
-  })
-}
-
 /** Profile picture: the profile's asset when it has one, else a deterministic
  *  colour chip carrying its initial (the app's own `profileColor` hue). */
 function Avatar({ row, size = AVATAR_SIZE }) {
@@ -5835,7 +5869,7 @@ function Avatar({ row, size = AVATAR_SIZE }) {
     enabled: row.hasAvatar,
     // Short, NOT Infinity: the avatar is owned by the profile's asset store,
     // which the Bots pane writes too — a cached-forever icon is what made a
-    // picture changed in Bots never reach this pane (Pedro, 2026-10-10: "the
+    // picture changed in Bots never reach this pane (The reviewer, 2026-10-10: "the
     // changes are synced... it reflects on the other"). Cheap enough: only
     // profiles that HAVE an avatar query at all.
     staleTime: 15000,
@@ -6021,7 +6055,7 @@ function humanPreview(preview) {
  *  preview, else 'Untitled session' — NEVER a raw id and never an injected
  *  block. Every compaction mints a fresh row whose title the generator writes a
  *  moment later, so a title-less tip is normal for a while; it must still read
- *  as a session the user recognizes (Pedro, 2026-10-10: "the actual session is
+ *  as a session the user recognizes (The reviewer, 2026-10-10: "the actual session is
  *  not in any of the rows"). Pure, so the harness pins the three shapes. */
 function sessionLabel(session) {
   const title = String(session?.title || '').trim()
@@ -6037,7 +6071,7 @@ function sessionLabel(session) {
 
 /** One menu row: core's own glyph for the verb, then the label.
  *
- *  Pedro, 2026-10-13: "add little icons to the options in the pop-up list when
+ *  The reviewer, 2026-10-13: "add little icons to the options in the pop-up list when
  *  right-clicking on a session". The shape is core's own, verbatim
  *  (`renderActionItem` in `components/ui/actions-menu.tsx`): a Codicon at
  *  `size="0.875rem"`, then the label in a `<span>`.
@@ -6073,6 +6107,7 @@ function SessionRow({
   onRename,
   onRenameCancel,
   onDragStart,
+  onHideUpTo,
   onRenameSubmit,
   onCreateAproposGroup,
   onArchiveUpTo,
@@ -6083,7 +6118,19 @@ function SessionRow({
   groups,
   onMoveGroup,
   onNewGroup,
+  // Optional: the caller wants to know the row was OPENED (the flat list records
+  // the read watermark here). Absent, the row opens exactly as before.
+  onOpen,
   profile,
+  // The roster ROW of the profile this session belongs to (its picture, its
+  // label, its picked colour). Only the flat Perso list has one to hand: the
+  // roster already draws it as a header, so it passes nothing and the slot
+  // collapses.
+  profileRow,
+  // The profile's display name, drawn beside the title. "next to" is the point:
+  // in a flat cross-profile list the picture answers "who" only once you have
+  // learned the faces.
+  profileLabel,
   // The profile's VISIBLE session list (the same array the profile menu docks).
   // A click under a profile the app is not on docks this list onto the strip, so
   // the row needs the list, not just its own session.
@@ -6108,7 +6155,7 @@ function SessionRow({
   const title = sessionLabel(session)
   // A menu opened on a TICKED row, mid-selection, must not offer a verb that can
   // only consult that row: `aproposSession` pins ONE parent id, so choosing it
-  // with two rows ticked silently dropped the second (Pedro, 2026-11-02 — the
+  // with two rows ticked silently dropped the second (The reviewer, 2026-11-02 — the
   // child it made carried a single `[APROPOS-PIN parent=…]` and could not answer
   // a question about both). Above one tick the submenu collapses to the
   // selection verb, which builds a GROUP digest naming every member.
@@ -6133,6 +6180,9 @@ function SessionRow({
   // offers the way back without the profile list re-rendering for it.
   const hiddenState = useValue($hiddenSessions)
   const hidden = (hiddenState[String(profile)] || []).includes(storedId)
+  // Subscribed because the AGE is derived from it: the sweep fills it moments
+  // after the first paint (see $lastActive).
+  useValue($lastActive)
   // A search hit from the ARCHIVE: the row is here because the query matched a
   // chat that is not in any live list, so it says where it came from instead of
   // looking like an ordinary recent session.
@@ -6148,7 +6198,7 @@ function SessionRow({
   //      group, so dropping an existing session into that box earns it the mark
   //      too (the box is the membership).
   //   ↳  this row IS that child: the curved hook says "derived, not original".
-  // Pedro, 2026-10-10: "put a diamond icon next to all sessions that are being
+  // The reviewer, 2026-10-10: "put a diamond icon next to all sessions that are being
   // referenced… When creating an Apropos child inside an apropos group, put the
   // curved hook arrow before the name."
   const groupedChild = Boolean(
@@ -6160,7 +6210,11 @@ function SessionRow({
   const mark = groupedChild ? '↳' : aproposGroup ? '◆' : ''
   // Which channel this conversation arrived on ('' = the app's own surfaces).
   const channel = channelLabel(session?.source)
-  const age = ageLabel(secondsToMs(session?.last_active || session?.started_at), nowMs)
+  const age = ageLabel(sessionActivityMs(session), nowMs)
+  // The last line of the conversation, cleaned by the same helper the roster's
+  // preview line uses (it rejects injected/system boilerplate, so a compaction
+  // banner can never become the thing the user reads under a title).
+  const preview = humanPreview(session?.preview)
   // The delete confirm is LOCAL to the row: it is one row's question, asked
   // where the user just clicked. The pane has no modal (and the SDK hands out no
   // dialog), so an inline strip is the whole confirmation.
@@ -6194,7 +6248,7 @@ function SessionRow({
       try {
         // `openId` matters: a live session may be registered under its runtime
         // id while the stored id is what `session.delete` refuses on. The row
-        // knows both (Pedro, 2026-10-10: "Allow deletion of active session").
+        // knows both (The reviewer, 2026-10-10: "Allow deletion of active session").
         // ONE chain delete per target: a live session may be registered under its
         // runtime id while the stored id is what `session.delete` refuses on, and
         // a compaction can put an ancestor back — the chain walk owns both.
@@ -6275,7 +6329,7 @@ function SessionRow({
           'data-session-row': '',
           'data-item-drag': selecting || !onDragStart ? undefined : 'session',
           className: 'flex min-w-0 items-center',
-          // Pedro's item-first drag: hold the row and move. In select mode the
+          // the reviewer’s item-first drag: hold the row and move. In select mode the
           // press is a TICK, so the gesture is off entirely there.
           onPointerDown: event => {
             // A right-click is a context-menu request, so it also SELECTS:
@@ -6316,8 +6370,12 @@ function SessionRow({
             boxShadow: dropTarget
               ? `inset 0 ${dropSide === 'before' ? '' : '-'}2px 0 0 var(--ui-accent)`
               : undefined,
-            paddingBottom: 7,
-            paddingTop: 7
+            // Height, explicitly: the row was ~30px (16px line + 7/7 padding).
+            // Two lines at 16 + 15 plus 4/4 puts it at ~39px — the 30% the user
+            // asked for, and it is a `style` because 4px of padding has no
+            // utility the app compiled for a row this shape.
+            paddingBottom: 4,
+            paddingTop: 4
           },
           // In select mode the row's whole job flips: it ticks instead of
           // opening. (The menu still opens a session — a right-click is an
@@ -6330,7 +6388,7 @@ function SessionRow({
           onClick: guardClick(
             selecting
               ? () => onToggleSelect()
-              : () => openSessionInProfile(profile, profileSessions, openId)
+              : () => (onOpen ? onOpen() : openSessionInProfile(profile, profileSessions, openId))
           ),
           children: [
             selecting
@@ -6344,115 +6402,162 @@ function SessionRow({
                 )
               : null,
             jsx(SessionStatusDot, { storedSessionId: storedId }),
-            // A message-body match: the text beside it is the MESSAGE the needle
-            // was found in, not the session title, so the glyph says why it is
-            // here.
-            session?.body
-              ? jsx(Codicon, { className: 'shrink-0 text-(--ui-text-quaternary)', name: 'comment-discussion' })
+            // The profile's picture, immediately after the status dot (the user,
+            // 2026-11-11: "status dot before the avatar"). Only the flat list
+            // passes a roster row; everywhere else this slot is empty and the
+            // row's text still starts on the one left edge.
+            profileRow
+              ? jsx(Avatar, { row: profileRow, size: AVATAR_ROW_SIZE })
               : null,
-            // The Apropos mark, BEFORE the name and OUTSIDE the truncating
-            // cell: a mark that scrolls away with a long title is not a mark.
-            mark
-              ? jsx(
-                  'span',
-                  {
-                    'data-row-mark': groupedChild ? 'child' : 'source',
-                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: mark
-                  },
-                  'mark'
-                )
-              : null,
-            // The name carries the picked color. `style`, not a class: a
-            // user-chosen hex has no compiled utility to reuse.
-            jsx('span', {
-              className: 'min-w-0 flex-1 truncate',
-              style: color ? { color } : undefined,
-              children: title
-            }),
-            // The channel chip: a Telegram / WhatsApp / Discord session says so,
-            // in the same muted micro-type the profile row's "default" badge
-            // uses. No chip for the app's own surfaces (see channelLabel).
-            channel
-              ? jsx(
-                  'span',
-                  {
-                    className:
-                      'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
-                    children: channel
-                  },
-                  'channel'
-                )
-              : null,
-            // The Apropos chip: `↩ parent` on a child, `→ n` on a parent. The
-            // same muted micro-type as the channel chip, and the same reason it
-            // is a span and not a button — the row's own button owns the click.
-            // Inside its own Apropos group the hook already says where this row
-            // came from, so the chip would only repeat it.
-            parentLink && !groupedChild
-              ? jsx(
-                  'span',
-                  {
-                    'data-apropos-parent': parentLink.parent,
-                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: `↩ ${clip(parentLink.label || parentLink.parent, 24)}`
-                  },
-                  'apropos-parent'
-                )
-              : null,
-            childCount
-              ? jsx(
-                  'span',
-                  {
-                    'data-apropos-children': String(childCount),
-                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: `→ ${childCount}`
-                  },
-                  'apropos-children'
-                )
-              : null,
-            hidden
-              ? jsx(
-                  'span',
-                  {
-                    'data-session-hidden': storedId,
-                    className:
-                      'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
-                    children: 'hidden'
-                  },
-                  'hidden-chip'
-                )
-              : null,
-            archived
-              ? jsx(
-                  'span',
-                  {
-                    'data-session-archived': storedId,
-                    className:
-                      'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
-                    children: 'archived'
-                  },
-                  'archived-chip'
-                )
-              : null,
-            matches
-              ? jsx(
-                  'span',
-                  {
-                    'data-session-matches': String(matches),
-                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: `${matches} matches`
-                  },
-                  'matches'
-                )
-              : null,
-            age
-              ? jsx('span', { className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)', children: age })
-              : null,
+            // ── the row's text block: TWO lines ─────────────────────────
+            // The reviewer, 2026-11-11: "include the last line from the conversation".
+            // The card the row imitates is a messenger row — a name and, under
+            // it, the last thing that was said. The title keeps the flexible
+            // cell so every row's name still starts on one left edge, and the
+            // age stays at the end of THAT line, where it has always been.
+            jsxs('div', {
+              className: 'flex min-w-0 flex-1 flex-col',
+              children: [
+                jsxs('div', {
+                  className: 'flex min-w-0 items-center gap-1.5',
+                  children: [
+              // A message-body match: the text beside it is the MESSAGE the needle
+              // was found in, not the session title, so the glyph says why it is
+              // here.
+              session?.body
+                ? jsx(Codicon, { className: 'shrink-0 text-(--ui-text-quaternary)', name: 'comment-discussion' })
+                : null,
+              // The Apropos mark, BEFORE the name and OUTSIDE the truncating
+              // cell: a mark that scrolls away with a long title is not a mark.
+              mark
+                ? jsx(
+                    'span',
+                    {
+                      'data-row-mark': groupedChild ? 'child' : 'source',
+                      className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                      children: mark
+                    },
+                    'mark'
+                  )
+                : null,
+              // The name carries the picked color. `style`, not a class: a
+              // user-chosen hex has no compiled utility to reuse.
+              jsx('span', {
+                className: 'min-w-0 flex-1 truncate',
+                style: color ? { color } : undefined,
+                children: title
+              }),
+              // WHICH profile this chat belongs to. Shrinkable and truncatable: it
+              // is a hint, never the reason a title stops fitting.
+              profileLabel
+                ? jsx(
+                    'span',
+                    {
+                      'data-row-profile': profile,
+                      className:
+                        'min-w-0 shrink truncate rounded-sm px-1 text-[0.625rem] text-(--ui-text-quaternary)',
+                      children: profileLabel
+                    },
+                    'profile-label'
+                  )
+                : null,
+              // The channel chip: a Telegram / WhatsApp / Discord session says so,
+              // in the same muted micro-type the profile row's "default" badge
+              // uses. No chip for the app's own surfaces (see channelLabel).
+              channel
+                ? jsx(
+                    'span',
+                    {
+                      className:
+                        'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
+                      children: channel
+                    },
+                    'channel'
+                  )
+                : null,
+              // The Apropos chip: `↩ parent` on a child, `→ n` on a parent. The
+              // same muted micro-type as the channel chip, and the same reason it
+              // is a span and not a button — the row's own button owns the click.
+              // Inside its own Apropos group the hook already says where this row
+              // came from, so the chip would only repeat it.
+              parentLink && !groupedChild
+                ? jsx(
+                    'span',
+                    {
+                      'data-apropos-parent': parentLink.parent,
+                      className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                      children: `↩ ${clip(parentLink.label || parentLink.parent, 24)}`
+                    },
+                    'apropos-parent'
+                  )
+                : null,
+              childCount
+                ? jsx(
+                    'span',
+                    {
+                      'data-apropos-children': String(childCount),
+                      className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                      children: `→ ${childCount}`
+                    },
+                    'apropos-children'
+                  )
+                : null,
+              hidden
+                ? jsx(
+                    'span',
+                    {
+                      'data-session-hidden': storedId,
+                      className:
+                        'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
+                      children: 'hidden'
+                    },
+                    'hidden-chip'
+                  )
+                : null,
+              archived
+                ? jsx(
+                    'span',
+                    {
+                      'data-session-archived': storedId,
+                      className:
+                        'shrink-0 rounded-sm px-1 text-[0.625rem] uppercase text-(--ui-text-quaternary)',
+                      children: 'archived'
+                    },
+                    'archived-chip'
+                  )
+                : null,
+              matches
+                ? jsx(
+                    'span',
+                    {
+                      'data-session-matches': String(matches),
+                      className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                      children: `${matches} matches`
+                    },
+                    'matches'
+                  )
+                : null,
+              age
+                ? jsx('span', { className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)', children: age })
+                : null
+                  ]
+                }),
+                // The last line of the conversation, clipped to one line. A row
+                // with nothing said in it draws none — never an empty band.
+                preview
+                  ? jsx('div', {
+                      'data-session-preview': storedId,
+                      className: 'min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)',
+                      style: { lineHeight: '15px' },
+                      children: preview
+                    }, 'preview')
+                  : null
+              ]
+            })
             // Re-ordering sessions is a drag-job too: the row IS the handle (the
             // pointerdown above arms it past a threshold), so the click still
             // opens the session and a list you re-sort by accident is worse than
-            // a list that never moves. Pedro, 2026-10-10: "remove the grip icons
+            // a list that never moves. The reviewer, 2026-10-10: "remove the grip icons
             // from the sessions and the profiles" — the grip was a second left
             // edge in every row and the item-first drag had made it redundant.
           ]
@@ -6463,7 +6568,7 @@ function SessionRow({
       }),
       jsx(ContextMenuContent, {
         children: [
-          // Pedro's ordering, 2026-10-10: ONE NOUN PER SUBMENU, one verb inline,
+          // the reviewer’s ordering, 2026-10-10: ONE NOUN PER SUBMENU, one verb inline,
           // and the two pickers last. Top level reads as a table of contents:
           // Select · Open · Session · Apropos · Group · Appearance · Project.
           jsx(
@@ -6557,14 +6662,29 @@ function SessionRow({
                             hidden ? 'eye' : 'eye-closed',
                             hidden
                               ? multi
-                                ? `Unhide ${targets.length} in Personae`
-                                : 'Unhide in Personae'
+                                ? `Unhide ${targets.length} in Perso`
+                                : 'Unhide in Perso'
                               : multi
-                                ? `Hide ${targets.length} from Personae`
-                                : 'Hide from Personae'
+                                ? `Hide ${targets.length} from Perso`
+                                : 'Hide from Perso'
                           )
                         },
                         'hide-session'
+                      ),
+                      // The bulk form of Hide, scoped by CREATION time (the user,
+                      // 2026-11-11: "hides from the Perso UI the selected session
+                      // as well as all the sessions created before that one"). The
+                      // pane reads the profile's FULL list before acting, so the
+                      // cut is the whole history, not the page on screen.
+                      multi
+                        ? null
+                        : jsx(
+                        ContextMenuItem,
+                        {
+                          onSelect: () => onHideUpTo?.(session, profile),
+                          children: menuGlyph('eye-closed', 'Hide all up to this point…')
+                        },
+                        'hide-upto'
                       ),
                       // An ARCHIVED row gets the way back instead of the verb it
                       // already has: "Archive" on something already archived is a
@@ -6591,7 +6711,7 @@ function SessionRow({
                             },
                             'archive'
                           ),
-                      // "Archive all up to this point" (Pedro, 2026-10-16): this
+                      // "Archive all up to this point" (The reviewer, 2026-10-16): this
                       // session marks a CUT — everything in the profile with an
                       // older last activity goes with it. The count is read from
                       // the profile's full list and confirmed before anything
@@ -6603,7 +6723,9 @@ function SessionRow({
                       // would re-archive rows and report a number as work done.
                       archived
                         ? null
-                        : jsx(
+                        : multi
+                          ? null
+                          : jsx(
                             ContextMenuItem,
                             {
                               onSelect: () => onArchiveUpTo?.(session, profile),
@@ -6616,7 +6738,7 @@ function SessionRow({
                       // neighbouring item must not reach it. Core's own
                       // destructive menu language — `variant` reddens the label
                       // AND tints the icon, exactly like the Sessions tab's trash
-                      // button (Pedro, 2026-10-10).
+                      // button (The reviewer, 2026-10-10).
                       jsx(ContextMenuSeparator, {}, 'sep-delete'),
                       jsx(
                         ContextMenuItem,
@@ -6669,7 +6791,7 @@ function SessionRow({
                             'apropos-session'
                           ),
                           // 4.2 the group flavour: ALWAYS a group, even for one
-                          // session (Pedro, 2026-10-10: "if a single session is
+                          // session (The reviewer, 2026-10-10: "if a single session is
                           // selected, a new apropos group is created with the selected
                           // session, inside. if multiple are selected, all are put
                           // inside the apropos group"). It acts on the TICK SET,
@@ -6791,7 +6913,7 @@ function SessionRow({
  *  above them the way a profile group does — same arrangement, one level down. */
 /** The group's verbs, defined ONCE, rendered into BOTH menus.
  *  The kebab and the header's right-click menu are the same menu reached two
- *  ways; a verb on only one of them is a verb the user cannot find. Pedro,
+ *  ways; a verb on only one of them is a verb the user cannot find. the user,
  *  2026-10-10: "For groups options in the right-click menu and the three dot
  *  menu should be identical, so color options, delete group, etc. should show up
  *  on both menus".
@@ -6824,14 +6946,14 @@ function sessionGroupMenuEntries({
     },
     // The group-level sibling of the session row's Apropos: one child seeded
     // with a digest of every member. On an Apropos group this is "start ANOTHER
-    // child" (Pedro, 2026-10-10: "Right-clicking the header allows the user to
+    // child" (The reviewer, 2026-10-10: "Right-clicking the header allows the user to
     // create a new child session.").
     {
       key: 'apropos',
       // One verb, two names, because it is two different acts to the user: on a
       // plain group this is what MAKES it an Apropos group (the diamond appears
       // on it and on its members, which join the digest); on one that already
-      // is, the same call starts another child. Pedro, 2026-10-10: "The header
+      // is, the same call starts another child. The reviewer, 2026-10-10: "The header
       // options should have 'new child session'."
       label: apropos ? 'New child session (beta)' : 'Apropos this group (beta)',
       disabled: !canApropos,
@@ -6925,7 +7047,12 @@ function SessionGroupHeading({
   onMove,
   onRename,
   onToggle,
-  profile
+  profile,
+  // The roster row of the ONE profile this box holds, when every member is that
+  // profile's. The picture then sits on the heading and the member rows drop
+  // theirs (The reviewer, 2026-11-11: "put the profile picture to the left of the group
+  // name and remove the profile pictures from sessions inside the group").
+  profileRow
 }) {
   // How many Apropos children this group has started. A hook, so only a
   // rendered heading subscribes (see aproposGroupCount).
@@ -6965,9 +7092,23 @@ function SessionGroupHeading({
         onClick: guardClick(() => onToggle(block.id)),
         children: [
           jsx(DisclosureCaret, { open: !block.collapsed }, 'caret'),
+          // After the caret, before the name: the caret owns the far left of a
+          // box, so the picture can never push the disclosure out of reach.
+          profileRow
+            ? jsx(
+                'span',
+                {
+                  'data-group-profile': String(profile || ''),
+                  // `children:` and not the third argument — that slot is the KEY,
+                  // and an element passed there renders an empty span.
+                  children: jsx(Avatar, { row: profileRow, size: AVATAR_HEAD_SIZE })
+                },
+                'group-profile'
+              )
+            : null,
           // An Apropos group is a NORMAL session group that also carries a
           // generated child, and the diamond is the whole difference on screen.
-          // Pedro, 2026-10-10: "create a new apropos group, just like a normal
+          // The reviewer, 2026-10-10: "create a new apropos group, just like a normal
           // session group, but with a diamond icon next to the name in the
           // header." A character, not a Codicon: no icon font to gamble on, and
           // it needs no compiled class.
@@ -7002,7 +7143,7 @@ function SessionGroupHeading({
       }),
       // No grip on a group heading. The header itself is the handle (the
       // pointerdown above arms the drag), and a grip in the heading was both
-      // clutter and a second, competing left edge next to the caret. Pedro,
+      // clutter and a second, competing left edge next to the caret. the user,
       // 2026-10-10: "remove the grip icons from the group headers".
       jsxs(DropdownMenu, {
         children: [
@@ -7048,6 +7189,1027 @@ function SessionGroupHeading({
 }
 
 /** One roster row, shaped like a Bots row. */
+// ── Perso: ONE flat list across every profile ───────────────────────────────
+// The reviewer, 2026-11-11: "instead of having a conversation with all the profiles, I
+// just want a list of sessions, ordered by activity, with the profile pictures
+// of the profiles it belongs to next to the title."
+//
+// The ORDER is the only new decision here. Everything else is the roster's own
+// machinery, reused rather than re-written: `withAproposChildren` (a child under
+// the parent it was seeded from), `sessionGroupBlocks` (a group box),
+// `SessionRow` (the row, its marks and its whole menu).
+
+/** Record that this pane opened a session (see OPENED_KEY). */
+function noteOpened(storedId, liveId) {
+  const id = String(storedId || '')
+  const live = String(liveId || '')
+
+  if (!id) {
+    return openedSessions
+  }
+
+  // BOTH ids: the slot asks with the live one (see claimsChatEmpty), the pane
+  // opens by the stored one.
+  const next = { ...openedSessions, [id]: Date.now(), ...(live ? { [live]: Date.now() } : {}) }
+  const entries = Object.entries(next)
+
+  if (entries.length > OPENED_MAX) {
+    entries.sort((a, b) => Number(a[1]) - Number(b[1]))
+
+    for (const [old] of entries.slice(0, entries.length - OPENED_MAX)) {
+      delete next[old]
+    }
+  }
+
+  openedSessions = next
+  $opened.set(next)
+  persist(OPENED_KEY, next)
+
+  return next
+}
+
+/** Does THIS pane own the empty transcript on screen?
+ *
+ *  All three facts are required: we opened that session, recently, and it is the
+ *  one in front of the user. Anything less and a second pane (or a session
+ *  reopened from core) would decorate a chat it did not start — and because the
+ *  slot mounts EVERY registration, two claims draw two heroes. */
+function claimsChatEmpty({ sessionId, activeId, focusedId, openedAt, now, ttlMs = OPENED_TTL_MS }) {
+  // `sessionId` from the slot is the LIVE id (`ChatEmptyProps`: "the live session
+  // whose transcript is empty"), while the claim store is keyed by the id the pane
+  // opened the session with — the STORED one. Comparing the two directly compares a
+  // runtime id to a stored id, which are never equal, so the hero could not draw
+  // for any session, ever (The reviewer, 2026-11-11: "the hero doesn't show up").
+  const live = String(sessionId || '')
+
+  if (!live) {
+    return false
+  }
+
+  const active = String(activeId || '')
+  const focused = String(focusedId || '')
+  const keys = [live]
+
+  // The mapping live → stored is only true for the tile that is actually on
+  // screen, and only when the app says WHICH live id that is. An unknown active
+  // id must not license borrowing the focused chat's claim for any session (the
+  // harness caught exactly that: a stranger drew with the hero's claim).
+  if (focused && active && active === live) {
+    keys.push(focused)
+  }
+
+  return keys.some(key => {
+    const at = Number(openedAt?.[key]) || 0
+
+    return at > 0 && Number(now) - at < ttlMs
+  })
+}
+
+function normalizeSeen(raw) {
+  const out = {}
+
+  for (const [id, at] of Object.entries(raw && typeof raw === 'object' ? raw : {})) {
+    const when = Number(at)
+
+    if (id && Number.isFinite(when) && when > 0) {
+      out[String(id)] = when
+    }
+  }
+
+  return out
+}
+
+/** He opened this row at `activeMs` (its own last activity). Idempotent, never
+ *  moves backwards — an older activity replayed by a poll must not un-read a
+ *  row he has already seen. */
+function noteSeen(storedId, activeMs) {
+  const id = String(storedId || '')
+  const at = Number(activeMs) || 0
+
+  if (!id || at <= 0) {
+    return seenSessions
+  }
+
+  if ((seenSessions[id] || 0) >= at) {
+    return seenSessions
+  }
+
+  const next = { ...seenSessions, [id]: at }
+  const entries = Object.entries(next)
+
+  if (entries.length > SEEN_MAX) {
+    entries.sort((a, b) => Number(a[1]) - Number(b[1]))
+
+    for (const [old] of entries.slice(0, entries.length - SEEN_MAX)) {
+      delete next[old]
+    }
+  }
+
+  seenSessions = next
+  $seen.set(next)
+  persist(SEEN_KEY, next)
+
+  return next
+}
+
+/** Which divider a session belongs under.
+ *
+ *  The reviewer, 2026-11-11: "Unread (which is a session that has finished running, but
+ *  the user has not opened the session to read the latest message); Running (all
+ *  sessions currently working), Read".
+ *
+ *  A session WAITING on him (`needs-input`) is not running and is certainly not
+ *  read, so it files under Unread — the bucket that means "look at me".
+ */
+function sessionBucket(state, { activeMs = 0, seenAt = 0 } = {}) {
+  if (state === 'working') {
+    return 'running'
+  }
+
+  if (state === 'needs-input') {
+    // Waiting on his answer: not running, and certainly not read.
+    return 'unread'
+  }
+
+  if (state !== 'unread') {
+    return 'read'
+  }
+
+  // Core says unread. The pane knows better when it watched him open the row:
+  // activity at or before the moment he opened it has been read. A turn that
+  // landed AFTER that moment is genuinely unread again.
+  return seenAt > 0 && activeMs > 0 && activeMs <= seenAt ? 'read' : 'unread'
+}
+
+/** The dividers, in the order they are drawn. */
+const BUCKETS = ['unread', 'running', 'read']
+const BUCKET_LABEL_KEY = { read: 'readSection', running: 'runningSection', unread: 'unreadSection' }
+const BUCKET_RANK = { unread: 0, running: 1, read: 2 }
+
+/** One box's members, split into the SAME three dividers the list uses, in
+ *  divider order and by activity inside each (The reviewer, 2026-11-11: "include the
+ *  dividers inside the groups").
+ *
+ *  This is the one place a box's own order is overridden: a box files its
+ *  members by hand, but inside it the question is still "what needs my eyes".
+ *  A bucket with no members draws nothing.
+ */
+function bucketSessions(sessions, states, seen, focusedId) {
+  const list = Array.isArray(sessions) ? sessions : []
+  const byActivity = (a, b) =>
+    sessionActivityMs(b) - sessionActivityMs(a) ||
+    String(a?.id || '').localeCompare(String(b?.id || ''))
+  const bucketOf = session => {
+    const id = String(session?.id || '')
+    const activeMs = sessionActivityMs(session)
+    const seenAt = id && id === String(focusedId || '') ? activeMs : Number(seen?.[id]) || 0
+
+    return sessionBucket(stateForRow(session, states), { activeMs, seenAt })
+  }
+
+  return BUCKETS.map(bucket => ({
+    bucket,
+    rows: list.filter(session => bucketOf(session) === bucket).sort(byActivity)
+  })).filter(group => group.rows.length)
+}
+
+/** When a row happened, in ms. `session.list` carries `last_active` in unix
+ *  SECONDS — the one unit `secondsToMs` speaks — and a session the gateway could
+ *  not date falls back to its start, then to the epoch. A row that sorts last is
+ *  a wrong place; an `undefined` inside a comparator is an unstable list. */
+function sessionActivityMs(session) {
+  return activityMsFor(session, lastActiveById)
+}
+
+/** When a row last MOVED, with the sweep's answer as the fallback. `session.list`
+ *  sends no `last_active`, so without the map every label and every comparison
+ *  below read `started_at` — a list that looks sorted by creation, and an age on
+ *  the right that never moves. Pure. */
+function activityMsFor(session, lastActive) {
+  const own = secondsToMs(session?.last_active)
+
+  if (own !== null) {
+    return own
+  }
+
+  const known = Number(lastActive?.[String(session?.id || '')])
+
+  return Number.isFinite(known) && known > 0 ? known : (secondsToMs(session?.started_at) ?? 0)
+}
+
+/** The map the resolver reads, kept beside the atom it mirrors (the same shape
+ *  the hidden/opened stores use). Module scope rather than a prop because
+ *  `sessionActivityMs` is called from ordering, bucketing and the read watermark
+ *  as well as the label — one answer, four consumers. */
+let lastActiveById = {}
+
+/** One profile's contribution to the flat list. Pure, so the harness can pin the
+ *  ordering without a DOM.
+ *
+ *  Two rules shape it:
+ *   - a GROUP is ONE item, and the caller pins every box ABOVE the loose rows
+ *     (the user: "groups should be at the top"). Inside the list the members ride
+ *     together and keep their own order — a box that is not contiguous is not a
+ *     box.
+ *   - everything ungrouped is strictly by activity (the caller sorts the lot). */
+function flatProfileItems({
+  groups,
+  hidden,
+  links,
+  order,
+  profile,
+  released,
+  revealed,
+  searching,
+  sessions,
+  sortMode = 'activity',
+  states,
+  seen,
+  focusedId
+}) {
+  const bucketOf = session => {
+    const id = String(session?.id || '')
+    const activeMs = sessionActivityMs(session)
+    // The session on screen in front of him is being read right now — no write
+    // needed, and no window where it is both open and "unread".
+    const seenAt = id && id === String(focusedId || '') ? activeMs : Number(seen?.[id]) || 0
+
+    return sessionBucket(stateForRow(session, states), { activeMs, seenAt })
+  }
+  const list = Array.isArray(sessions) ? sessions : []
+  // A child draws under its parent — the roster's own rule, so the two panes
+  // cannot disagree about which rows exist or where a derived chat sits.
+  const withChildren = withAproposChildren(sortProfileSessions(list, sortMode, order), links, profile)
+  const hiddenIds = new Set((Array.isArray(hidden) ? hidden : []).map(String))
+  // Hiding is a VIEW (HIDDEN_KEY): a hidden session still answers a search, and
+  // it draws there WITH its `hidden` chip and its Unhide verb.
+  const visible = revealed ? withChildren : withChildren.filter(session => !hiddenIds.has(String(session?.id)))
+  // An ARCHIVED row belongs to the archived section, never to the live list.
+  const filed = searching ? visible : visible.filter(session => session?.archived !== true)
+
+  if (searching) {
+    // A search is about the needle, not about filing: no boxes, no anchoring.
+    return filed.map(session => ({
+      at: sessionActivityMs(session),
+      bucket: bucketOf(session),
+      kind: 'session',
+      profile,
+      session
+    }))
+  }
+
+  // The cap is the CALLER's: this list is capped once, globally (FLAT_PAGE), so
+  // the per-profile ten the roster uses would silently drop rows that belong in
+  // the top fifty.
+  const blocks = sessionGroupBlocks(filed, groups, profile, released, Infinity)
+  const boxed = blocks.filter(block => block.id)
+  const items = []
+
+  for (const block of blocks) {
+    if (!block.id) {
+      for (const session of block.sessions) {
+        items.push({
+          at: sessionActivityMs(session),
+          bucket: bucketOf(session),
+          kind: 'session',
+          profile,
+          session
+        })
+      }
+
+      continue
+    }
+
+    // ONE item per box, so a page boundary can never split a group: an open box
+    // draws every member it has, a collapsed one keeps its place as one line.
+    items.push({
+      at: Math.max(0, ...block.sessions.map(sessionActivityMs)),
+      block,
+      groupCount: boxed.length,
+      index: boxed.findIndex(candidate => candidate.id === block.id),
+      kind: 'group',
+      profile
+    })
+  }
+
+  return items
+}
+
+/** The whole list: every profile's items, ONE global order, then "Show more"
+ *  pages through it.
+ *
+ *  GROUP BOXES COME FIRST (The reviewer, 2026-11-11: "groups should be at the top").
+ *  A box is a place the user put things; burying it under a busy morning's chat
+ *  traffic hides the one part of the list he arranged by hand. Boxes are ordered
+ *  among themselves by their newest member (so they do not jump around), and
+ *  every ungrouped session follows, strictly by activity.
+ *
+ *  The tiebreak is TOTAL (profile, then id): two rows at the same second must
+ *  not swap places on every poll — a list that reshuffles by itself reads as
+ *  activity that never happened, which is the one thing a strict activity order
+ *  must never do. */
+function flatSessionItems({
+  byProfile,
+  focusedId,
+  groups,
+  hidden,
+  links,
+  profiles,
+  released,
+  revealed,
+  searching,
+  seen,
+  states
+}) {
+  const items = []
+
+  for (const profile of profiles || []) {
+    items.push(
+      ...flatProfileItems({
+        groups,
+        hidden: hidden?.[String(profile)],
+        links,
+        profile,
+        released: released?.[String(profile)],
+        revealed: Boolean(revealed),
+        searching,
+        focusedId,
+        sessions: byProfile?.[String(profile)],
+        seen,
+        states
+      })
+    )
+  }
+
+  const idOf = item => (item.kind === 'group' ? `g:${item.block.id}` : `s:${item.session?.id}`)
+  // Groups first — always, whatever the clock says. Then the DIVIDERS
+  // (Unread, Running, Read — see sessionBucket), and inside one divider the
+  // activity order the pane has always had.
+  const rank = item => (item.kind === 'group' ? 0 : 1)
+  const bucketRank = item => (item.kind === 'group' ? -1 : BUCKET_RANK[item.bucket] ?? 2)
+
+  return items.sort(
+    (a, b) =>
+      rank(a) - rank(b) ||
+      bucketRank(a) - bucketRank(b) ||
+      b.at - a.at ||
+      String(a.profile).localeCompare(String(b.profile)) ||
+      idOf(a).localeCompare(idOf(b))
+  )
+}
+
+/** A labelled divider. `inside` is the group it belongs to, if any: a box's
+ *  divider is indented to the rows it separates and carries the box's id so the
+ *  two kinds are never confused.
+ */
+function BucketDivider({ bucket, count, inside, t }) {
+  return jsxs(
+    'div',
+    {
+      'data-divider': bucket,
+      'data-divider-in': inside ? String(inside) : undefined,
+      className: inside
+        ? 'mt-1 flex min-w-0 items-center gap-1.5 border-t border-(--ui-stroke-secondary) px-1 pt-1.5 pb-0.5'
+        : 'mt-1 flex min-w-0 items-center gap-1.5 border-t border-(--ui-stroke-secondary) px-2 pt-2 pb-0.5',
+      children: [
+        jsx(
+          'span',
+          {
+            className:
+              'shrink-0 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+            children: t(BUCKET_LABEL_KEY[bucket])
+          },
+          'label'
+        ),
+        jsx(
+          'span',
+          {
+            className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+            children: String(count)
+          },
+          'count'
+        )
+      ]
+    },
+    `divider-${inside || 'list'}-${bucket}`
+  )
+}
+
+/** One session row of the flat list: the roster's own SessionRow, carrying the
+ *  two things a cross-profile list cannot infer from the session — the profile's
+ *  picture and its name.
+ *
+ *  No `onDragStart`: a session dragged across profiles would file an id into a
+ *  group it does not belong to, and in a flat list every row's neighbour may be
+ *  another profile's. The menu's "Move to group ▸" is the same verb, scoped to
+ *  the session's own profile, and it cannot silently fail. */
+function PersoRow({
+  aproposGroup,
+  byProfile,
+  groupId,
+  groupState,
+  handlers,
+  hideProfile,
+  nowMs,
+  profile,
+  profileRow,
+  session
+}) {
+  const key = `sess-${profile}-${session?.id}`
+  const row = profileRow || { label: profile, name: profile }
+  const node = jsx(
+    SessionRow,
+    {
+      aproposGroup: Boolean(aproposGroup),
+      editing: Boolean(
+        handlers.editingSession &&
+          handlers.editingSession.profile === profile &&
+          String(handlers.editingSession.id) === String(session?.id)
+      ),
+      group: groupId || null,
+      groups: profileSessionGroups(groupState, profile).groups,
+      nowMs,
+      onArchiveUpTo: handlers.onArchiveUpTo,
+      onCreateAproposGroup: () =>
+        handlers.onCreateAproposGroup(
+          aproposEntriesFor({
+            profile,
+            selectedKeys: handlers.selectedKeys,
+            session,
+            sessions: byProfile?.[String(profile)] || []
+          })
+        ),
+      // Opening a row is the act of reading it: record the moment, and tell the
+      // app's own unread store (the SDK's documented door for exactly this) so
+      // the dot and the divider cannot disagree.
+      onOpen: () => handlers.onOpenRow?.(profile, session, byProfile?.[String(profile)]),
+      onMoveGroup: payload => handlers.onMoveGroup(profile, payload),
+      onHideUpTo: handlers.onHideUpTo,
+      onNewGroup: () => handlers.onNewGroup(profile, groupMemberIds(handlers.ticks, profile)),
+      onRename: handlers.onRenameSession,
+      onRenameCancel: handlers.onRenameCancel,
+      onRenameSubmit: name => handlers.onRenameSubmit(profile, session, name),
+      onRightClickSelect: handlers.onRightClickSelect,
+      onSelect: () => handlers.onSelect(profile, session?.id),
+      onToggleSelect: () => handlers.onToggleSelect(sessionKey(profile, session?.id)),
+      profile,
+      // Inside a single-profile box the heading already said who this is, so the
+      // row drops both the picture and the name chip: nothing is lost, and the
+      // rows stop repeating a label four times over.
+      profileLabel: hideProfile ? '' : row.label || profile,
+      profileRow: hideProfile ? null : row,
+      profileSessions: byProfile?.[String(profile)] || [],
+      selected: (handlers.selectedKeys || []).includes(sessionKey(profile, session?.id)),
+      selecting: handlers.selecting,
+      session,
+      tickCount: (handlers.ticks || []).length,
+      // The RESOLVED set, so a menu opened over a selection acts on all of it.
+      batchTicks: handlers.ticks || []
+    },
+    key
+  )
+
+  return sessionColorBox(sessionColor(profile, session?.id), node, key)
+}
+
+/** The empty transcript, contributed to the chat area: the profile's picture
+ *  over its name, the way Bot Mode introduces a bot chat (The reviewer, 2026-11-11:
+ *  "when you start a new session in bots, the main screen shows the bot's name
+ *  and their profile picture" — "yes, to both Perso and Personae").
+ *
+ *  Declines everything it does not own: the slot mounts every contribution, and
+ *  a hero drawn over someone else's chat is worse than a blank thread. */
+function ProfileChatEmpty({ sessionId }) {
+  const activeId = useValue(host.state.activeSessionId)
+  const focusedId = useValue(host.state.focusedStoredSessionId)
+  const focusedProfile = useValue(host.state.focusedSessionProfile)
+  // A session created seconds ago may not have a focused profile yet, and the
+  // roster row is the face: fall back to the profile being viewed.
+  const viewedProfile = useValue(host.state.profile)
+  const profile = String(focusedProfile || viewedProfile || '')
+  const opened = useValue($opened)
+  const roster = useQuery({ queryKey: ROSTER_KEY, queryFn: fetchRoster, staleTime: 5000 })
+  const row = (roster.data || []).find(entry => entry.name === String(profile || ''))
+
+  if (
+    !claimsChatEmpty({ sessionId, activeId, focusedId, openedAt: opened, now: Date.now() }) ||
+    !row
+  ) {
+    return null
+  }
+
+  return jsxs('div', {
+    'data-slot': 'profile_chat_empty',
+    className:
+      'pointer-events-none flex w-full min-w-0 flex-col items-center justify-center px-0.5 py-6 text-center text-muted-foreground sm:px-6 lg:px-8',
+    children: [
+      jsx(
+        'div',
+        {
+          className: 'flex justify-center',
+          // The name is the chat's title, so IT sits on the optical centre line
+          // and the face hangs above it — the balance Bot Mode's empty state
+          // strikes.
+          style: { marginBottom: 12 },
+          children: jsx('div', {
+            className: 'overflow-hidden rounded-full',
+            children: jsx(Avatar, { row, size: 64 })
+          })
+        },
+        'face'
+      ),
+      jsx(Wordmark, { className: 'mb-1', text: row.label || row.name, width: 'calc(80% - 1rem)' }, 'wordmark')
+    ]
+  })
+}
+
+/** The pane's body: one activity-ordered list over every profile, its group
+ *  boxes anchored where their newest member would have been. */
+function PersoList({
+  byProfile,
+  cap,
+  cut,
+  cutBar,
+  drag,
+  dropAt,
+  handlers,
+  nowMs,
+  onDragStart,
+  onMore,
+  onToggleHidden,
+  profileRows,
+  renamingGroup,
+  revealHidden,
+  searching,
+  t
+}) {
+  // Filed, hidden and coloured state is subscribed HERE, once, because this list
+  // IS every profile's session list: a menu pick (or a child created in another
+  // window) must redraw it without waiting for the 5s poll.
+  const groupState = useValue($sessionGroups)
+  const releasedState = useValue($released)
+  const hiddenState = useValue($hiddenSessions)
+  const links = useValue($apropos)
+  useValue($sessionColors)
+  // The dividers are made of this: one state per session, from the same sweep
+  // that paints the dots.
+  const states = useValue($sessionStates)
+  // What he has opened, and what is open RIGHT NOW (the app's own focus): the
+  // two facts that turn core's stale `unread` into an honest Read.
+  const seen = useValue($seen)
+  const focusedId = useValue(host.state.focusedStoredSessionId)
+  const profiles = Object.keys(byProfile || {}).sort()
+  const items = flatSessionItems({
+    byProfile,
+    focusedId,
+    groups: groupState,
+    hidden: hiddenState,
+    links,
+    profiles,
+    released: releasedState,
+    revealed: revealHidden,
+    searching,
+    seen,
+    states
+  })
+  const limit = Math.max(1, Number(cap) || FLAT_PAGE)
+  const drawn = items.slice(0, limit)
+  const hiddenCount = profiles.reduce(
+    (total, name) => total + (hiddenState?.[String(name)] || []).length,
+    0
+  )
+  const fill = name => fillOf(profileRows?.[name] || { name })
+  // "Archive all up to this point" asks UNDER the row it was opened on, never at
+  // the top of the pane. The roster placed the bar in ProfileRow; this list owns
+  // its own rows, so it anchors here — and keeps a fallback at the top for a cut
+  // whose row is no longer drawn (filtered out, hidden, archived since).
+  let cutPlaced = false
+  const withCut = (profile, session, node) => {
+    if (!cut || !isCutAnchor(cut, profile, session)) {
+      return node
+    }
+
+    cutPlaced = true
+
+    return jsxs(
+      'div',
+      { className: 'grid min-w-0 grid-cols-1', children: [node, cutBar] },
+      `cut-${profile}-${session?.id}`
+    )
+  }
+
+  return jsxs('div', {
+    // The list's own layout contract, with a wider GAP than the roster's: two-line
+    // rows at 39px read as a wall without air between them (The reviewer, 2026-11-11:
+    // "give some more white space between rows"). `grid-cols-1` is also what
+    // stops a nowrap cell from setting the pane's minimum width.
+    className: 'grid min-w-0 grid-cols-1 gap-1.5 px-1.5',
+    children: [
+      drawn.map((item, index) => {
+        if (item.kind !== 'group') {
+          const prev = drawn[index - 1]
+          // A divider opens a bucket: the first loose row of the list, or the
+          // first row after a box, or the first row whose state changed. Boxes
+          // are above all three (the user: "groups remain above these dividers").
+          const opens =
+            !prev || prev.kind === 'group' || prev.bucket !== item.bucket
+          const count = drawn.filter(entry => entry.kind !== 'group' && entry.bucket === item.bucket).length
+          const row = jsx(
+            PersoRow,
+            {
+              byProfile,
+              groupId: null,
+              groupState,
+              handlers,
+              nowMs,
+              profile: item.profile,
+              profileRow: profileRows?.[item.profile],
+              session: item.session
+            }
+          )
+
+          if (!opens) {
+            return jsx('div', { className: 'grid min-w-0 grid-cols-1', children: withCut(item.profile, item.session, row) },
+              `flat-${item.profile}-${item.session?.id}`)
+          }
+
+          return jsxs(
+            'div',
+            {
+              className: 'grid min-w-0 grid-cols-1',
+              children: [
+                jsx(BucketDivider, { bucket: item.bucket, count, t }, `divider-${item.bucket}`),
+                withCut(item.profile, item.session, row)
+              ]
+            },
+            `flat-${item.profile}-${item.session?.id}`
+          )
+        }
+
+        const block = item.block
+        // A box's members come from ONE profile: `sessionGroupBlocks` is asked
+        // per profile and the group store is keyed by profile, so a box cannot
+        // span profiles today. That is why the picture and the name move ONTO
+        // the heading — if a box ever holds two profiles' sessions, the rows must
+        // get them back (the `spanning` branch below).
+        const spanning = false
+        const parts = [
+          renamingGroup?.id === block.id
+            ? jsx(
+                NameField,
+                {
+                  initial: block.name,
+                  label: 'Session group name',
+                  onCancel: handlers.onRenameGroupCancel,
+                  onSubmit: name => handlers.onRenameGroupSubmit(item.profile, block.id, name)
+                },
+                `sg-rename-${block.id}`
+              )
+            : jsx(
+                SessionGroupHeading,
+                {
+                  block,
+                  // Groups are draggable here (The reviewer, 2026-11-11: "allow the user
+                  // to DnD the groups"). The gesture was already built and wired
+                  // for the roster — `dropAction` answers `sessionGroupOrder` and
+                  // `elementAt` reads both the heading strip and the whole box —
+                  // so this only has to hand the heading the drag state and the
+                  // arm handler.
+                  dragging: drag?.kind === 'sessionGroup' && String(drag.group) === String(block.id),
+                  dropTarget:
+                    String(dropAt?.sessionGroup || '') === String(block.id) ||
+                    String(dropAt?.groupBox || '') === String(block.id),
+                  onDragStart,
+                  groupCount: item.groupCount,
+                  index: item.index,
+                  // "Apropos this group" makes it an Apropos group and STOPS —
+                  // the flag puts ◆ on its members. On a group that already is
+                  // one the same slot seeds a child from its SOURCES.
+                  onApropos: () => {
+                    if (aproposVerbKind(block.apropos) === 'convert') {
+                      markSessionGroupApropos(item.profile, block.id)
+
+                      return null
+                    }
+
+                    return aproposGroupSession(
+                      item.profile,
+                      block.id,
+                      block.name,
+                      aproposSources({
+                        groupId: block.id,
+                        links: $apropos.get(),
+                        profile: item.profile,
+                        sessions: block.sessions
+                      })
+                    )
+                  },
+                  onDelete: () => handlers.onDeleteGroup(item.profile, block.id),
+                  onMove: delta => handlers.onMoveGroupOrder(item.profile, block.id, delta),
+                  onRename: () => handlers.onRenameGroup({ id: block.id, name: block.name }),
+                  onToggle: id => handlers.onToggleGroup(item.profile, id),
+                  profile: item.profile,
+                  profileRow: spanning ? null : profileRows?.[item.profile]
+                },
+                `sg-${item.profile}-${block.id}`
+              ),
+          block.collapsed
+            ? null
+            : // The same three dividers, inside the box: a grouped session is
+              // still unread, running or read, and a box is not a place to lose
+              // that.
+              bucketSessions(block.sessions, states, seen, focusedId).flatMap(group => [
+                jsx(
+                  BucketDivider,
+                  { bucket: group.bucket, count: group.rows.length, inside: block.id, t },
+                  `div-${block.id}-${group.bucket}`
+                ),
+                ...group.rows.map(session =>
+                  jsx(
+                    'div',
+                    {
+                      // `children:`, NOT the third argument: `jsx(type, props, key)`
+                      // takes the KEY there, so an element passed positionally is
+                      // coerced into a key and the row renders as an empty div
+                      // (every grouped session vanished this way).
+                      children: withCut(
+                        item.profile,
+                        session,
+                        jsx(PersoRow, {
+                          aproposGroup: block.apropos === true,
+                          byProfile,
+                          groupId: block.id,
+                          groupState,
+                          handlers,
+                          hideProfile: !spanning,
+                          nowMs,
+                          profile: item.profile,
+                          profileRow: profileRows?.[item.profile],
+                          session
+                        })
+                      ),
+                      className: 'grid min-w-0 grid-cols-1'
+                    },
+                    `grow-${item.profile}-${session?.id}`
+                  )
+                )
+              ])
+        ].filter(Boolean)
+
+        return jsx(
+          'div',
+          {
+            className: 'grid min-w-0 grid-cols-1',
+            children: sessionGroupShell(
+              block,
+              parts,
+              drag?.kind === 'sessionGroup' && String(drag.group) === String(block.id),
+              fill(item.profile)
+            )
+          },
+          `box-${item.profile}-${block.id}`
+        )
+      }),
+      // The fallback slot: a cut whose row is not drawn (collapsed box, hidden,
+      // filtered, past the page) still surfaces — a bulk verb whose confirmation
+      // vanished with its row is one nobody can cancel.
+      cut && !cutPlaced ? cutBar : null,
+      // A page boundary is a DOOR, never a dead line: the row ranked just past
+      // it has to be reachable from here.
+      items.length > limit
+        ? jsxs('div', {
+            className: 'flex min-w-0 items-center gap-2 px-2 py-1.5 pl-4',
+            children: [
+              jsx(
+                'button',
+                {
+                  'data-show-more': String(items.length - limit),
+                  className:
+                    'rounded-sm px-1.5 py-1 text-[0.6875rem] text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover)',
+                  onClick: () => onMore?.(),
+                  type: 'button',
+                  children: `${t('showMore')} (${items.length - limit})`
+                },
+                'show-more'
+              ),
+              jsx('span', {
+                className: 'min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)',
+                children: `${items.length} ${t('sessionsLabel')}`
+              }, 'count')
+            ]
+          }, 'more-row')
+        : null,
+      // A hidden row is invisible by definition, so the only way back to one
+      // must not depend on finding it: this is the one door.
+      hiddenCount
+        ? jsx(
+            'button',
+            {
+              'data-hidden-toggle': String(hiddenCount),
+              className:
+                'min-w-0 self-start px-2 py-1 pl-4 text-left text-[0.6875rem] text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover)',
+              onClick: () => onToggleHidden?.(),
+              type: 'button',
+              children: revealHidden
+                ? t('hideHiddenRows')
+                : t('showHiddenRows', hiddenCount)
+            },
+            'hidden-toggle'
+          )
+        : null
+    ]
+  })
+}
+
+/** Every row from ANY profile on the far side of one moment.
+ *
+ *  "Up to this point" is a MOMENT, not a profile (The reviewer, 2026-11-11: "when we use
+ *  the options archive/hide up to this point it refers to all sessions from all
+ *  profiles"). Each profile's own list goes through this one predicate, and every
+ *  entry keeps the profile it came from: the hide is per session, and an entry
+ *  that lost its owner would act on the wrong store.
+ *
+ *  `field` names the moment — `activity` (last activity) or `started` (when the
+ *  conversation began, which is what the hide cut means). `inclusive` takes the
+ *  anchor with it.
+ */
+function cutRowsByMoment(rows, profile, momentMs, { field = 'activity', inclusive = false } = {}) {
+  const at = Number(momentMs) || 0
+
+  if (at <= 0) {
+    return []
+  }
+
+  return (Array.isArray(rows) ? rows : [])
+    .filter(row => {
+      const when =
+        field === 'started'
+          ? secondsToMs(row?.started_at) || 0
+          : secondsToMs(row?.last_active || row?.started_at) || 0
+
+      if (!when) {
+        return false
+      }
+
+      return inclusive ? when <= at : when < at
+    })
+    .map(row => ({ ...row, profile: String(profile), session_id: String(row?.id || '') }))
+}
+
+
+/** Hide a BATCH in one store write. The up-to-this-point verb names dozens of
+ *  ids at a time, and a `setSessionHidden` per id would repaint the list (and
+ *  write localStorage) once per row. */
+function hideSessions(profile, ids) {
+  const key = String(profile)
+  const next = [...new Set([...hiddenFor(key), ...(ids || []).map(String)])]
+  const state = { ...hiddenSessions }
+
+  if (next.length) {
+    state[key] = next
+  } else {
+    delete state[key]
+  }
+
+  hiddenSessions = state
+  $hiddenSessions.set(state)
+  persist(HIDDEN_KEY, state)
+
+  return next.length
+}
+
+/** Every profile's archived sessions in one list — the section at the bottom of
+ *  the pane.
+ *
+ *  `session.list` cannot serve the archive at ALL (its param whitelist is
+ *  title/limit/include_hidden), so this is the one listing only the pane's own
+ *  backend can answer. A build without that route, or a route that threw, comes
+ *  back as `null` per profile and the section SAYS which profiles were
+ *  unreadable — an empty archive drawn over a reachable one is the lie this
+ *  avoids. */
+async function loadArchivedRows(names) {
+  const results = await Promise.all(
+    (names || []).map(async name => [name, await listArchivedSessions(name, 60)])
+  )
+  const rows = []
+  const unreadable = []
+
+  for (const [name, list] of results) {
+    if (list === null) {
+      unreadable.push(name)
+
+      continue
+    }
+
+    for (const session of list) {
+      rows.push({ ...session, archived: true, profile: name })
+    }
+  }
+
+  rows.sort(
+    (a, b) =>
+      sessionActivityMs(b) - sessionActivityMs(a) || String(a.profile).localeCompare(String(b.profile))
+  )
+
+  return { rows, unreadable }
+}
+
+function ArchivedSection({ handlers, names, nowMs, onToggle, open, profileRows, t }) {
+  const query = useQuery({
+    queryKey: [ID, 'archived', names.join('|')],
+    queryFn: () => loadArchivedRows(names),
+    enabled: Boolean(open) && names.length > 0,
+    // Archived sessions move when the user archives something, and this list is
+    // only read while the section is open: refetch every time it is opened.
+    staleTime: 0,
+    retry: false
+  })
+  const data = query.data || { rows: [], unreadable: [] }
+  const rows = Array.isArray(data.rows) ? data.rows : []
+  const unreadable = Array.isArray(data.unreadable) ? data.unreadable : []
+  const counts = {}
+
+  for (const row of rows) {
+    counts[String(row.profile)] = (counts[String(row.profile)] || 0) + 1
+  }
+
+  return jsxs('div', {
+    'data-archived-section': open ? 'open' : 'closed',
+    className: 'mt-1 grid min-w-0 grid-cols-1 border-t border-(--ui-stroke-secondary) pt-1',
+    children: [
+      jsxs('button', {
+        'aria-expanded': open ? 'true' : 'false',
+        className:
+          'flex min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover)',
+        onClick: () => onToggle?.(),
+        type: 'button',
+        children: [
+          jsx(Codicon, { name: open ? 'chevron-down' : 'chevron-right' }, 'caret'),
+          // `children:` on its OWN line: the class-token scanner is a regex over
+          // `className:` expressions that keeps consuming past parentheses, so a
+          // one-line call with an i18n key in it reports the key as a class.
+          jsx(
+            'span',
+            {
+              className: 'min-w-0 truncate',
+              children: t('archivedSection')
+            },
+            'label'
+          ),
+          rows.length
+            ? jsx(
+                'span',
+                { 'data-archived-count': String(rows.length), className: 'shrink-0', children: String(rows.length) },
+                'count'
+              )
+            : null
+        ]
+      }, 'archived-toggle'),
+      open
+        ? query.isPending
+          ? jsx('div', {
+              className: 'px-2 py-1 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
+              children: t('loading')
+            }, 'archived-loading')
+          : unreadable.length
+            ? jsx(
+                'div',
+                {
+                  'data-archived-unreadable': unreadable.join(','),
+                  className: 'min-w-0 px-2 py-1 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  children: t('archivedUnreadable', unreadable.length)
+                },
+                'archived-unreadable'
+              )
+            : rows.length
+              ? rows.map(row =>
+                  jsx(
+                    'div',
+                    {
+                      className: 'grid min-w-0 grid-cols-1',
+                      children: jsx(PersoRow, {
+                        byProfile: { [String(row.profile)]: rows.filter(entry => entry.profile === row.profile) },
+                        groupId: null,
+                        groupState: $sessionGroups.get(),
+                        handlers,
+                        nowMs,
+                        profile: String(row.profile),
+                        profileRow: profileRows?.[String(row.profile)],
+                        session: row
+                      })
+                    },
+                    `arch-${row.profile}-${row.id}`
+                  )
+                )
+              : jsx('div', {
+                  className: 'px-2 py-1 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  children: t('archivedEmpty')
+                }, 'archived-empty')
+        : null
+    ]
+  })
+}
+
 function ProfileRow({
   cut,
   cutBar,
@@ -7117,12 +8279,12 @@ function ProfileRow({
   // (the right-click rule has already made the ticked row real). Resolved HERE,
   // once per profile, so the menu's label and the set it acts on cannot disagree
   // — and so this roster passes the ticks to `aproposCreateGroup` exactly like
-  // the "View all" drill-down does, instead of one row (Pedro, 2026-11-02: two
+  // the "View all" drill-down does, instead of one row (The reviewer, 2026-11-02: two
   // sessions ticked, the child it made consulted only the row he right-clicked).
   const tickedHere = selectedSessions([{ name: row.name, sessions }], selectedKeys || [])
   // While a query is live the MATCHES are this row's list, expanded or not.
   // That ordering is the whole fix for "I searched for a keyword and it didn't
-  // pop up the session I was expecting" (Pedro, 2026-10-16): the profile's own
+  // pop up the session I was expecting" (The reviewer, 2026-10-16): the profile's own
   // recent sessions are the answer to a different question, and they used to
   // win outright — so a profile that happened to be OPEN drew its ten latest
   // sessions and swallowed every hit for it.
@@ -7138,7 +8300,7 @@ function ProfileRow({
         )
   // Hiding is a VIEW, not a mutation (see HIDDEN_KEY): the pane filters its own
   // list, core's session list is untouched, and the row is one click away from
-  // coming back. Pedro, 2026-10-10: "hiding only hides it from view in the
+  // coming back. The reviewer, 2026-10-10: "hiding only hides it from view in the
   // Messenger tab, not from Sessions."
   const hiddenState = useValue($hiddenSessions)
   const hiddenIds = new Set(hiddenState[String(row.name)] || [])
@@ -7154,7 +8316,7 @@ function ProfileRow({
   // not about filing — and `sessionGroupBlocks` hands back a single anonymous
   // block when there are no groups, which is the flat list it has always been.
   //
-  // ARCHIVED MEMBERS ARE NOT DRAWN HERE (Pedro, 2026-11-03: "once they become
+  // ARCHIVED MEMBERS ARE NOT DRAWN HERE (The reviewer, 2026-11-03: "once they become
   // archived they will be removed from the group (or at least from showing in
   // the main view)"). The membership is KEPT — it is what puts the row back in
   // its box the moment it is unarchived — and the member is still fetched and
@@ -7166,7 +8328,7 @@ function ProfileRow({
       ? sessionGroupBlocks(filed, groupState, row.name, releasedState[String(row.name)] || [])
       : [{ collapsed: false, id: null, name: '', sessions: visible }]
   // "Archive all up to this point" is confirmed UNDER the row it was opened on
-  // (Pedro, 2026-11-03). `cutAnchored` asks whether this profile will actually
+  // (The reviewer, 2026-11-03). `cutAnchored` asks whether this profile will actually
   // DRAW that row: a collapsed group or a hidden session draws nothing, and a
   // confirmation that vanished with its row would be a bulk verb the user can
   // no longer cancel — so it falls back to just under this profile's own row.
@@ -7389,7 +8551,7 @@ function ProfileRow({
                 { onSelect: () => onEditProfile(row), children: menuGlyph('edit', 'Edit profile\u2026') },
                 'edit-profile'
               ),
-              // Pedro, 2026-10-09: "group options should not be listed in the
+              // The reviewer, 2026-10-09: "group options should not be listed in the
               // menu" — a profile's menu is about its PROFILES' sessions, so it
               // holds session verbs only. Renaming, deleting and moving a group is
               // the group heading's kebab, where the noun matches the verb.
@@ -7407,7 +8569,7 @@ function ProfileRow({
                 'open-all'
               ),
               jsx(ContextMenuSeparator, {}, 'sep-sort'),
-              // Pedro, 2026-10-10: "allow sorting of sessions, manually, by last
+              // The reviewer, 2026-10-10: "allow sorting of sessions, manually, by last
               // activity and others. That can be an option when right-clicking
               // on a profile". A submenu, because the menu is a list of actions
               // and this is one action with four settings.
@@ -7523,7 +8685,7 @@ function ProfileRow({
             ? null
             : block.sessions.map(session => {
                 // The user's own colour for THIS session outranks the
-                // profile fill and the group tint (Pedro, 2026-10-10: the
+                // profile fill and the group tint (The reviewer, 2026-10-10: the
                 // fill "is overridden ... also by session colors"). Wrapped,
                 // not painted on the row, for the hover reason above.
                 const drawn = sessionColorBox(
@@ -7557,7 +8719,7 @@ function ProfileRow({
                       // (sessionId, groupId) was the arity bug that made moving a
                       // session into a group a silent no-op.
                       onMoveGroup,
-                      // The bulk-archive cut (see cutRowsByMoment): the row supplies
+                      // The bulk-archive cut (see sessionsUpTo): the row supplies
                       // the session it was picked on, the PANE reads the
                       // profile's full list and confirms the count before
                       // anything moves.
@@ -7592,7 +8754,7 @@ function ProfileRow({
                 )
 
                 // The confirmation goes UNDER the row it was opened on, inside
-                // whatever box that row sits in (Pedro, 2026-11-03).
+                // whatever box that row sits in (The reviewer, 2026-11-03).
                 if (!isCutAnchor(cut, row.name, session)) {
                   return drawn
                 }
@@ -7612,7 +8774,7 @@ function ProfileRow({
           fill
         )
       }),
-      // P7 (Pedro's item 1): the expanded list is capped at
+      // P7 (the reviewer’s item 1): the expanded list is capped at
       // SESSIONS_PER_PROFILE, so its last line is where the rest of the profile
       // lives — "View all" (every session) with "View Archived" beside it. Only
       // the EXPANDED list carries it: these buttons describe the profile's whole
@@ -7645,7 +8807,7 @@ function ProfileRow({
                   },
                   'view-archived'
                 ),
-                // Pedro, 2026-10-10: "next to View All and View Archives,
+                // The reviewer, 2026-10-10: "next to View All and View Archives,
                 // include a View hidden option for the hidden sessions from
                 // messenger, and allow the user to unhide them."
                 hiddenCount
@@ -7691,13 +8853,13 @@ function ProfileRow({
 
 /** A group heading: caret + name + count in the row button, kebab beside it
  *  (a button inside a button is not a thing the DOM allows). */
-/** The drag handle — the answer to Pedro's "isn't there a way to get rid of the
+/** The drag handle — the answer to the reviewer’s "isn't there a way to get rid of the
  *  click in that situation?". Dragging lives on this grip alone, so a drag can
  *  never be mistaken for the click that opens a row, and the row keeps a plain
  *  click. `stopPropagation` on the pointerdown keeps the row's own handlers out
  *  of the gesture entirely. */
 // ── item-first drag ─────────────────────────────────────────────────────────
-// Pedro, 2026-10-10: "can you make DnD activate by holding the actual item
+// The reviewer, 2026-10-10: "can you make DnD activate by holding the actual item
 // (session, profile, group), instead of needing a grip icon?"
 //
 // The item IS also a button — a session row opens a session, a profile row
@@ -7817,7 +8979,7 @@ function DragGrip({ label, onStart }) {
 }
 
 /** The section (profile-group) verbs, defined ONCE and rendered into BOTH of its
- *  menus. Pedro, 2026-10-10: "For groups options in the right-click menu and the
+ *  menus. The reviewer, 2026-10-10: "For groups options in the right-click menu and the
  *  three dot menu should be identical". The section heading had only a kebab, so
  *  right-clicking a group did nothing at all — now both ways in open the same
  *  list, in the same order. */
@@ -7861,7 +9023,7 @@ function sectionMenuEntries({ active, index, onAdd, onDelete, onMove, onRename, 
 }
 
 /** The group kebab owns every GROUP verb: this scope's sort mode, the group's
- *  own position, who is in it, its name, its life. Pedro, 2026-10-09: the profile
+ *  own position, who is in it, its name, its life. The reviewer, 2026-10-09: the profile
  *  menu must not list group options — so they live here, where the noun matches
  *  the verb, instead of there, where they buried the session actions. */
 function SectionHeading({
@@ -7910,7 +9072,7 @@ function SectionHeading({
         ]
       }),
       // No grip: the header is the handle, exactly like the session-group
-      // heading and the session row (Pedro, 2026-10-10: grips off sessions and
+      // heading and the session row (The reviewer, 2026-10-10: grips off sessions and
       // profiles). It stays a SIBLING slot of the button only for the kebab.
       jsxs(DropdownMenu, {
         children: [
@@ -7941,7 +9103,7 @@ function SectionHeading({
 }
 
 /** "Add profiles…", the half of the old "Move to…" list that is a GROUP verb.
- *  Pedro, 2026-10-09: the profile menu must not list group options — but filing a
+ *  The reviewer, 2026-10-09: the profile menu must not list group options — but filing a
  *  profile into a group still has to be possible without a drag, so the picker
  *  lives on the group that receives them. Clicking a row toggles membership;
  *  nothing is committed until the member map is written. */
@@ -8021,7 +9183,7 @@ function AddProfilesDialog({ onClose, onToggle, open, profiles, section }) {
  *    the shape of "if I try to create a second session group, it doesn't work".
  *  - the explicit button lets the name land on a click that is its own gesture,
  *    so the flow does not depend on a focus state surviving a menu close.
- *  Enter commits, Escape cancels, both as before. Pedro, 2026-10-10. */
+ *  Enter commits, Escape cancels, both as before. The reviewer, 2026-10-10. */
 function NameField({ initial, label, onCancel, onSubmit, submitLabel }) {
   const [text, setText] = useState(String(initial || ''))
   const commit = () => {
@@ -8155,7 +9317,7 @@ function SelectBar({ armed, busy, count, onApropos, onArchive, onClear, onClose,
   })
 }
 
-function Toolbar({ onBell, onFiles, onNewGroup, onSelect, rows, selecting, shownCount, t, toasts }) {
+function Toolbar({ countLabel, liveTotal = 0, liveWorking = 0, onBell, onFiles, onNewGroup, onSelect, rows, selecting, shownCount, t, toasts }) {
   return jsxs('div', {
     className: 'flex min-w-0 items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5',
     children: [
@@ -8179,7 +9341,9 @@ function Toolbar({ onBell, onFiles, onNewGroup, onSelect, rows, selecting, shown
               'span',
               {
                 className: 'min-w-0 shrink truncate text-[0.6875rem] text-(--ui-text-quaternary)',
-                children: `${shownCount}/${rows.length} ${t('profilesLabel')} · ${BUILD}`
+                // A caller with its own unit (Perso counts SESSIONS, not
+                // profiles) passes the whole line; the roster keeps its own.
+                children: `${countLabel || `${shownCount}/${rows.length} ${t('profilesLabel')}`} · ${BUILD} · live ${liveWorking}/${liveTotal}`
               },
               'count'
             )
@@ -8287,21 +9451,26 @@ function Toolbar({ onBell, onFiles, onNewGroup, onSelect, rows, selecting, shown
                   'new-session'
                 )
               : null,
-            jsx(
-              Tip,
-              {
-                label: t('newGroup'),
-                children: jsx(Button, {
-                  'aria-label': t('newGroup'),
-                  className: 'rounded-md text-(--ui-text-tertiary) hover:text-foreground',
-                  onClick: onNewGroup,
-                  size: 'icon-xs',
-                  variant: 'ghost',
-                  children: jsx(Codicon, { name: 'new-folder' })
-                })
-              },
-              'new-group'
-            )
+            // A section is a ROSTER concept (profile groups). Perso has no
+            // profile rows, so a folder button there would mint something that
+            // draws nowhere — it only renders when a caller wires it.
+            typeof onNewGroup === 'function'
+              ? jsx(
+                  Tip,
+                  {
+                    label: t('newGroup'),
+                    children: jsx(Button, {
+                      'aria-label': t('newGroup'),
+                      className: 'rounded-md text-(--ui-text-tertiary) hover:text-foreground',
+                      onClick: onNewGroup,
+                      size: 'icon-xs',
+                      variant: 'ghost',
+                      children: jsx(Codicon, { name: 'new-folder' })
+                    })
+                  },
+                  'new-group'
+                )
+              : null
           ]
         },
         'actions'
@@ -8479,9 +9648,9 @@ function stampAge(value, nowMs) {
 }
 
 /* ── SCREEN: the RFB client ──────────────────────────────────────────────────
- * Personae DRIVES a profile's Bot Desktop — Start, Stop, Install, watch and
+ * This pane DRIVES a profile's Bot Desktop — Start, Stop, Install, watch and
  * Take over — instead of printing "go to Bot Mode → Screen" and calling that a
- * feature. Pedro, 2026-10-15: "The Screen tab / hero does nothing useful."
+ * feature. The reviewer, 2026-10-15: "The Screen tab / hero does nothing useful."
  *
  * The viewer is hand-written on purpose. A runtime-loaded plugin may import
  * exactly `@hermes/plugin-sdk` and `react` (`contrib/runtime-loader.ts` rejects
@@ -9357,7 +10526,7 @@ function displayMissing(error) {
 function ScreenHero({ profile }) {
   const t = usePluginI18n(ID)
   const status = useQuery({
-    queryKey: ['personae', 'screen', profile],
+    queryKey: [ID, 'screen', profile],
     queryFn: () => host.request('display.status', { profile }),
     refetchInterval: 15000,
     retry: false,
@@ -9366,7 +10535,7 @@ function ScreenHero({ profile }) {
   const tone = screenTone(status.data || null, displayMissing(status.error))
   const live = tone === 'live' || tone === 'other'
   const frame = useQuery({
-    queryKey: ['personae', 'screen-frame', profile],
+    queryKey: [ID, 'screen-frame', profile],
     queryFn: () => host.request('display.thumbnail', { profile }),
     enabled: live,
     refetchInterval: 4000,
@@ -9454,7 +10623,7 @@ function timestampStale(frame) {
 /** The Screen viewer this plugin offers: the same profile's Bot Desktop, live
  *  and drivable, in its own workspace tab. Each pane owns its own lease holder,
  *  so two tabs of this pane are two viewers — and taking over in one evicts the
- *  other, which is exactly what `display.lease` reports (Pedro, 2026-10-15:
+ *  other, which is exactly what `display.lease` reports (The reviewer, 2026-10-15:
  *  "make Personae able to START/STOP/TAKE OVER the screen itself"). */
 const screenTabs = new Map()
 
@@ -9473,7 +10642,7 @@ function screenBackTarget(state, fallbackProfile) {
 }
 
 /** Front the session the user was reading when they opened this tab. A tab that
- *  takes the chat area must not be a one-way door (Pedro, 2026-10-16: "I didn't
+ *  takes the chat area must not be a one-way door (The reviewer, 2026-10-16: "I didn't
  *  really have a way to come back to this chat"). */
 function screenBackToSession(target) {
   if (!target?.id || typeof host.openSession !== 'function') {
@@ -9564,7 +10733,7 @@ function noteScreenInstallDone(payload) {
  *  ask and then `force` it. Returns the i18n key of the question, or '' when a
  *  plain Stop is enough — and which human holds only changes the WORDING, never
  *  whether the question is asked. (Asking only about somebody ELSE is how the
- *  pane offered Pedro a stop that the server could not honour: HE held the
+ *  pane offered the user a stop that the server could not honour: HE held the
  *  lease, so the polite stop was refused and no force path was offered.) */
 function screenStopQuestion(status, hash) {
   const lease = status?.lease || null
@@ -9778,7 +10947,7 @@ async function screenLease(session, api, action) {
   // beside a Hand back that never leaves the client.
   const params =
     action === 'take'
-      ? { profile: api.profile, reason: 'Personae', viewer_id: session.viewerId }
+      ? { profile: api.profile, reason: 'Perso', viewer_id: session.viewerId }
       : { profile: api.profile, viewer_id: session.viewerId }
 
   const result = await host.request(action === 'take' ? 'display.lease.acquire' : 'display.lease.release', params)
@@ -9863,7 +11032,7 @@ function ScreenView({ back, onClose, profile }) {
   }
 
   const session = sessionRef.current
-  const statusKey = ['personae', 'screen', profile]
+  const statusKey = [ID, 'screen', profile]
   const status = useQuery({
     queryKey: statusKey,
     queryFn: () => host.request('display.status', { profile }),
@@ -10536,7 +11705,7 @@ async function fetchRoutines(names) {
 
 /** The right-edge tile, in Bot Mode's shape: the live screen of the profile on
  *  show, that profile's header, then one rich card per job. There is no profile
- *  picker in here (Pedro, 2026-10-09): the tile follows what the LEFT pane has
+ *  picker in here (The reviewer, 2026-10-09): the tile follows what the LEFT pane has
  *  selected, so which profile you are looking at is decided in exactly one of
  *  the two panes instead of two. Mutations go to the scheduler through
  *  `cron.manage`; nothing here invents a second write path. */
@@ -10548,7 +11717,7 @@ function RoutinesPane() {
   const rows = roster.data || []
   const names = rows.map(row => row.name)
   const routines = useQuery({
-    queryKey: ['personae', 'routines', epoch, names.join('|')],
+    queryKey: [ID, 'routines', epoch, names.join('|')],
     queryFn: () => fetchRoutines(names),
     enabled: names.length > 0,
     refetchInterval: 20000,
@@ -10667,7 +11836,7 @@ function listMatch(session, needle) {
   )
 }
 
-/** P7 drill-down (Pedro's D-A): the pane body IS replaced by one profile's
+/** P7 drill-down (the reviewer’s D-A): the pane body IS replaced by one profile's
  *  session list — "View all" (every session it has), "View Archived", "View
  *  hidden" (the pane's own store) or "View matches" (one search's hits, opened
  *  from a row's `${extra} more`) — with a back button. Deliberately NOT a
@@ -10676,7 +11845,7 @@ function listMatch(session, needle) {
  *  backend reads.
  *
  *  1.4.0: it is also a LIST the user can work on — multiselect with the same
- *  batch bar as the roster (Pedro, 2026-10-16: "In 'View Archived', allow the
+ *  batch bar as the roster (The reviewer, 2026-10-16: "In 'View Archived', allow the
  *  user to multiselect"), and a filter of its own, because this is where the
  *  hundreds of old sessions actually live. */
 function SessionListView({
@@ -10697,7 +11866,7 @@ function SessionListView({
   t
 }) {
   const archived = kind === 'archived'
-  // "View hidden" is the pane's own list (Pedro, 2026-10-10: "next to View All
+  // "View hidden" is the pane's own list (The reviewer, 2026-10-10: "next to View All
   // and View Archives, include a View hidden option for the hidden sessions from
   // messenger, and allow the user to unhide them"). It reads the SAME
   // session.list, narrowed by the store — and the narrowing is a hook, so
@@ -10721,7 +11890,7 @@ function SessionListView({
   const [filter, setFilter] = useState('')
   // P11 select mode, the same shape and the same verbs the roster has. The
   // drill-down is where a list of OLD sessions actually gets cleaned up, so
-  // acting on them one right-click at a time was the whole complaint (Pedro,
+  // acting on them one right-click at a time was the whole complaint (the user,
   // 2026-10-16: "In 'View Archived', allow the user to multiselect").
   const [selecting, setSelecting] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState([])
@@ -10732,7 +11901,7 @@ function SessionListView({
     // The search kind is keyed on the NEEDLE as well: two different keywords
     // are two different lists, and a cache key that ignored it would serve the
     // previous search's rows.
-    queryKey: searchKind ? ['personae', 'view', kind, profile, needle] : ['personae', 'view', kind, profile],
+    queryKey: searchKind ? [ID, 'view', kind, profile, needle] : [ID, 'view', kind, profile],
     queryFn: () =>
       searchKind
         ? listSearchHits(profile, needle)
@@ -10766,7 +11935,7 @@ function SessionListView({
     setStatus(failed ? `${done} ${label} · ${failed} ${t('failed')}` : `${done} ${label}`)
     setSelectedKeys([])
     await queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
-    await queryClient.invalidateQueries({ queryKey: ['personae', 'view'] })
+    await queryClient.invalidateQueries({ queryKey: [ID, 'view'] })
   }
   const runDelete = () => {
     if (!armedDelete) {
@@ -10903,7 +12072,7 @@ function SessionListView({
           `view-${profile}-${session.id}`
         )
 
-        // The confirmation sits UNDER the row it was opened on (Pedro,
+        // The confirmation sits UNDER the row it was opened on (the user,
         // 2026-11-03). The cut is what carries the anchor, so a bar cannot
         // attach itself to a neighbouring row.
         if (!isCutAnchor(cut, profile, session)) {
@@ -11135,7 +12304,7 @@ function botMetaPatch(meta, { color, title } = {}) {
 /** Edit ONE profile — the edit the Bots pane offers, written to the SAME two
  *  places it writes: `ui_meta['hermes-bots']` for the name and colour, and the
  *  profile's own `assets/avatar.*` for the picture. One document, two panes,
- *  which is what makes a change in either show up in the other (Pedro,
+ *  which is what makes a change in either show up in the other (the user,
  *  2026-10-10: "the changes are synced, so if the user changes a profile
  *  picture in either Messenger or Bots, it reflects on the other").
  *
@@ -11265,7 +12434,7 @@ function EditProfileDialog({ onClose, open, queryClient, row }) {
           }),
           // The app's OWN grid, clear row included — the same `ColorSwatches`
           // the session and group pickers use, so all three speak one language.
-          // The clear row IS the "no fill" option (Pedro, 2026-10-10: "allow
+          // The clear row IS the "no fill" option (The reviewer, 2026-10-10: "allow
           // for a no fill option as well"): a picked colour paints the profile
           // row and its sessions, so the picker has to offer the way back to
           // nothing. Bots' editor gets its clear row from
@@ -11343,7 +12512,12 @@ function EditProfileDialog({ onClose, open, queryClient, row }) {
   })
 }
 
-function MessengerPane() {
+function MessengerPane({ mode = 'list' }) {
+  // ONE pane component, two bodies: the roster (this plugin's own view since the
+  // beginning) and the flat cross-profile list (Perso, merged in). Everything
+  // above the body — the queries, the selection, the menus, the dialogs — is
+  // shared, which is the whole reason the two lives in one file.
+  const isRoster = mode === 'roster'
   const t = usePluginI18n(ID)
   const currentProfile = useValue(host.state.profile)
   const model = useValue($sections)
@@ -11352,6 +12526,7 @@ function MessengerPane() {
   const sessionOrderState = useValue($sessionOrder)
   const view = useValue($listView)
   const toasts = useValue($activityToasts)
+  const liveInfo = useValue($liveInfo)
   // Which profiles' last load threw — drawn as a note on their own row.
   const failedProfiles = new Set((useValue($loadFailures) || []).map(String))
   // The search box and the needle it drives are TWO atoms (see scheduleSearch):
@@ -11362,7 +12537,7 @@ function MessengerPane() {
   const query = useValue($searchQuery)
   const health = useValue($searchHealth)
   // "Archive all up to this point" — the pending cut. It is confirmed UNDER the
-  // session row it was opened on (Pedro, 2026-11-03: "the confirmation box
+  // session row it was opened on (The reviewer, 2026-11-03: "the confirmation box
   // should be under the selected session, not at the top of the list"), and
   // never in a modal: this pane asks in place, like the row's own delete strip.
   const archiveCut = useValue($archiveCut)
@@ -11371,6 +12546,9 @@ function MessengerPane() {
   const [activity, setActivity] = useState('all')
   const [profiles, setProfiles] = useState([])
   const [editing, setEditing] = useState(null)
+  // The roster's inline "new section" field. Its only reader is the roster body;
+  // the flat list has no sections of its own to create.
+  const [creating, setCreating] = useState(false)
   // The row whose Edit profile dialog is open (the ROW, not its name: the
   // dialog needs the document it is editing).
   const [editingProfileRow, setEditingProfileRow] = useState(null)
@@ -11394,7 +12572,7 @@ function MessengerPane() {
   const [editingSession, setEditingSession] = useState(null)
   // ONE slot: a group is created first and only ever RENAMED afterwards (see
   // createGroupNow), so there is no "new group being named" state to keep in
-  // step with anything. Pedro, 2026-10-10: "Don't give them a text box to fill
+  // step with anything. The reviewer, 2026-10-10: "Don't give them a text box to fill
   // in before the group is created."
   // Which profiles are revealing their hidden sessions. A view preference, so
   // it lives in this window only (the hiding itself is persisted).
@@ -11421,21 +12599,31 @@ function MessengerPane() {
   })
   const hits = searching ? deep.data || {} : {}
 
-  // Expanded profiles: ONE query keyed by the OPEN SET, so opening a row only
-  // fetches that profile and the poll keeps the titles and ages fresh.
+  // Perso has no collapsed profile: the FLAT list IS every profile's session
+  // list, so every profile is fetched — one query, keyed by the roster, polling
+  // at the pane's usual cadence so titles and ages stay live.
+  //
+  // The page asked for is FLAT_FETCH, not the roster's ten: a global activity
+  // sort can only be right if each profile hands over enough rows to sort, and
+  // the drawn page is capped once, below.
   const expanded = useValue($expanded)
-  const openNames = Object.keys(expanded)
-    .filter(name => expanded[name])
-    .sort()
+  const openNames = rows.map(row => row.name).sort()
   const sessions = useQuery({
-    queryKey: ['personae', 'sessions', openNames.join('|')],
-    queryFn: () => refreshSessions(openNames),
+    queryKey: [ID, 'sessions', openNames.join('|'), FLAT_FETCH],
+    queryFn: () => refreshSessions(openNames, FLAT_FETCH),
     enabled: openNames.length > 0,
     refetchInterval: POLL_MS,
     staleTime: 2000,
     retry: false
   })
   const byProfile = sessions.data || {}
+  // The flat list's own view state: how many top-level items are drawn
+  // ("Show more"), whether the archived section is open, and whether hidden
+  // rows are revealed (a GLOBAL door here — there is no profile row to carry a
+  // per-profile one).
+  const [flatCap, setFlatCap] = useState(FLAT_PAGE)
+  const [archOpen, setArchOpen] = useState(false)
+  const [revealHidden, setRevealHidden] = useState(false)
 
   /** Commit an inline session rename, then drop the field. The list picks the
    *  new title up on its next poll (the query key does not change). */
@@ -11455,40 +12643,16 @@ function MessengerPane() {
   // what makes a working search look broken: the pane says so instead of
   // drawing an unchanged roster.
   const noHits = searching && shown.length === 0
-  // "Archive all up to this point" (Pedro, 2026-10-16). Two steps on purpose:
+  // "Archive all up to this point" (The reviewer, 2026-10-16). Two steps on purpose:
   // READ the profile's whole history (`session.list`) to work out the cut, then
   // confirm the count before anything moves. The rows on screen are a capped,
   // sorted, possibly filtered page — a bulk verb that computed its set from them
   // would report one number and act on another.
-  /** Every profile's FULL list, in parallel. A profile whose store refuses
-   *  contributes nothing rather than taking the whole verb down with it. */
-  const readEveryProfile = () =>
-    Promise.all(
-      rows.map(async row => {
-        try {
-          return [row.name, await listAllSessions(row.name)]
-        } catch {
-          return [row.name, []]
-        }
-      })
-    )
   const openArchiveUpTo = async (session, profile) => {
-    // The CUT is a moment: everything, in EVERY profile, older than the row the
-    // verb was picked on. Reading only this profile's list is what made the verb
-    // quietly profile-scoped.
-    const at = secondsToMs(session?.last_active || session?.started_at)
     let entries = []
 
-    if (!at) {
-      setSelectStatus(t('nothingOlder'))
-
-      return
-    }
-
     try {
-      const lists = await readEveryProfile()
-
-      entries = lists.flatMap(([name, list]) => cutRowsByMoment(list, name, at))
+      entries = sessionsUpTo(await listAllSessions(profile), sessionIdOf(session) || session?.id)
     } catch (error) {
       host.notifyError?.(String(error?.message || error))
 
@@ -11523,11 +12687,7 @@ function MessengerPane() {
     setArchiveCut(null)
     setSelectStatus(failed ? `${done} ${t('archived')} · ${failed} ${t('failed')}` : `${done} ${t('archived')}`)
     await queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
-    // The pages are per profile and keyed by the OPEN SET, so a cut that reached
-    // a profile the user is not looking at would leave that profile's rows on
-    // screen until something else moved its key.
-    await queryClient.invalidateQueries({ queryKey: ['personae', 'sessions'] })
-    await queryClient.invalidateQueries({ queryKey: ['personae', 'view'] })
+    await queryClient.invalidateQueries({ queryKey: [ID, 'view'] })
 
     return undefined
   }
@@ -11806,9 +12966,227 @@ function MessengerPane() {
     })
   }
 
+  // The roster's own composition (filter → group into sections). The flat list
+  // below ignores both: it sorts everything itself.
+  const shownRows = isRoster
+    ? visibleRows(rows, { activity, kind, matchesByProfile: hits, nowMs, profiles, query })
+    : rows
+  const rosterBlocks = isRoster ? groupRows(shownRows, model) : []
+
   let body
 
-  if (roster.isPending) {
+  if (isRoster) {
+  
+    if (roster.isPending) {
+      body = jsx(LoadingRows, {})
+    } else if (roster.isError) {
+      body = jsx(ErrorState, {
+        className: 'px-2 py-4',
+        description: String(roster.error?.message || roster.error || ''),
+        title: t('loadFailed')
+      })
+    } else if (!shownRows.length && !model.sections.length) {
+      body = jsxs('div', {
+        className: 'flex min-h-0 flex-1 flex-col',
+        children: [
+          jsx('img', {
+            alt: '',
+            'data-personae-mark': '',
+            src: MARK_SRC,
+            style: {
+              borderRadius: '22%',
+              display: 'block',
+              height: 56,
+              margin: '28px auto 0',
+              opacity: 0.9,
+              width: 56
+            }
+          }),
+          jsx(EmptyState, {
+            description: rows.length ? t('filteredHint') : t('emptyHint'),
+            title: rows.length ? t('filtered') : t('empty')
+          })
+        ]
+      })
+    } else {
+      body = jsx('div', {
+        className: LIST_CLASS,
+        children: rosterBlocks.map((block, index) =>
+          jsxs(
+            'div',
+            {
+              className: 'grid min-w-0 grid-cols-1',
+              children: [
+                block.id
+                  ? jsx(SectionHeading, {
+                      block,
+                      index,
+                      onAddProfiles: target => setAdding(target),
+                      dropTarget: dropAt?.group === block.id,
+                      onDelete: target => deleteSection(target.id),
+                      onDragStart: startDrag,
+                      onMove: delta => moveSection(block.id, delta),
+                      onRename: target => {
+                        setCreating(false)
+                        setEditing({ id: target.id, name: target.name })
+                      },
+                      onSort: mode => setSort(block.scope, mode),
+                      scopeCount: rosterBlocks.filter(candidate => candidate.id).length,
+                      sort: model.sort?.[block.scope] || 'activity'
+                    })
+                  : null,
+                editing && editing.id === block.id
+                  ? jsx(NameField, {
+                      initial: editing.name,
+                      label: t('groupName'),
+                      onCancel: () => setEditing(null),
+                      onSubmit: name => {
+                        renameSection(editing.id, name)
+                        setEditing(null)
+                      }
+                    })
+                  : null,
+                block.collapsed
+                  ? null
+                  : block.rows.map(row =>
+                      jsx(
+                        ProfileRow,
+                        {
+                          cut: archiveCut,
+                          cutBar,
+                          editingSession,
+                          expanded: Boolean(expanded[row.name]),
+                          hits: hits[row.name],
+                          isCurrent: row.name === currentProfile,
+                          nowMs,
+                          onView: (name, kind) => {
+                            $listView.set({ kind, profile: name })
+                            setRoutineProfile(name)
+                          },
+                          onArchiveUpTo: openArchiveUpTo,
+                          searching,
+                          drag,
+                          dropAt,
+                          onDragStart: startDrag,
+                          scope: block.scope,
+                          onSelect: (name, storedId) => {
+                            setSelecting(true)
+                            setSelectedKeys([sessionKey(name, storedId)])
+                          },
+                          onRightClickSelect: key => setSelectedKeys(keys => clickSelect(keys, key)),
+                          loadFailed: failedProfiles.has(row.name),
+                          onEditProfile: setEditingProfileRow,
+                          // Unticking the LAST row is how the user leaves select
+                          // mode, which is what tickState reports (see it).
+                          onToggleSelect: key => {
+                            const next = tickState(selectedKeys, key)
+  
+                            setArmedDelete(false)
+                            setSelectedKeys(next.keys)
+                            setSelectStatus('')
+  
+                            if (next.empty) {
+                              setSelecting(false)
+                            }
+                          },
+                          selectedKeys,
+                          selecting,
+                          t,
+                          onRenameCancel: () => setEditingSession(null),
+                          onRenameSession: (session, profile) => {
+                            setEditing(false)
+                            setEditingSession({
+                              id: String(session.id),
+                              profile,
+                              title: String(session.title || '')
+                            })
+                          },
+                          onRenameSubmit: submitSessionRename,
+                          showHidden,
+                          onToggleHidden: name =>
+                            setShowHidden(previous => ({ ...previous, [name]: !previous[name] })),
+                          renamingGroup,
+                          onDeleteGroup: id => deleteSessionGroup(row.name, id),
+                          onMoveGroup: payload =>
+                            moveSessionsToGroup(
+                              row.name,
+                              sessionGroupMoveTargets({
+                                profile: row.name,
+                                selectedKeys,
+                                sessionId: payload?.sessionId
+                              }),
+                              payload?.groupId ?? null
+                            ),
+                          // Make the group FIRST, name it second (createGroupNow):
+                          // "Group #1" appears the instant the verb is picked, and
+                          // the field that opens on it is a RENAME — so a lost
+                          // keystroke can no longer lose the group. Pedro,
+                          // 2026-10-10: "immediately create the group, with Group #1
+                          // or Apropos #1. The user will then rename it accordingly.
+                          // Don't give them a text box to fill in before the group
+                          // is created."
+                          onNewGroup: sessionIds => {
+                            const made = createGroupNow(row.name, sessionIds)
+  
+                            if (made) {
+                              setRenamingGroup(made)
+                            }
+                          },
+                          // "Apropos (On that topic) → Create group": always a real
+                          // Apropos group, built from the TICK SET — which the
+                          // right-click rule has already made real (clickSelect).
+                          onCreateAproposGroup: entry => {
+                            const entries = ticks.length ? ticks : [entry]
+  
+                            return aproposCreateGroup(entries).then(made => {
+                              if (made.length) {
+                                // The rename opens on the group that was just made,
+                                // so the default name is never a dead end.
+                                setRenamingGroup({ id: made[0].groupId, name: made[0].name })
+                              }
+  
+                              return made
+                            })
+                          },
+                          onRenameGroup: group => setRenamingGroup({ id: group.id, name: group.name }),
+                          onRenameGroupCancel: () => setRenamingGroup(null),
+                          // Renaming a group also retitles the children it
+                          // started, so "Apropos group: …" never outlives the
+                          // name it was made from (see renameAproposGroup).
+                          onRenameGroupSubmit: (id, name) => {
+                            renameAproposGroup(row.name, id, name, byProfile[row.name])
+                            setRenamingGroup(null)
+                          },
+                          onToggleGroup: id => toggleSessionGroupCollapsed(row.name, id),
+                          onMoveGroupOrder: (id, delta) => moveSessionGroup(row.name, id, delta),
+                          // Selecting a profile IS clicking it: the right-hand
+                          // tile follows the left pane (Pedro, 2026-10-09), so one
+                          // click decides both halves of the window.
+                          onToggle: name => {
+                            toggleExpanded(name)
+                            setRoutineProfile(name)
+                          },
+                          row,
+                          sessionOrder: sessionOrderState,
+                          sessions: byProfile[row.name]
+                        },
+                        row.name
+                      )
+                    ),
+                !block.collapsed && !block.rows.length
+                  ? jsx('div', {
+                      className: 'px-2 py-1 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
+                      children: t('groupEmpty')
+                    })
+                  : null
+              ]
+            },
+            block.id || 'all'
+          )
+        )
+      })
+    }
+  } else if (roster.isPending) {
     body = jsx(LoadingRows, {})
   } else if (roster.isError) {
     body = jsx(ErrorState, {
@@ -11816,7 +13194,7 @@ function MessengerPane() {
       description: String(roster.error?.message || roster.error || ''),
       title: t('loadFailed')
     })
-  } else if (!shown.length && !model.sections.length) {
+  } else if (!shown.length) {
     body = jsxs('div', {
       className: 'flex min-h-0 flex-1 flex-col',
       children: [
@@ -11840,181 +13218,187 @@ function MessengerPane() {
       ]
     })
   } else {
-    body = jsx('div', {
-      className: LIST_CLASS,
-      children: blocks.map((block, index) =>
-        jsxs(
-          'div',
-          {
-            className: 'grid min-w-0 grid-cols-1',
-            children: [
-              block.id
-                ? jsx(SectionHeading, {
-                    block,
-                    index,
-                    onAddProfiles: target => setAdding(target),
-                    dropTarget: dropAt?.group === block.id,
-                    onDelete: target => deleteSection(target.id),
-                    onDragStart: startDrag,
-                    onMove: delta => moveSection(block.id, delta),
-                    onRename: target => {
-                      setCreating(false)
-                      setEditing({ id: target.id, name: target.name })
-                    },
-                    onSort: mode => setSort(block.scope, mode),
-                    scopeCount: blocks.filter(candidate => candidate.id).length,
-                    sort: model.sort?.[block.scope] || 'activity'
-                  })
-                : null,
-              editing && editing.id === block.id
-                ? jsx(NameField, {
-                    initial: editing.name,
-                    label: t('groupName'),
-                    onCancel: () => setEditing(null),
-                    onSubmit: name => {
-                      renameSection(editing.id, name)
-                      setEditing(null)
-                    }
-                  })
-                : null,
-              block.collapsed
-                ? null
-                : block.rows.map(row =>
-                    jsx(
-                      ProfileRow,
-                      {
-                        cut: archiveCut,
-                        cutBar,
-                        editingSession,
-                        expanded: Boolean(expanded[row.name]),
-                        hits: hits[row.name],
-                        isCurrent: row.name === currentProfile,
-                        nowMs,
-                        onView: (name, kind) => {
-                          $listView.set({ kind, profile: name })
-                          setRoutineProfile(name)
-                        },
-                        onArchiveUpTo: openArchiveUpTo,
-                        searching,
-                        drag,
-                        dropAt,
-                        onDragStart: startDrag,
-                        scope: block.scope,
-                        onSelect: (name, storedId) => {
-                          setSelecting(true)
-                          setSelectedKeys([sessionKey(name, storedId)])
-                        },
-                        onRightClickSelect: key => setSelectedKeys(keys => clickSelect(keys, key)),
-                        loadFailed: failedProfiles.has(row.name),
-                        onEditProfile: setEditingProfileRow,
-                        // Unticking the LAST row is how the user leaves select
-                        // mode, which is what tickState reports (see it).
-                        onToggleSelect: key => {
-                          const next = tickState(selectedKeys, key)
+    // ── the flat list ─────────────────────────────────────────────────────
+    // ONE handler bundle for both screens that draw a session row (the live
+    // list and the archived section): the two must offer the SAME menu, not the
+    // same labels on different verbs.
+    // "Hide all up to this point": the cut is a MOMENT read across EVERY
+    // profile's whole history — not just this row's profile, and not just the
+    // page on screen (The reviewer, 2026-11-11: "it refers to all sessions from all
+    // profiles"). A capped page would hide a dozen rows and report the job done.
+    const hideUpTo = async (session, profile) => {
+      const anchorId = sessionIdOf(session) || String(session?.id || '')
+      const at = (Number(session?.started_at) || 0) * 1000
 
-                          setArmedDelete(false)
-                          setSelectedKeys(next.keys)
-                          setSelectStatus('')
+      // A row that cannot be placed in time hides ONLY itself: an unknown
+      // moment must never sweep the fleet.
+      if (!at) {
+        return anchorId ? hideSessions(profile, [anchorId]).length : 0
+      }
 
-                          if (next.empty) {
-                            setSelecting(false)
-                          }
-                        },
-                        selectedKeys,
-                        selecting,
-                        t,
-                        onRenameCancel: () => setEditingSession(null),
-                        onRenameSession: (session, profile) => {
-                          setEditing(false)
-                          setEditingSession({
-                            id: String(session.id),
-                            profile,
-                            title: String(session.title || '')
-                          })
-                        },
-                        onRenameSubmit: submitSessionRename,
-                        showHidden,
-                        onToggleHidden: name =>
-                          setShowHidden(previous => ({ ...previous, [name]: !previous[name] })),
-                        renamingGroup,
-                        onDeleteGroup: id => deleteSessionGroup(row.name, id),
-                        onMoveGroup: payload =>
-                          moveSessionsToGroup(
-                            row.name,
-                            sessionGroupMoveTargets({
-                              profile: row.name,
-                              selectedKeys,
-                              sessionId: payload?.sessionId
-                            }),
-                            payload?.groupId ?? null
-                          ),
-                        // Make the group FIRST, name it second (createGroupNow):
-                        // "Group #1" appears the instant the verb is picked, and
-                        // the field that opens on it is a RENAME — so a lost
-                        // keystroke can no longer lose the group. Pedro,
-                        // 2026-10-10: "immediately create the group, with Group #1
-                        // or Apropos #1. The user will then rename it accordingly.
-                        // Don't give them a text box to fill in before the group
-                        // is created."
-                        onNewGroup: sessionIds => {
-                          const made = createGroupNow(row.name, sessionIds)
+      let lists = []
 
-                          if (made) {
-                            setRenamingGroup(made)
-                          }
-                        },
-                        // "Apropos (On that topic) → Create group": always a real
-                        // Apropos group, built from the TICK SET — which the
-                        // right-click rule has already made real (clickSelect).
-                        onCreateAproposGroup: entry => {
-                          const entries = ticks.length ? ticks : [entry]
-
-                          return aproposCreateGroup(entries).then(made => {
-                            if (made.length) {
-                              // The rename opens on the group that was just made,
-                              // so the default name is never a dead end.
-                              setRenamingGroup({ id: made[0].groupId, name: made[0].name })
-                            }
-
-                            return made
-                          })
-                        },
-                        onRenameGroup: group => setRenamingGroup({ id: group.id, name: group.name }),
-                        onRenameGroupCancel: () => setRenamingGroup(null),
-                        // Renaming a group also retitles the children it
-                        // started, so "Apropos group: …" never outlives the
-                        // name it was made from (see renameAproposGroup).
-                        onRenameGroupSubmit: (id, name) => {
-                          renameAproposGroup(row.name, id, name, byProfile[row.name])
-                          setRenamingGroup(null)
-                        },
-                        onToggleGroup: id => toggleSessionGroupCollapsed(row.name, id),
-                        onMoveGroupOrder: (id, delta) => moveSessionGroup(row.name, id, delta),
-                        // Selecting a profile IS clicking it: the right-hand
-                        // tile follows the left pane (Pedro, 2026-10-09), so one
-                        // click decides both halves of the window.
-                        onToggle: name => {
-                          toggleExpanded(name)
-                          setRoutineProfile(name)
-                        },
-                        row,
-                        sessionOrder: sessionOrderState,
-                        sessions: byProfile[row.name]
-                      },
-                      row.name
-                    )
-                  ),
-              !block.collapsed && !block.rows.length
-                ? jsx('div', {
-                    className: 'px-2 py-1 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: t('groupEmpty')
-                  })
-                : null
-            ]
-          },
-          block.id || 'all'
+      try {
+        lists = await Promise.all(
+          rows.map(async row => {
+            try {
+              return [row.name, await listAllSessions(row.name)]
+            } catch {
+              return [row.name, []]
+            }
+          })
         )
-      )
+      } catch {
+        lists = Object.entries(byProfile)
+      }
+
+      let hidden = 0
+
+      for (const [name, list] of lists) {
+        const ids = cutRowsByMoment(list, name, at, { field: 'started', inclusive: true }).map(
+          entry => entry.id
+        )
+
+        if (ids.length) {
+          hideSessions(name, ids)
+          hidden += ids.length
+        }
+      }
+
+      // The anchor is named explicitly: a listing row without `started_at`
+      // would be dropped by the cut and the click would look like a no-op.
+      if (anchorId) {
+        hideSessions(profile, [anchorId])
+      }
+
+      return hidden
+    }
+    // Opening a row: read it, remember that, and let the app's own unread store
+    // hear it too — the dot is core's component and paints what that store says.
+    const openRow = (profile, session, sessions) => {
+      const id = sessionIdOf(session) || String(session?.id || '')
+
+      noteSeen(id, sessionActivityMs(session))
+      noteOpened(id)
+      ackStoredSessionId?.(id, profile)
+
+      return openSessionInProfile(profile, sessions, id)
+    }
+    const persoHandlers = {
+      editingSession,
+      onHideUpTo: hideUpTo,
+      onOpenRow: openRow,
+      onArchiveUpTo: openArchiveUpTo,
+      onCreateAproposGroup: entry => {
+        const entries = ticks.length ? ticks : [entry]
+
+        return aproposCreateGroup(entries).then(made => {
+          if (made.length) {
+            // The rename opens on the group that was just made, so the default
+            // name is never a dead end.
+            setRenamingGroup({ id: made[0].groupId, name: made[0].name })
+          }
+
+          return made
+        })
+      },
+      onDeleteGroup: (profile, id) => deleteSessionGroup(profile, id),
+      onMoveGroup: (profile, payload) =>
+        moveSessionsToGroup(
+          profile,
+          sessionGroupMoveTargets({ profile, selectedKeys, sessionId: payload?.sessionId }),
+          payload?.groupId ?? null
+        ),
+      onMoveGroupOrder: (profile, id, delta) => moveSessionGroup(profile, id, delta),
+      // Make the group FIRST, name it second (createGroupNow) — the roster's
+      // own rule, unchanged.
+      onNewGroup: (profile, sessionIds) => {
+        const made = createGroupNow(profile, sessionIds)
+
+        if (made) {
+          setRenamingGroup(made)
+        }
+      },
+      onRenameCancel: () => setEditingSession(null),
+      onRenameGroup: group => setRenamingGroup({ id: group.id, name: group.name }),
+      onRenameGroupCancel: () => setRenamingGroup(null),
+      onRenameGroupSubmit: (profile, id, name) => {
+        renameAproposGroup(profile, id, name, byProfile[profile])
+        setRenamingGroup(null)
+      },
+      onRenameSession: (session, profile) => {
+        setEditing(false)
+        setEditingSession({
+          id: String(session.id),
+          profile,
+          title: String(session.title || '')
+        })
+      },
+      onRenameSubmit: submitSessionRename,
+      onRightClickSelect: key => setSelectedKeys(keys => clickSelect(keys, key)),
+      onSelect: (profile, storedId) => {
+        setSelecting(true)
+        setSelectedKeys([sessionKey(profile, storedId)])
+      },
+      // Unticking the LAST row is how the user leaves select mode (tickState).
+      onToggleSelect: key => {
+        const next = tickState(selectedKeys, key)
+
+        setArmedDelete(false)
+        setSelectedKeys(next.keys)
+        setSelectStatus('')
+
+        if (next.empty) {
+          setSelecting(false)
+        }
+      },
+      onToggleGroup: (profile, id) => toggleSessionGroupCollapsed(profile, id),
+      selectedKeys,
+      selecting,
+      ticks
+    }
+    // While a query is live the MATCHES are the list (the roster's own
+    // precedence rule), so the flat view is fed the hits instead of the recent
+    // page — and a profile that answers the needle is never hidden because it
+    // had nothing recent.
+    const flatSource = searching ? hits : byProfile
+
+    body = jsxs('div', {
+      className: 'grid min-w-0 grid-cols-1',
+      children: [
+        jsx(PersoList, {
+          byProfile: flatSource,
+          cap: flatCap,
+          cut: archiveCut,
+          cutBar,
+          // Group drag lives in the pane (its window-level listeners own the
+          // gesture); the list only reports what is held and what is under it.
+          drag,
+          dropAt,
+          handlers: persoHandlers,
+          nowMs,
+          onDragStart: startDrag,
+          onMore: () => setFlatCap(count => count + FLAT_PAGE),
+          onToggleHidden: () => setRevealHidden(revealed => !revealed),
+          profileRows: Object.fromEntries(rows.map(row => [row.name, row])),
+          renamingGroup,
+          revealHidden,
+          searching,
+          t
+        }, 'flat-list'),
+        // The archive is a SECTION of this one list, not a drill-down: it is
+        // the same pane, one scroll further, and it is the only listing that
+        // needs the pane's own backend (see loadArchivedRows).
+        jsx(ArchivedSection, {
+          handlers: persoHandlers,
+          names: rows.map(row => row.name),
+          nowMs,
+          onToggle: () => setArchOpen(open => !open),
+          open: archOpen,
+          profileRows: Object.fromEntries(rows.map(row => [row.name, row])),
+          t
+        }, 'archived-section')
+      ]
     })
   }
 
@@ -12022,7 +13406,7 @@ function MessengerPane() {
   // a grid, whose implicit `auto` track takes its minimum from the widest child's
   // MIN-CONTENT — so a single unshrinkable band (or one long unbreakable token)
   // widens the track past the pane, and `overflow: auto` then scrolls the row's
-  // right edge — where the caret and the drag grip live — out of view. Pedro,
+  // right edge — where the caret and the drag grip live — out of view. the user,
   // 2026-10-10: "The arrow and the grip icon should always be visible regardless
   // of the pane width." So: clip x, let every band shrink, and keep the chrome
   // that must never leave (leading caret, trailing grip) shrink-0.
@@ -12034,21 +13418,20 @@ function MessengerPane() {
     className: 'flex h-full min-h-0 flex-col overflow-y-auto overflow-x-hidden text-sm',
     children: [
       jsx(Toolbar, {
+        // The toolbar's unit here is the SESSION: this list is every profile's
+        // sessions at once, and "3/22 profiles" said nothing about it. No
+        // `onNewGroup`: sections belong to the roster (see Toolbar).
+        countLabel: `${Object.values(byProfile).reduce(
+          (total, list) => total + (Array.isArray(list) ? list.length : 0),
+          0
+        )} ${t('sessionsLabel')}`,
+        // Diagnostic while status not-updating is open: what the sweep saw live.
+        liveTotal: liveInfo.total,
+        liveWorking: liveInfo.working,
         onBell: toggleToasts,
         onFiles: openCoreFiles,
-        // The section's own immediate-creation path, same rule as the session
-        // groups: make "Group #1" now, then open its rename field on it.
-        onNewGroup: () => {
-          const id = createSection(nextSectionName())
-
-          if (id) {
-            const section = ($sections.get().sections || []).find(entry => entry.id === id)
-
-            setEditing({ id, name: section?.name || '' })
-          }
-        },
-        rows,
         onSelect: () => (selecting ? leaveSelect() : setSelecting(true)),
+        rows,
         selecting,
         shownCount: shown.length,
         t,
@@ -12166,7 +13549,7 @@ function MessengerPane() {
           })
         : null,
       // The cut used to be confirmed HERE (top of the list), which put the
-      // question a screenful away from the row it was about (Pedro,
+      // question a screenful away from the row it was about (the user,
       // 2026-11-03). It is now placed by the row itself — see ProfileRow's
       // `cut`/`cutBar` and SessionListView's.
       body
@@ -12174,11 +13557,12 @@ function MessengerPane() {
   })
 }
 
-/** One-time prefs carry-over for the 1.2.0 id rename (`messenger` -> `personae`).
+/** One-time prefs carry-over for Perso: `personae` -> `perso`.
  *
  *  `ctx.storage` is namespaced by the plugin's CURRENT id, so it cannot see the
- *  old namespace — this reads the renderer's own `localStorage` instead, copies
- *  every `hermes.plugin.messenger.*` value into `hermes.plugin.personae.*`, and
+ *  namespace the roster has been writing — this reads the renderer's own
+ *  `localStorage` instead, copies every `hermes.plugin.personae.*` value into
+ *  `hermes.plugin.perso.*`, and
  *  leaves the old entries in place: a COPY, never a move, so someone who rolls
  *  back to an older build finds their groups, colours and sort orders exactly
  *  where they left them. A key the new id has already written is never
@@ -12195,8 +13579,12 @@ function migrateLegacyStorage() {
 
   if (!store || typeof store.length !== 'number') return 0
 
-  const from = 'hermes.plugin.messenger.'
-  const to = 'hermes.plugin.personae.'
+  // Perso inherits what the roster he has been using already wrote, so the
+  // hidden set, the sort orders and the sections do not start from nothing on
+  // the day he opens this pane. A COPY, never a move: rolling back to Personae
+  // must find everything exactly where it was.
+  const from = 'hermes.plugin.personae.'
+  const to = 'hermes.plugin.perso.'
   let copied = 0
 
   try {
@@ -12231,7 +13619,7 @@ function migrateLegacyStorage() {
 
 export default {
   id: ID, // must match the folder name
-  name: 'Personae',
+  name: 'Perso',
   register(ctx) {
     ctxRef = ctx
     migrateLegacyStorage()
@@ -12263,6 +13651,21 @@ export default {
         older: 'Older',
         paneTitle: 'Personae',
         profilesLabel: 'profiles',
+        // ── Perso's flat list ──
+        archivedEmpty: 'Nothing archived.',
+        archivedSection: 'Archived',
+        archivedUnreadable: count =>
+          count === 1
+            ? '1 profile could not be read — the Perso backend is not mounted yet.'
+            : `${count} profiles could not be read — the Perso backend is not mounted yet.`,
+        hideHiddenRows: 'Hide hidden rows',
+        loading: 'Loading…',
+        readSection: 'Read',
+        runningSection: 'Running',
+        sessionsLabel: 'sessions',
+        unreadSection: 'Unread',
+        showHiddenRows: count => `Show hidden (${count})`,
+        showMore: 'Show more',
         recentlyActive: 'Recently active',
         cancel: 'Cancel',
         create: 'Create',
@@ -12358,11 +13761,11 @@ export default {
         toastsOn: 'Activity toasts on — click to silence',
         viewAll: 'View all',
         viewAllEmpty: 'No sessions for this profile.',
-        viewArchiveUnavailable: 'Archive unavailable — the Personae backend is not mounted in this build.',
+        viewArchiveUnavailable: 'Archive unavailable — the Perso backend is not mounted in this build.',
         viewArchived: 'View Archived',
         viewArchivedEmpty: 'Nothing archived for this profile.',
         viewHidden: 'View hidden',
-        viewHiddenEmpty: 'Nothing hidden in Personae for this profile.',
+        viewHiddenEmpty: 'Nothing hidden in Perso for this profile.',
         unhideAll: 'Unhide all',
         viewBack: 'Back',
         viewSessions: 'sessions',
@@ -12395,7 +13798,20 @@ export default {
       area: 'panes',
       title: 'Personae',
       data: { hideOnly: true, placement: 'left', width: '280px' },
-      render: () => jsx(MessengerPane, {})
+      render: () => jsx(MessengerPane, { mode: 'roster' })
+    })
+
+    // The SAME pane, one view over: every profile's sessions in ONE list, sorted
+    // by activity, each row carrying its profile's picture and name. Registered
+    // second so the roster stays the tab the plugin opens on, and `hideOnly` on
+    // both — no ✕ to hit by accident; the tab's right-click menu carries
+    // "Hide ⟨title⟩" for whichever view the user does not want.
+    ctx.register({
+      id: 'perso',
+      area: 'panes',
+      title: 'Perso',
+      data: { hideOnly: true, placement: 'left', width: '280px' },
+      render: () => jsx(MessengerPane, { mode: 'list' })
     })
 
     // The right edge's Scheduled jobs tile — the same one Bots puts beside the
@@ -12423,8 +13839,8 @@ export default {
       })
 
     // The empty transcript of a session THIS pane opened: the profile's face and
-    // name, the way Bot Mode introduces a bot chat. Registered last: the panes are
-    // this plugin's own surface and come first in the registry.
+    // name, the way Bot Mode introduces a bot chat. Registered LAST on purpose —
+    // the panes are this plugin's own surface and come first in the registry.
     ctx.register({
       id: 'chat-empty',
       area: CHAT_EMPTY_AREA,
@@ -12459,6 +13875,29 @@ export default {
  *  filtering and grouping without a DOM to type into. Not part of the plugin
  *  API: the app reads `default` and nothing else. */
 export const __internals = {
+  // ── Perso: the flat list's decision layer ──
+  ArchivedSection,
+  FLAT_FETCH,
+  FLAT_PAGE,
+  PersoList,
+  PersoRow,
+  flatProfileItems,
+  flatSessionItems,
+  hideSessions,
+  loadArchivedRows,
+  $opened,
+  $seen,
+  $lastActive,
+  $sessionStates,
+  activityMsFor,
+  claimsChatEmpty,
+  noteOpened,
+  ProfileChatEmpty,
+  bucketSessions,
+  noteSeen,
+  sessionActivityMs,
+  sessionBucket,
+  cutRowsByMoment,
   openCoreFiles,
   migrateLegacyStorage,
   applyPref,
@@ -12502,7 +13941,9 @@ export const __internals = {
   dotStateFor,
   DOT_LIST_TTL_MS,
   dotListCache,
+  liveStatusForRow,
   liveStatusMap,
+  stateForRow,
   LIVE_WORKING,
   ROLLUP_DOT,
   ROLLUP_INK,
@@ -12652,10 +14093,6 @@ export const __internals = {
   $sessionGroups,
   sessionColor,
   setSessionColor,
-  $opened,
-  claimsChatEmpty,
-  noteOpened,
-  ProfileChatEmpty,
   toggleExpanded,
   bodyHit,
   bodySearch,
@@ -12667,7 +14104,7 @@ export const __internals = {
   listMatch,
   moreHitsTarget,
   ArchiveCutBar,
-  cutRowsByMoment,
+  sessionsUpTo,
   cutAnchorIds,
   isCutAnchor,
   anySessionId,

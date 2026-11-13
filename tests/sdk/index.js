@@ -80,6 +80,7 @@ export const host = {
     /** The durable id + owner of the focused chat, which is what a "back to
      *  where I was" control navigates with (activeSessionId is a runtime id). */
     focusedSessionProfile: atom('default'),
+    focusedSessionProfile: atom(null),
     focusedStoredSessionId: atom(null),
     gateway: atom('127.0.0.1:9119'),
     model: atom('deepseek-flash'),
@@ -209,6 +210,16 @@ export const host = {
 }
 
 /** The unread store behind `SessionStatusDot`'s emerald dot. */
+/** The app's own "he opened it" door (see sdk/index.ts: `ackStoredSessionId`
+ *  clears the emerald dot). Recorded so a test can prove the pane tells the app
+ *  as well as its own watermark. */
+export function ackStoredSessionId(storedSessionId, profileHint) {
+  const h = harness()
+  h.acks = [...(h.acks || []), { profile: profileHint, id: storedSessionId }]
+
+  return undefined
+}
+
 export function markSessionUnreadFinished(storedSessionId, profileHint) {
   harness().unread.push({ id: storedSessionId, profile: profileHint })
 }
@@ -255,7 +266,8 @@ export function Button({ children, className, onClick, size, variant, ...props }
  *  registration and each answers for itself). */
 export const CHAT_EMPTY_AREA = 'chat.empty'
 
-/** Core's own lettering over the empty chat. */
+/** Core's own lettering over the empty chat. A marker is enough: the plugin's
+ *  contract is "draw this text", not the font it uses. */
 export function Wordmark({ className, text, width }) {
   return jsx('span', { 'data-slot': 'wordmark', 'data-width': width, className, children: text })
 }
@@ -275,7 +287,7 @@ export function ContextMenu({ children }) {
  * `ContextMenu` looks up a `Menu` context nobody provided under its scope and
  * throws `` `MenuItem` must be used within `Menu` `` at RENDER time — the
  * pane's right-click crash of 2026-10-09. The stub enforces the same rule, so
- * mixing the families fails HERE instead of in Pedro's window.
+ * mixing the families fails HERE instead of in the reviewer’s window.
  */
 const MenuScope = createContext('none')
 

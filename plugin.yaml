@@ -1,11 +1,17 @@
 name: personae
-version: "1.8.15"
-description: "Personae — a messenger for your agents: one row per profile, its sessions underneath, and a status light for who is waiting on you."
+version: "2.0.0"
+description: >-
+  Perso — one flat, activity-ordered list of every profile's sessions, each row
+  carrying the profile's picture and name. A copy of Personae with the roster
+  view replaced; it reads and writes the SAME state (groups, Apropos, hidden,
+  archive) so the two panes agree.
 author: SmoothMarx
 license: GPL-3.0-or-later
-homepage: https://github.com/SmoothMarx/personae
+homepage: https://github.com/SmoothMarx/perso
+kind: standalone
+platforms: []
 tags:
   - desktop
   - sessions
   - profiles
-  - roster
+  - list

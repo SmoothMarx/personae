@@ -1,14 +1,15 @@
 {
-  "name": "hermes-plugin-personae",
-  "version": "1.8.15",
+  "name": "hermes-plugin-perso",
+  "version": "2.0.0",
   "private": true,
-  "description": "Personae - a Hermes Desktop plugin that merges your bot roster with each profile's live sessions in one tab.",
+  "description": "Perso - a Hermes Desktop plugin that lists every profile's sessions as ONE activity-ordered list, with the profile's picture on each row.",
   "type": "module",
   "license": "GPL-3.0-or-later",
   "engines": {
     "node": ">=20.6"
   },
   "scripts": {
-    "test": "./tests/run.sh"
+    "test": "./tests/run.sh",
+    "build": "./tests/run.sh"
   }
 }
