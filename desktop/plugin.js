@@ -481,7 +481,7 @@ const AVATAR_ROW_SIZE = 17
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane that has been silently running a stale build looks exactly like a
  *  broken feature, and that mistake has cost this file three rounds. */
-const BUILD = '2.0.0'
+const BUILD = '2.0.1'
 /** The picture at the head of a single-profile group box. Smaller than a row's:
  *  it labels a section, it is not the row you are scanning. */
 const AVATAR_HEAD_SIZE = 14
@@ -6165,6 +6165,12 @@ function SessionRow({
   // this row alone. `multi` is what hides the verbs that can only consult ONE
   // transcript (rename, branch, export, "from this session") and what puts the
   // count into the others' labels.
+  // The session the app is SHOWING, subscribed here so the ring follows focus
+  // without threading a prop through three construct sites. Focus is a STORED id;
+  // a row may be drawn under a lineage tip or hold its runtime id, so the
+  // comparison goes through every id it answers to.
+  const focusedNow = useValue(host.state.focusedStoredSessionId)
+  const isFocused = Boolean(focusedNow) && rowIdentities({ ...(session || {}), resolved_id: openId }).has(String(focusedNow))
   const ownEntry = { openId, profile: String(profile || ''), session_id: storedId, title }
   const targets = menuTargets({ batchTicks, entry: ownEntry, selected, selecting, tickCount: ticked })
   const multi = targets.length > 1
@@ -6327,8 +6333,18 @@ function SessionRow({
           // falls back to the nearest row, for the gutters between rows.)
           'data-drop-session': storedId,
           'data-session-row': '',
+          // The harness asserts this marker, and the glow is a RING: an outline or
+          // border would shift the row box and every row under it.
+          'data-focused': isFocused ? 'true' : undefined,
           'data-item-drag': selecting || !onDragStart ? undefined : 'session',
           className: 'flex min-w-0 items-center',
+          style: isFocused
+            ? {
+                borderRadius: 8,
+                boxShadow:
+                  '0 0 0 1.5px var(--ui-accent), 0 0 18px -4px color-mix(in srgb, var(--ui-accent) 70%, transparent)'
+              }
+            : undefined,
           // the reviewer’s item-first drag: hold the row and move. In select mode the
           // press is a TICK, so the gesture is off entirely there.
           onPointerDown: event => {

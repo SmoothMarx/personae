@@ -1,5 +1,5 @@
 name: personae
-version: "2.0.0"
+version: "2.0.1"
 description: >-
   Perso — one flat, activity-ordered list of every profile's sessions, each row
   carrying the profile's picture and name. A copy of Personae with the roster

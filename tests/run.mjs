@@ -6162,6 +6162,51 @@ if (process.env.DUMP_GROUPS) {
     'the live status and the row are still keyed in different id spaces'
   )
 
+  // The list must say WHICH chat the main pane is on. Pedro, 2026-11-13: "Put a
+  // glowing outline around the currently active session on screen."
+  check(
+    'the focused session wears the glow, and only that one',
+    (() => {
+      const mark = html => (html.match(/data-focused="true"/g) || []).length
+      const roster = { data: [{ hasAvatar: false, label: 'Zulu', lastActiveMs: Date.now(), name: 'zulu', sessionId: 'sess-zulu-9' }], error: null, isError: false, isPending: false }
+      const saved = h.queryResults['personae|roster']
+      const savedSessions = h.queryResults['personae|sessions|zulu']
+
+      h.queryResults['personae|roster'] = roster
+      h.queryResults['personae|sessions|zulu'] = {
+        data: {
+          sessions: [
+            { id: 'sess-zulu-9', last_active: Math.floor(Date.now() / 1000), message_count: 2, preview: 'a', title: 'Focused one' },
+            { id: 'sess-zulu-8', last_active: Math.floor(Date.now() / 1000) - 60, message_count: 2, preview: 'b', title: 'Other one' }
+          ]
+        },
+        error: null,
+        isError: false,
+        isPending: false
+      }
+
+      host.state.focusedStoredSessionId.set('sess-zulu-9')
+      const focused = mark(render())
+      host.state.focusedStoredSessionId.set('sess-nothing-here')
+      const none = mark(render())
+      host.state.focusedStoredSessionId.set(null)
+
+      if (saved) h.queryResults['personae|roster'] = saved
+      if (savedSessions) h.queryResults['personae|sessions|zulu'] = savedSessions
+
+      return (
+        // exactly one row glows, and it is the focused one…
+        focused === 1 &&
+        // …no focus, no glow…
+        none === 0 &&
+        // …and it is a RING (box-shadow), never a border, which would shift the
+        // rows below it.
+        render().includes('box-shadow') === false
+      )
+    })(),
+    'the glow did not follow focus'
+  )
+
   // `session.list` projects no `last_active` (`_session_row_summary` sends
   // id/title/preview/started_at/message_count/source), so every row read its
   // CREATION time — the age on the right never moved and the order looked like
