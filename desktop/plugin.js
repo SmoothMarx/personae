@@ -481,7 +481,7 @@ const AVATAR_ROW_SIZE = 17
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane that has been silently running a stale build looks exactly like a
  *  broken feature, and that mistake has cost this file three rounds. */
-const BUILD = '2.1.0'
+const BUILD = '2.1.1'
 /** The picture at the head of a single-profile group box. Smaller than a row's:
  *  it labels a section, it is not the row you are scanning. */
 const AVATAR_HEAD_SIZE = 14
@@ -3600,7 +3600,9 @@ function groupRows(rows, model) {
     discovered.push({ id, name: String(meta.sectionName || '').trim() || 'Group' })
   }
 
-  for (const section of [...model.sections, ...discovered]) {
+  const drawnSections = [...model.sections, ...discovered]
+
+  for (const section of drawnSections) {
     const members = sortedFor(section.id, rows.filter(row => filed(row.name) === section.id))
 
     // Emitted with ZERO members too: a group you just created is empty by
@@ -3617,18 +3619,25 @@ function groupRows(rows, model) {
     })
   }
 
-  const rest = rows.filter(row => !model.sections.some(section => section.id === filed(row.name)))
+  // "Rest" is everything NOT drawn under a heading above. It has to be measured
+  // against the sections that were actually DRAWN — a section discovered from the
+  // Bots document is not in `model.sections`, so filtering on that list floated
+  // every Bot Mode member into Unassigned while the heading above it drew the same
+  // profile (Pedro, 2026-11-13: "it's confused and putting profiles in group and
+  // saying they're unassigned").
+  const drawnIds = new Set(drawnSections.map(section => String(section.id)))
+  const rest = rows.filter(row => !drawnIds.has(String(filed(row.name) || '')))
 
   if (rest.length) {
     // With no groups at all the block is anonymous (no heading, so no sort
     // control either) — its scope is still "all" so a manual order survives
     // creating the first group later.
-    const scope = model.sections.length ? UNASSIGNED : 'all'
+    const scope = drawnSections.length ? UNASSIGNED : 'all'
 
     blocks.push({
       collapsed: model.collapsed.includes(UNASSIGNED),
       // Anonymous only when there are no sections to be missing from.
-      id: model.sections.length ? UNASSIGNED : null,
+      id: drawnSections.length ? UNASSIGNED : null,
       name: 'Unassigned',
       rows: sortedFor(scope, rest),
       scope

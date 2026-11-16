@@ -6183,8 +6183,11 @@ if (process.env.DUMP_GROUPS) {
         clients.name === 'Clients' &&
         clients.rows.length === 1 &&
         clients.rows[0].name === 'zulu' &&
-        // …and it is not also drawn under the local section it used to claim.
-        !blocks.some(block => block.id === 'my-own' && block.rows.some(row => row.name === 'zulu'))
+        // …and it is not ALSO in Unassigned: a row drawn under a heading must not
+        // be listed as unassigned further down the same pane.
+        !blocks.some(block => block.id === 'section:unassigned' && block.rows.some(row => row.name === 'zulu')) &&
+        // …while the profile that is in NO section still lands there.
+        blocks.some(block => block.id === 'section:unassigned' && block.rows.some(row => row.name === 'lima'))
       )
     })(),
     'groupRows still reads the pane-private map first'
