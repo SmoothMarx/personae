@@ -73,11 +73,11 @@ async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "plugin": "personae",
-        "version": "0.6.0",
+        "version": "2.2.0",
         "readOnly": False,
         "resolve": True,
         "state": True,
-        "title": True,
+        "title": False,  # renames ride the session.title RPC now (no store writes here)
         "search_roles": True,
         "search_titles": True,
     }
@@ -114,111 +114,52 @@ async def put_state(request: Request) -> JSONResponse:
     return JSONResponse(merged, headers={"Cache-Control": "no-store"})
 
 
+# Sources that are machine runs, not conversations: a cron tick, a kanban worker,
+# a one-shot, a webhook, a tool integration. Declared HERE rather than imported
+# from core — the catalog review was explicit that a listed plugin must not reach
+# into `hermes_state_sessions` (Pedro, 2026-11-16: "private core imports for
+# reads"). The cost is drift; the mitigation is that a new machine source is also
+# a source this pane would draw as a chat, so it gets noticed.
+MACHINE_SOURCES = frozenset({"cron", "kanban", "tool", "oneshot", "webhook"})
+
+
 def _denied_sources() -> set:
-    """The same machine-run deny-list every human-facing listing uses.
+    return set(MACHINE_SOURCES)
 
-    Read from core rather than copied, so this pane drifts with the backend instead of
-    against it. ``hermes_state_sessions`` is a sibling of this process, not a dependency
-    of the SDK — hence the import guard.
+
+def _state_db_path(profile: str):
+    """The session store for one profile, from the documented home layout.
+
+    `get_hermes_home()` is public and profile-aware; the default home keeps its
+    `state.db` at the root and every other profile has its own. Resolving the
+    path here instead of calling a web-router helper is what keeps this route off
+    Hermes internals (see the catalog review, 2026-11-13).
     """
-    try:
-        from hermes_state_sessions import INTERNAL_LISTING_SOURCES
+    from pathlib import Path
 
-        return {str(s).strip().lower() for s in INTERNAL_LISTING_SOURCES}
-    except Exception:
-        return {"cron", "kanban", "tool", "oneshot", "webhook"}
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    name = str(profile or "").strip()
+
+    if not name or name == "default":
+        return home / "state.db"
+
+    return home / "profiles" / name / "state.db"
 
 
 def _store(profile: str):
-    """Open ``profile``'s session store read-only, or raise for the caller to catch."""
-    from hermes_cli.web_server_sessions import (
-        _open_session_db_at_path,
-        _session_db_path_for_profile,
-    )
+    """Open ``profile``'s session store READ-ONLY via the public SessionDB."""
+    from hermes_state import SessionDB
 
-    path = _session_db_path_for_profile(profile or None)
+    path = _state_db_path(profile)
     if not path.exists():
         return None
-    return _open_session_db_at_path(path, read_only=True)
 
-
-def _writer(profile: str):
-    """Open ``profile``'s session store for a WRITE, or raise for the caller to catch.
-
-    The gateway's own REST title route opens the store exactly this way
-    (``hermes_cli/web_routers/sessions.py``: ``_with_db(..., read_only=False)``);
-    SQLite's WAL keeps the gateway's reader and this writer out of each other's
-    way, which is how the dashboard and the gateway already co-exist here.
-    """
-    from hermes_cli.web_server_sessions import (
-        _open_session_db_at_path,
-        _session_db_path_for_profile,
-    )
-
-    path = _session_db_path_for_profile(profile or None)
-    if not path.exists():
-        return None
-    return _open_session_db_at_path(path, read_only=False)
-
-
-@router.post("/title")
-async def set_title(request: Request) -> JSONResponse:
-    """Rename a session by its STORED id — the door core's RPC cannot offer.
-
-    ``session.title`` is a SESSION-SCOPED RPC: the gateway resolves its
-    ``session_id`` against the LIVE registry and answers ``4001 session not
-    found`` for anything else, and every id a session list shows is a STORED id.
-    So the pane had no way to rename a chat it was not currently running
-    (2026-10-16: "every time I try to rename a session in my plug-in, it says
-    'Session not found'").
-
-    This mirrors the REST route the app itself uses — ``resolve_session_id``
-    (title/prefix aliases included) then ``set_session_title`` — and nothing
-    else. It does not touch messages, and an unknown id is a 404 with the id in
-    the detail, so the pane can say WHICH session it could not find.
-    """
-    try:
-        payload = json.loads((await request.body()).decode("utf-8") or "null")
-    except (ValueError, UnicodeDecodeError):
-        return JSONResponse({"error": "bad_request", "detail": "body is not valid JSON"}, status_code=400)
-    if not isinstance(payload, dict):
-        return JSONResponse({"error": "bad_request", "detail": "body must be an object"}, status_code=400)
-
-    profile = str(payload.get("profile") or "")
-    session_id = str(payload.get("session_id") or "").strip()
-    title = str(payload.get("title") or "").strip()
-    if not session_id:
-        return JSONResponse({"error": "bad_request", "detail": "session_id required"}, status_code=400)
-    if not title:
-        return JSONResponse({"error": "bad_request", "detail": "title required"}, status_code=400)
-
-    db = None
-    try:
-        db = _writer(profile)
-    except Exception as exc:  # unknown profile, unreadable store, ...
-        return JSONResponse({"error": "store_unavailable", "detail": f"{type(exc).__name__}: {exc}"}, status_code=500)
-    if db is None:
-        return JSONResponse({"error": "store_unavailable", "detail": f"no session store for {profile or 'default'}"}, status_code=404)
-
-    try:
-        key = db.resolve_session_id(session_id) if hasattr(db, "resolve_session_id") else session_id
-        if not key:
-            return JSONResponse(
-                {"error": "session_not_found", "detail": f"no session {session_id} in {profile or 'default'}"},
-                status_code=404,
-            )
-        db.set_session_title(str(key), title)
-        return JSONResponse({"ok": True, "session_key": str(key), "title": db.get_session_title(str(key)) or title},
-                            headers={"Cache-Control": "no-store"})
-    except ValueError as exc:  # too long, invalid characters, or already in use
-        return JSONResponse({"error": "rejected", "detail": str(exc)}, status_code=400)
-    except Exception as exc:  # noqa: BLE001 - a broken store must not 500 the pane silently
-        return JSONResponse({"error": "write_failed", "detail": f"{type(exc).__name__}: {exc}"}, status_code=500)
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
+    db = SessionDB(path)
+    # This half only reads; the class stays public, the write path is gone (see
+    # the module docstring: renames ride the gateway's own RPC now).
+    return db
 
 
 @router.post("/resolve")
@@ -257,7 +198,7 @@ async def resolve(request: Request) -> JSONResponse:
     try:
         for wanted in ids:
             try:
-                chain = db._session_lineage_root_to_tip(wanted) or []
+                chain = db.get_compression_tip(wanted) or []
             except Exception:  # noqa: BLE001 - an id with no lineage is still an id
                 chain = []
 

@@ -61,6 +61,20 @@ Copy `desktop/plugin.js` into `<hermes home>/desktop-plugins/personae/`, then re
   switches itself off on the first `404` and body search falls back to the session
   metadata the RPC surface already gives it — never an error, never a retry loop.
 
+### What the backend may touch
+Only two kinds of door, both documented:
+
+* **Reads** open the profile's session store through the public `SessionDB` class
+  (`hermes_state`) and ask it public questions — `list-`/`get_`/`search_messages`/
+  `get_compression_tip`. The path comes from `get_hermes_home()`, the documented home
+  layout, not from a router helper.
+* **Writes: none.** A rename rides the gateway's own RPCs — `session.title` for a
+  running session, and `session.resume` first when the session has no runtime. The pane
+  never writes `state.db`, and never imports `hermes_cli.web_server_sessions`,
+  `INTERNAL_LISTING_SOURCES`, `_session_lineage_root_to_tip` or any other private core
+  helper. The machine-run sources this pane hides (cron, kanban, tool, one-shot,
+  webhook) are declared in the plugin, so no core policy list is imported.
+
 There is nothing to build: the app executes `desktop/plugin.js` as it stands.
 
 ---

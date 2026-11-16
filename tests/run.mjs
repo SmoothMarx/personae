@@ -1394,58 +1394,61 @@ check(
   const renamed = await __internals.renameSession({ id: 'sess-zulu-9', resolved_id: 'runtime-9' }, 'zulu', 'Better name')
   const told = h.requests.find(entry => entry.method === 'session.title')
 
+  // The catalog review drew this line: a listed plugin may not write state.db
+  // through core's private opener. Renames ride `session.title` (live) and
+  // `session.resume` + `session.title` (stored) — public RPCs, no store writes.
   check(
-    'a LIVE row renames through the backend AND tells the running session',
+    'a LIVE row renames through session.title on the LIVE id — no backend write',
     renamed === true &&
-      h.rest.writes?.[0]?.body?.session_id === 'sess-zulu-9' &&
       told?.params?.session_id === 'runtime-9' &&
-      told?.params?.title === 'Better name',
+      told?.params?.title === 'Better name' &&
+      !(h.rest.writes || []).length,
     JSON.stringify({ requests: h.requests.map(r => r.method), writes: h.rest.writes })
   )
   check(
     '…and the STORED id is never the one the RPC is given (it 4001s every one)',
-    told && told.params.session_id !== 'sess-zulu-9' && !JSON.stringify(h.rest.writes).includes('runtime-9')
+    told && told.params.session_id !== 'sess-zulu-9'
   )
   h.requests.length = before === 0 ? 0 : h.requests.length
 }
 
 {
   // The stored-id door. This is the case the user actually hits: the sessions in
-  // a list are almost never live in the gateway process.
+  // a list are almost never live in the gateway process. It resumes first — a
+  // PUBLIC rpc — then titles the runtime it got back.
   const before = h.requests.length
-  const restCallsBefore = h.rest.calls.length
 
-  h.rest.byProfile = { zulu: { ok: true, session_key: 'sess-zulu-9', title: 'Archived-era name' } }
+  h.responses['session.resume'] = () => ({ session_key: 'sess-zulu-9', session_id: 'runtime-resumed' })
   h.rest.writes = []
 
   const renamed = await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'Archived-era name')
+  const called = h.requests.slice(before).map(entry => entry.method)
+  const titled = h.requests.slice(before).find(entry => entry.method === 'session.title')
 
-  check('a STORED-only row renames through the pane backend', renamed === true)
   check(
-    '…which is a POST /title carrying the profile, the stored id and the name',
-    h.rest.writes?.[0]?.method === 'POST' &&
-      h.rest.writes[0].path === '/title' &&
-      h.rest.writes[0].body?.profile === 'zulu' &&
-      h.rest.writes[0].body?.session_id === 'sess-zulu-9' &&
-      h.rest.writes[0].body?.title === 'Archived-era name',
-    JSON.stringify(h.rest.writes)
+    'a STORED-only row resumes it, then renames the runtime it got back',
+    renamed === true &&
+      called.join('|') === 'session.resume|session.title' &&
+      titled?.params?.session_id === 'runtime-resumed' &&
+      titled?.params?.title === 'Archived-era name',
+    JSON.stringify(called)
   )
   check(
-    '…and it does NOT fire the doomed session.title first (the gateway logs every rejected one)',
-    h.requests.length === before && h.rest.calls.length > restCallsBefore,
-    `requests +${h.requests.length - before}`
+    '…and nothing in that chain writes the session store',
+    !(h.rest.writes || []).length,
+    JSON.stringify(h.rest.writes)
   )
 }
 
 {
-  // Neither door knows the session: the store has no row and the gateway refuses
-  // the id too. The backend's sentence is the honest one — it names the session.
-  const realTitle = h.responses['session.title']
+  // The gateway does not know the id either. Its refusal is the honest sentence:
+  // name it, do not claim the stored row was written (nothing was).
+  const realResume = h.responses['session.resume']
 
-  h.responses['session.title'] = () => {
-    throw new Error('4001 session not found')
+  h.responses['session.resume'] = () => {
+    throw new Error('4001 session not found for sess-gone')
   }
-  h.rest.byProfile = { zulu: { detail: 'no session sess-gone in zulu', error: 'session_not_found' } }
+  h.rest.writes = []
 
   let said = ''
 
@@ -1455,49 +1458,52 @@ check(
     said = String(error.message || error)
   }
 
-  h.responses['session.title'] = realTitle
+  h.responses['session.resume'] = realResume
 
   check(
-    'a backend 404 becomes the backend’s own sentence, so the toast names the session',
-    said.includes('no session sess-gone in zulu'),
+    'a refused resume becomes the gateway’s own sentence, so the toast names the session',
+    said.includes('4001 session not found for sess-gone'),
     said
+  )
+  check(
+    '…and the failure is not dressed up as a stored write',
+    !(h.rest.writes || []).length,
+    JSON.stringify(h.rest.writes)
   )
 }
 
 {
-  // A chat that exists ONLY as a live session: nothing has written a row yet, so
-  // the stored door answers "no such session" and the gateway is the only door
-  // there is. This is the "until it has answered me" case.
-  h.rest.byProfile = { zulu: { detail: 'no session draft-1 in zulu', error: 'session_not_found' } }
-  h.rest.writes = []
+  // A chat that exists ONLY as a live session: nothing has written a row yet, and
+  // it must not be resumed to be renamed — the runtime it already has is the door.
   h.requests.length = 0
   h.responses['session.title'] = () => ({ title: 'ok' })
 
   const renamed = await __internals.renameSession({ id: 'draft-1', resolved_id: 'runtime-draft-1' }, 'zulu', 'First chat')
 
   check(
-    'a chat with no stored row renames through the gateway alone',
+    'a chat with no stored row renames through the gateway alone, never resuming',
     renamed === true &&
+      !h.requests.some(entry => entry.method === 'session.resume') &&
       h.requests.some(
         entry => entry.method === 'session.title' && entry.params?.session_id === 'runtime-draft-1' && entry.params?.title === 'First chat'
       ),
-    JSON.stringify({ requests: h.requests.map(e => e.method), writes: h.rest.writes })
-  )
-  check(
-    '…and it does not then claim a stored row it never wrote',
-    (h.rest.writes || []).filter(entry => entry.path === '/title').length === 1
+    JSON.stringify(h.requests.map(entry => entry.method))
   )
 }
 
 {
+  // No plugin backend mounted at all. Rename must not notice: it is two RPCs.
   const realRest = ctx.rest
 
   delete ctx.rest
+  h.responses['session.resume'] = () => ({ session_id: 'runtime-resumed' })
+  h.responses['session.title'] = () => ({ title: 'ok' })
 
+  let renamed = false
   let said = ''
 
   try {
-    await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'anything')
+    renamed = await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'No backend needed')
   } catch (error) {
     said = String(error.message || error)
   }
@@ -1505,11 +1511,9 @@ check(
   ctx.rest = realRest
   h.rest.byProfile = {}
 
-
-
   check(
-    'with no backend at all the failure SAYS so instead of blaming the session',
-    /needs the Perso backend/i.test(said),
+    'rename needs no backend route at all — the plugin can be mounted bare',
+    renamed === true && !said,
     said
   )
 }
@@ -8428,53 +8432,50 @@ h.rest.byProfile = {}
   )
 }
 
-// ── "Session not found" must mean the SESSION, never a missing route ────────
+// ── A rename is two public RPCs, and a stale runtime is not a failure ───────
 {
-  // 1. Route not mounted (an older backend half): say THAT.
-  h.rest.byProfile = { zulu: new Error('404 Not Found') }
+  // The row's runtime id can outlive the runtime (the agent moved, the gateway
+  // restarted). `session.title` then refuses — which is a signal to RESUME the
+  // stored id, not to tell the user their session does not exist.
+  const realTitle = h.responses['session.title']
+  let titleCalls = 0
+
+  h.responses['session.title'] = params => {
+    titleCalls += 1
+
+    if (titleCalls === 1) {
+      throw new Error('4001 session not found for runtime-stale')
+    }
+
+    return { title: params.title }
+  }
+  h.responses['session.resume'] = () => ({ session_id: 'runtime-fresh' })
   h.requests.length = 0
 
-  let said = ''
-
-  try {
-    await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'anything')
-  } catch (error) {
-    said = String(error.message || error)
-  }
+  const renamed = await __internals.renameSession({ id: 'sess-zulu-9', resolved_id: 'runtime-stale' }, 'zulu', 'Still mine')
 
   check(
-    'a missing /title route says RESTART, not "Session not found"',
-    /does not serve \/title/i.test(said) && /restart/i.test(said) && h.requests.length === 0,
-    said
+    'a stale runtime id falls back to resuming the stored one, and the rename lands',
+    renamed === true &&
+      h.requests.map(entry => entry.method).join('|') === 'session.title|session.resume|session.title' &&
+      h.requests[2].params.session_id === 'runtime-fresh' &&
+      h.requests[2].params.title === 'Still mine',
+    JSON.stringify(h.requests.map(entry => entry.method))
   )
 
-  // 2. The store does not know a STORED-shaped id: do not hand it to the gateway
-  //    (it answers "Session not found" for every one, and that sentence lies).
-  h.rest.byProfile = { zulu: { detail: 'no session 20260101_000000_example in zulu', error: 'session_not_found' } }
-  h.requests.length = 0
-  said = ''
-
-  try {
-    await __internals.renameSession({ id: '20260101_000000_example' }, 'zulu', 'anything')
-  } catch (error) {
-    said = String(error.message || error)
-  }
-
-  check(
-    'a stored-shaped id the store does not have is reported as missing, with no doomed RPC',
-    /no session 20260101_000000_example/.test(said) && h.requests.length === 0,
-    said
-  )
-
-  h.rest.byProfile = {}
+  h.responses['session.title'] = realTitle
+  delete h.responses['session.resume']
 }
 
 // ── The strip follows the pane: rename repaints a tab, archive removes it ────
 {
   h.tiles.length = 0
-  h.rest.byProfile = { zulu: { ok: true, session_key: 'sess-zulu-9', title: 'Renamed' } }
+  h.responses['session.resume'] = () => ({ session_id: 'runtime-resumed' })
+  h.responses['session.title'] = () => ({ title: 'Renamed' })
 
   await __internals.renameSession({ id: 'sess-zulu-9' }, 'zulu', 'Renamed')
+
+  delete h.responses['session.resume']
 
   check(
     'a rename reaches the TAB: the row it is named from is patched',

@@ -481,7 +481,7 @@ const AVATAR_ROW_SIZE = 17
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane that has been silently running a stale build looks exactly like a
  *  broken feature, and that mistake has cost this file three rounds. */
-const BUILD = '2.1.1'
+const BUILD = '2.2.0'
 /** The picture at the head of a single-profile group box. Smaller than a row's:
  *  it labels a section, it is not the row you are scanning. */
 const AVATAR_HEAD_SIZE = 14
@@ -4400,103 +4400,59 @@ async function renameSession(session, profile, title) {
     return false
   }
 
-  const rest = ctxRef?.rest
-
-  if (typeof rest !== 'function') {
-    throw new Error('Renaming needs the Perso backend, and it is not mounted in this build.')
-  }
-
-  // Two AUTHORITIES, not two guesses. The store is the durable title; the
-  // running session object is what core's auto-titler consults — so a rename
-  // that writes only the store is silently UNDONE by the first turn of a young
-  // chat, which is exactly what "I can't rename it until it has answered me"
-  // looks like from the outside (The reviewer, 2026-10-17).
+  // PUBLIC RPCs ONLY. Renaming used to write `state.db` through a private opener
+  // (`_open_session_db_at_path(read_only=False)` + `set_session_title`), which the
+  // catalog review refused: those are core internals, not a contract (teknium1,
+  // 2026-11-13: "renames write state.db through a private opener").
   //
-  // The id decides the door, and each id shape has exactly one legitimate door:
-  //   stored id → the pane's backend (works for a session that is not running)
-  //   live id   → `session.title` (the only thing core will accept for a RUNNING
-  //               session; it 4001s every stored id, which is why the stored door
-  //               is not a fallback for it but the primary for the other shape)
+  // Two public doors, one per id shape:
+  //   live id   → `session.title` — core's own guarded path, which writes the
+  //               durable title as well as the running session's.
+  //   stored id → `session.resume` mints a runtime first (it is a public RPC), and
+  //               the same `session.title` then applies. That is the stored-session
+  //               rename, without touching the store.
   const liveId = String(session?.resolved_id || session?.openId || '').trim()
-  let answer = null
-  let said = ''
 
-  try {
-    answer = await rest('/title', { body: { profile, session_id: storedId, title: name }, method: 'POST' })
-  } catch (error) {
-    said = String(error?.message || error || '')
-  }
-
-  const stored = Boolean(answer) && !answer.error
-  const missing = answer?.error === 'session_not_found'
-  // A 403/404 with NO answer body is the ROUTE, not the session: an older backend
-  // half predates /title. Falling through to the RPC in that state produced the
-  // gateway's own "Session not found" for a session that exists — the exact
-  // message the user kept seeing (2026-10-17).
-  const routeMissing = !answer && /\b40[34]\b/.test(said)
-
-  if (routeMissing) {
-    throw new Error(
-      `Rename failed — the Perso backend half does not serve /title yet (restart it): ${said || 'no answer'}`
-    )
-  }
-
-  // A chat created in this window can exist ONLY as a live session: nothing has
-  // written a row yet, so the stored door answers "no such session" and the
-  // gateway is the only door there is.
-  if (missing) {
-    // The store has no such row, so the id we are holding cannot be a STORED id:
-    // it is the gateway's own id for a chat that has not been written yet. Try
-    // the gateway with it — this is the "until it has answered me" case — and
-    // only then admit that neither door knows it.
-    // Never hand the gateway an id that is shaped like a STORED id: it answers
-    // "Session not found" for every one of them, and that sentence then reads as
-    // the pane's own failure. A stored-shaped id that the store does not know is
-    // simply a session that is not there.
-    const storedShaped = /^\d{8}_\d{6}_[A-Za-z0-9]+$/.test(storedId)
-    const candidate = liveId || (storedShaped ? '' : storedId)
-
-    if (!candidate) {
-      throw new Error(String(answer?.detail || `Could not rename this session (${storedId || 'no id'}).`))
-    }
-
+  // A tab is named from the row it was opened from, so the strip has to be told
+  // too — the gateway has no idea a tile exists (feature-detected: an older
+  // desktop simply keeps the old label).
+  const finish = () => {
     try {
-      await host.request('session.title', { session_id: candidate, title: name })
-
-      return true
-    } catch (error) {
-      const why = String(error?.message || error || '')
-
-      throw new Error(String(answer?.detail || why || `Could not rename this session (${storedId || 'no id'}).`))
+      host.retitleSessionTile?.(storedId, name)
+    } catch {
+      /* the tab keeps its old label */
     }
+
+    return true
   }
 
-  if (!stored) {
-    throw new Error(
-      /\b40[34]\b/.test(said)
-        ? `Rename failed — the Perso backend half is older than the plugin (restart it): ${said}`
-        : `Rename failed: ${said || answer?.detail || 'the backend did not answer.'}`
-    )
-  }
-
-  // The store took it. If this session is RUNNING, tell it too: its own title is
-  // what auto-titling will overwrite on the next turn. Best effort by design —
-  // the durable write already succeeded, and a non-running row has no live id.
   if (liveId) {
     try {
       await host.request('session.title', { session_id: liveId, title: name })
+
+      return finish()
     } catch {
-      // A live id that the gateway no longer holds is not a rename failure.
+      // A stale runtime id is not a failure: fall through and resume by stored id.
     }
   }
 
-  // The strip names a tab from its session ROW, and the app only re-reads rows
-  // when its own list churns — which never happens for a write made over this
-  // backend. Patching the row is what makes a rename reach the tab (the user,
-  // 2026-10-17). Feature-detected: an older desktop simply keeps the old caption.
-  host.retitleSessionTile?.(storedId, name)
+  let runtime = ''
 
-  return true
+  try {
+    const resumed = await host.request('session.resume', { profile, session_id: storedId })
+
+    runtime = String(resumed?.session_id || resumed?.runtime_id || '')
+  } catch (error) {
+    throw new Error(`Could not rename this session: ${String(error?.message || error || 'it did not resume')}`)
+  }
+
+  if (!runtime) {
+    throw new Error('Could not rename this session: it resumed without a runtime id.')
+  }
+
+  await host.request('session.title', { session_id: runtime, title: name })
+
+  return finish()
 }
 
 /** Whole-session branch of a stored parent; the child opens like core's does. */
