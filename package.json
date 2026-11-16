@@ -1,6 +1,6 @@
 {
   "name": "hermes-plugin-perso",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "private": true,
   "description": "Perso - a Hermes Desktop plugin that lists every profile's sessions as ONE activity-ordered list, with the profile's picture on each row.",
   "type": "module",

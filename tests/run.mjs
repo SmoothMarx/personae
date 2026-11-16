@@ -6162,6 +6162,34 @@ if (process.env.DUMP_GROUPS) {
     'the live status and the row are still keyed in different id spaces'
   )
 
+  // ONE grouping, two panes: Bot Mode stores membership on the profile
+  // (`ui_meta['hermes-bots'].sectionId`), so this pane must read AND write that
+  // same field — it kept a private map, which is why a group made in Bot Mode was
+  // invisible here and a group made here was invisible there (Pedro, 2026-11-13).
+  check(
+    'a profile is filed by the BOTS document first, and its section draws a heading',
+    (() => {
+      const rows = [
+        { botsMeta: { sectionId: 'bot-sec-1', sectionName: 'Clients' }, name: 'zulu' },
+        { botsMeta: null, name: 'lima' }
+      ]
+      // The private map says the OPPOSITE for zulu — the Bots document wins.
+      const model = { collapsed: [], members: { lima: 'my-own', zulu: 'my-own' }, sections: [] }
+      const blocks = __internals.groupRows(rows, model)
+      const clients = blocks.find(block => block.id === 'bot-sec-1')
+
+      return (
+        Boolean(clients) &&
+        clients.name === 'Clients' &&
+        clients.rows.length === 1 &&
+        clients.rows[0].name === 'zulu' &&
+        // …and it is not also drawn under the local section it used to claim.
+        !blocks.some(block => block.id === 'my-own' && block.rows.some(row => row.name === 'zulu'))
+      )
+    })(),
+    'groupRows still reads the pane-private map first'
+  )
+
   // The list must say WHICH chat the main pane is on. Pedro, 2026-11-13: "Put a
   // glowing outline around the currently active session on screen."
   check(
@@ -9310,3 +9338,12 @@ const failedNow = results.filter(r => !r.ok)
 console.log(`\n${results.length - failedNow.length}/${results.length} passed`)
 
 process.exit(failedNow.length ? 1 : 0)
+
+// The roster's folder+ was lost when the flat list took over the pane's ONE
+// toolbar. Asserted on the source because the SESSION-group menu uses the same
+// glyph in both views, which makes a markup count ambiguous.
+check(
+  'the roster keeps its “new profile group” verb, and the flat list does not',
+  SRC.includes('onNewGroup: isRoster') && SRC.includes('const id = createSection(nextSectionName())'),
+  'the roster lost the only way to make a group of profiles'
+)

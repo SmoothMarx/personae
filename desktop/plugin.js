@@ -481,7 +481,7 @@ const AVATAR_ROW_SIZE = 17
 /** Rendered in the toolbar: the only proof of WHICH bytes the app is running.
  *  A pane that has been silently running a stale build looks exactly like a
  *  broken feature, and that mistake has cost this file three rounds. */
-const BUILD = '2.0.1'
+const BUILD = '2.1.0'
 /** The picture at the head of a single-profile group box. Smaller than a row's:
  *  it labels a section, it is not the row you are scanning. */
 const AVATAR_HEAD_SIZE = 14
@@ -2627,11 +2627,25 @@ function renameSection(id, name) {
 function deleteSection(id) {
   const current = $sections.get()
   const members = { ...current.members }
+  const released = []
 
   for (const [profile, sectionId] of Object.entries(members)) {
     if (sectionId === id) {
       delete members[profile]
+      released.push(profile)
     }
+  }
+
+  // …and anyone the BOTS document still files there (a group made in Bot Mode has
+  // no entry in this pane's map at all).
+  for (const [name, row] of Object.entries(rowsByName)) {
+    if (row && row.botsMeta && String(row.botsMeta.sectionId || '') === String(id)) {
+      released.push(name)
+    }
+  }
+
+  if (released.length) {
+    void writeSectionMembership([...new Set(released)], null)
   }
 
   setSections({
@@ -2639,6 +2653,46 @@ function deleteSection(id) {
     members,
     sections: current.sections.filter(section => section.id !== id)
   })
+}
+
+/** `{profile: row}` from the last roster paint. Only the section writer needs it,
+ *  and only to read each profile's current `hermes-bots` document. */
+let rowsByName = {}
+
+/** File profiles into a section in the BOTS pane's own document.
+ *
+ *  One grouping means one writer: `ui_meta['hermes-bots'].sectionId` +
+ *  `sectionName` is what Bot Mode reads, so this pane writes it too (Pedro,
+ *  2026-11-13: a group made in one surface must show in the other). The slice is
+ *  REPLACED wholesale by `profiles.configure`, so every write starts from the
+ *  profile's current document — anything else it holds (colour, title) survives.
+ *  Best effort: the local section store is already updated by the caller, and a
+ *  refusal is surfaced on the row rather than throwing out of a drag. */
+async function writeSectionMembership(profiles, section) {
+  const sectionId = section && section.id ? String(section.id) : ''
+  const sectionName = section && section.name ? String(section.name).trim() : ''
+
+  await Promise.all(
+    (profiles || []).map(async name => {
+      const row = rowsByName[String(name)] || null
+      const meta = row && row.botsMeta && typeof row.botsMeta === 'object' ? row.botsMeta : {}
+      const next = { ...meta }
+
+      if (sectionId) {
+        next.sectionId = sectionId
+        next.sectionName = sectionName || undefined
+      } else {
+        delete next.sectionId
+        delete next.sectionName
+      }
+
+      try {
+        await host.request('profiles.configure', { name, ui_meta: { [BOTS_META_KEY]: next } })
+      } catch {
+        /* the local store is the source until the next roster poll */
+      }
+    })
+  )
 }
 
 function moveToSection(profiles, sectionId) {
@@ -2654,6 +2708,11 @@ function moveToSection(profiles, sectionId) {
   }
 
   setSections({ ...current, members })
+
+  const section =
+    sectionId === UNASSIGNED ? null : ($sections.get().sections || []).find(entry => entry.id === sectionId) || null
+
+  void writeSectionMembership(profiles, section)
 }
 
 function toggleCollapsed(id) {
@@ -3038,6 +3097,8 @@ async function fetchRoster() {
   const mapped = rows.map(toRow).filter(row => !row.hidden).sort(compareRows)
 
   trackActivity(mapped, host.state.profile.get())
+  // The section writer reads each profile's CURRENT Bots document from here.
+  rowsByName = Object.fromEntries(mapped.map(row => [row.name, row]))
 
   // P8b: the aggregate dots' two readable sources. What is LIVE in this gateway
   // process, and every profile's own rows. The rows come from
@@ -3505,11 +3566,41 @@ function isCutAnchor(cut, profile, session) {
  *  block, so the pane renders exactly as it did before groups existed. */
 function groupRows(rows, model) {
   const blocks = []
-  const filed = name => model.members[name]
+  // WHERE a profile is filed now has ONE answer, and it is the one the Bots pane
+  // already writes: `ui_meta['hermes-bots'].sectionId`, carried on the row as
+  // `botsMeta`. This pane used to keep a private `members` map, so a group made in
+  // Bot Mode was invisible here and a group made here was invisible there (Pedro,
+  // 2026-11-13). The private map stays as the FALLBACK, so anything filed before
+  // this keeps its place without a migration step.
+  const metas = new Map(rows.map(row => [row.name, row.botsMeta || null]))
+  const filed = name => {
+    const meta = metas.get(name)
+    const fromBots = meta && meta.sectionId ? String(meta.sectionId) : ''
+
+    return fromBots || model.members[name]
+  }
   const sortedFor = (scope, list) =>
     sortRows(list, model.sort?.[scope] || 'activity', model.order?.[scope])
 
-  for (const section of model.sections) {
+  // Sections the Bots pane made are not in this pane's own list, so they are
+  // discovered from the members that carry them (name from `sectionName`, which
+  // Bots stamps on every member for exactly this reason).
+  const known = new Set(model.sections.map(section => section.id))
+  const discovered = []
+
+  for (const row of rows) {
+    const meta = row.botsMeta || null
+    const id = meta && meta.sectionId ? String(meta.sectionId) : ''
+
+    if (!id || known.has(id)) {
+      continue
+    }
+
+    known.add(id)
+    discovered.push({ id, name: String(meta.sectionName || '').trim() || 'Group' })
+  }
+
+  for (const section of [...model.sections, ...discovered]) {
     const members = sortedFor(section.id, rows.filter(row => filed(row.name) === section.id))
 
     // Emitted with ZERO members too: a group you just created is empty by
@@ -13444,6 +13535,21 @@ function MessengerPane({ mode = 'list' }) {
         // Diagnostic while status not-updating is open: what the sweep saw live.
         liveTotal: liveInfo.total,
         liveWorking: liveInfo.working,
+        // Profile groups are a ROSTER verb: "New session group" is a different
+        // thing (a box of sessions) and keeps its own menu. This was dropped when
+        // the flat list took over the toolbar, which is why the roster lost the
+        // only way to make a group of profiles (Pedro, 2026-11-13).
+        onNewGroup: isRoster
+          ? () => {
+              const id = createSection(nextSectionName())
+
+              if (id) {
+                const section = ($sections.get().sections || []).find(entry => entry.id === id)
+
+                setEditing({ id, name: section?.name || '' })
+              }
+            }
+          : undefined,
         onBell: toggleToasts,
         onFiles: openCoreFiles,
         onSelect: () => (selecting ? leaveSelect() : setSelecting(true)),
